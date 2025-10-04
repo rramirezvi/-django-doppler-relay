@@ -7,7 +7,7 @@ from django.core.files.base import ContentFile
 
 class Attachment(models.Model):
     name = models.CharField(max_length=255)
-    file = models.FileField(upload_to='attachments/%Y/%m/')
+    file = models.FileField(upload_to='%Y/%m/')
     content_type = models.CharField(max_length=100, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
