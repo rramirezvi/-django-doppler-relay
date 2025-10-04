@@ -2,6 +2,7 @@ from django import forms
 from django.contrib import admin
 from django.conf import settings
 from django.utils.html import format_html
+from django.contrib.admin.widgets import FilteredSelectMultiple
 from .models import EmailMessage, Delivery, Event, BulkSend, Attachment
 from .services.doppler_relay import DopplerRelayClient
 # Formulario personalizado para EmailMessage
@@ -198,7 +199,7 @@ class BulkSendForm(forms.ModelForm):
     recipients_file = forms.FileField(
         help_text="Archivo CSV con los destinatarios. Debe tener al menos una columna 'email'"
     )
-    variables_mapping = forms.CharField(
+    variables = forms.CharField(
         widget=forms.Textarea,
         required=False,
         help_text="""Mapeo de columnas CSV a variables de la plantilla (opcional).
@@ -229,15 +230,10 @@ class BulkSendForm(forms.ModelForm):
                 "El campo variables debe ser JSON válido.")
 
     def clean_attachments(self):
-        data = self.cleaned_data["attachments"]
-        import json
+        data = self.cleaned_data.get("attachments")
         if not data:
             return []
-        try:
-            return json.loads(data)
-        except Exception:
-            raise forms.ValidationError(
-                "El campo adjuntos debe ser JSON válido.")
+        return data
 
 # Admin para BulkSend
 

@@ -550,7 +550,7 @@ class DopplerRelayClient:
 
                     attachments.append({
                         "content": content,
-                        "name": str(attachment["filename"]).strip()
+                        "filename": str(attachment["filename"]).strip()
                     })
                 except Exception as e:
                     print(f"Error procesando adjunto: {str(e)}")

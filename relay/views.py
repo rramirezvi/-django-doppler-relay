@@ -114,12 +114,12 @@ def process_bulk_template_send(template_id, recipients, subject=None, adj_list=N
 
                 attachments.append({
                     "content": content,
-                    "name": str(attachment["filename"]).strip()
+                    "filename": str(attachment.get("filename") or attachment.get("name", "")).strip()
                 })
         except Exception as e:
             raise ValueError(f"Error procesando adjuntos: {str(e)}")
 
-    # Procesamos cada destinatario individualmente
+            # Procesamos cada destinatario individualmente
     for recipient in recipients:
         try:
             # Validar email del destinatario
@@ -128,13 +128,15 @@ def process_bulk_template_send(template_id, recipients, subject=None, adj_list=N
                 raise ValueError(f"Email inválido: {email}")
 
             # Convertir todas las variables a string y limpiar
-            variables = {
-                str(k).strip(): str(v).strip()
-                for k, v in recipient.get("variables", {}).items()
-                if v is not None  # Ignorar valores None
-            }
-
-            # Modelo para un solo destinatario con estructura requerida por la API
+            variables = {}
+            if "substitution_data" in recipient:
+                variables = recipient["substitution_data"]
+            elif "variables" in recipient:
+                variables = {
+                    str(k).strip(): str(v).strip()
+                    for k, v in recipient.get("variables", {}).items()
+                    if v is not None  # Ignorar valores None
+                }            # Modelo para un solo destinatario con estructura requerida por la API
             single_model = {
                 "from_email": FROM_EMAIL,
                 "from_name": FROM_NAME,
@@ -145,13 +147,16 @@ def process_bulk_template_send(template_id, recipients, subject=None, adj_list=N
                     "name": recipient.get("name", ""),
                     "variables": variables,
                     "type": "to"
-                }],
-                "attachments": attachments or []
+                }]
             }
 
             if attachments:
+                single_model["attachments"] = attachments
+
+            if attachments:
                 # Debug pre-envío
-                single_model["model"]["attachments"] = attachments
+                print(
+                    f"Adjuntos a enviar: {json.dumps(attachments, indent=2)}")
             print(f"\nIntentando enviar a {email}")
             print(f"Variables: {json.dumps(variables, indent=2)}")
             print(f"Modelo: {json.dumps(single_model, indent=2)}")
@@ -310,10 +315,10 @@ def send_bulk_email(request: HttpRequest):
             if "attachments" in data:
                 attachments = []
                 for att in data["attachments"]:
-                    if isinstance(att, dict) and "content" in att and "filename" in att:
+                    if isinstance(att, dict) and "content" in att and ("name" in att or "filename" in att):
                         attachments.append({
                             "content": att["content"],
-                            "filename": att["filename"]
+                            "name": att.get("name") or att.get("filename", "")
                         })
 
             # Enviar correos

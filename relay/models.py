@@ -17,10 +17,12 @@ class Attachment(models.Model):
     def to_doppler_format(self):
         """Convierte el archivo a formato base64 para Doppler"""
         content = base64.b64encode(self.file.read()).decode('utf-8')
+        # Usar el nombre real del archivo en lugar del nombre personalizado
+        filename = self.file.name.split(
+            '/')[-1] if '/' in self.file.name else self.file.name
         return {
-            'name': self.name,
-            'content': content,
-            'type': self.content_type or 'application/octet-stream'
+            'filename': filename,
+            'content': content
         }
 
     @classmethod
