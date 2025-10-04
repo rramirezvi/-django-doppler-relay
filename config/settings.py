@@ -50,8 +50,8 @@ TEMPLATES = [{
 WSGI_APPLICATION = 'config.wsgi.application'
 
 # Configuración de archivos de media
-MEDIA_URL = '/attachments/'
-MEDIA_ROOT = os.path.join(BASE_DIR, 'attachments')
+MEDIA_URL = '/'  # La URL base para archivos media
+MEDIA_ROOT = BASE_DIR  # La raíz será el directorio base del proyecto
 ASGI_APPLICATION = 'config.asgi.application'
 
 DATABASES = {'default': {'ENGINE': 'django.db.backends.sqlite3',
