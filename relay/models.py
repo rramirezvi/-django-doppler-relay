@@ -3,6 +3,94 @@ from __future__ import annotations
 import base64
 from django.db import models
 from django.core.files.base import ContentFile
+from django.contrib.auth.models import User
+
+
+class UserEmailConfig(models.Model):
+    user = models.OneToOneField(User, on_delete=models.CASCADE)
+    from_email = models.EmailField(
+        verbose_name="Email del remitente",
+        help_text="Email que se usará como remitente para los envíos"
+    )
+    from_name = models.CharField(
+        max_length=255,
+        verbose_name="Nombre del remitente",
+        help_text="Nombre que aparecerá como remitente"
+    )
+    is_active = models.BooleanField(
+        default=True,
+        verbose_name="Activo",
+        help_text="Indica si esta configuración está activa"
+    )
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Configuración de email de usuario"
+        verbose_name_plural = "Configuraciones de email de usuarios"
+
+    def __str__(self):
+        return f"{self.user.username} - {self.from_email}"
+
+    @classmethod
+    def get_user_email_config(cls, user):
+        """
+        Obtiene la configuración de email activa para un usuario.
+        Si no existe, retorna None.
+        """
+        if not user or not user.is_authenticated:
+            return None
+
+        try:
+            return cls.objects.get(user=user, is_active=True)
+        except cls.DoesNotExist:
+            return None
+
+    @classmethod
+    def get_from_email_for_user(cls, user, fallback=None):
+        """
+        Obtiene el email del remitente para un usuario específico.
+        Prioridad: 1) Configuración personalizada, 2) Email del usuario Django, 3) Fallback
+        """
+        if not user or not user.is_authenticated:
+            return fallback
+
+        # Prioridad 1: Configuración personalizada del usuario
+        config = cls.get_user_email_config(user)
+        if config:
+            return config.from_email
+
+        # Prioridad 2: Email del usuario de Django
+        if user.email:
+            return user.email
+
+        # Prioridad 3: Fallback proporcionado
+        return fallback
+
+    @classmethod
+    def get_from_name_for_user(cls, user, fallback=None):
+        """
+        Obtiene el nombre del remitente para un usuario específico.
+        Prioridad: 1) Configuración personalizada, 2) Nombre del usuario Django, 3) Fallback
+        """
+        if not user or not user.is_authenticated:
+            return fallback
+
+        # Prioridad 1: Configuración personalizada del usuario
+        config = cls.get_user_email_config(user)
+        if config:
+            return config.from_name
+
+        # Prioridad 2: Nombre completo del usuario de Django
+        if user.first_name or user.last_name:
+            return f"{user.first_name} {user.last_name}".strip()
+
+        # Prioridad 3: Username del usuario
+        if user.username:
+            return user.username
+
+        # Prioridad 4: Fallback proporcionado
+        return fallback
 
 
 class Attachment(models.Model):

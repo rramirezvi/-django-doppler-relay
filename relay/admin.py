@@ -1,10 +1,19 @@
+from .services.doppler_relay import DopplerRelayClient
 from django import forms
 from django.contrib import admin
 from django.conf import settings
 from django.utils.html import format_html
 from django.contrib.admin.widgets import FilteredSelectMultiple
-from .models import EmailMessage, Delivery, Event, BulkSend, Attachment
-from .services.doppler_relay import DopplerRelayClient
+from .models import EmailMessage, Delivery, Event, BulkSend, Attachment, UserEmailConfig
+
+# Formulario para la configuración de email del usuario
+
+
+class UserEmailConfigForm(forms.ModelForm):
+    class Meta:
+        model = UserEmailConfig
+        fields = ['user', 'from_email', 'from_name', 'is_active']
+
 # Formulario personalizado para EmailMessage
 
 
@@ -19,11 +28,29 @@ class EmailMessageForm(forms.ModelForm):
         }
 
     def __init__(self, *args, **kwargs):
+        # Extraer el request para obtener el usuario
+        self.request = kwargs.pop('request', None)
         super().__init__(*args, **kwargs)
-        # Usar el remitente por defecto si está configurado y es un nuevo registro
+
+        # Usar el email del usuario logueado como remitente
         if not self.instance.pk and not self.fields['from_email'].initial:
-            self.fields['from_email'].initial = settings.DOPPLER_RELAY.get(
-                'DEFAULT_FROM_EMAIL', '')
+            if self.request and self.request.user.is_authenticated:
+                # Prioridad 1: Configuración personalizada del usuario (si existe)
+                user_config = UserEmailConfig.get_user_email_config(
+                    self.request.user)
+                if user_config:
+                    self.fields['from_email'].initial = user_config.from_email
+                # Prioridad 2: Email del usuario de Django
+                elif self.request.user.email:
+                    self.fields['from_email'].initial = self.request.user.email
+                # Prioridad 3: Fallback al valor del .env
+                else:
+                    self.fields['from_email'].initial = settings.DOPPLER_RELAY.get(
+                        'DEFAULT_FROM_EMAIL', '')
+            else:
+                # Fallback al valor por defecto si no hay usuario logueado
+                self.fields['from_email'].initial = settings.DOPPLER_RELAY.get(
+                    'DEFAULT_FROM_EMAIL', '')
 
 
 @admin.register(EmailMessage)
@@ -34,6 +61,16 @@ class EmailMessageAdmin(admin.ModelAdmin):
     search_fields = ("subject", "from_email", "to_emails", "relay_message_id")
     list_filter = ("status",)
     actions = ['send_email']
+
+    def get_form(self, request, obj=None, **kwargs):
+        form = super().get_form(request, obj, **kwargs)
+        # Crear una nueva clase de formulario que incluya el request
+
+        class FormWithRequest(form):
+            def __init__(self, *args, **kwargs):
+                kwargs['request'] = request
+                super().__init__(*args, **kwargs)
+        return FormWithRequest
 
     def send_email(self, request, queryset):
         from django.utils import timezone
@@ -150,6 +187,29 @@ class EmailMessageAdmin(admin.ModelAdmin):
                     'classes': ('collapse',),
                 }),
             )
+
+
+@admin.register(UserEmailConfig)
+class UserEmailConfigAdmin(admin.ModelAdmin):
+    form = UserEmailConfigForm
+    list_display = ('user', 'from_email', 'from_name',
+                    'is_active', 'updated_at')
+    list_filter = ('is_active',)
+    search_fields = ('user__username', 'from_email', 'from_name')
+    autocomplete_fields = ['user']
+
+    def get_form(self, request, obj=None, **kwargs):
+        form = super().get_form(request, obj, **kwargs)
+        if obj is None:  # Solo para objetos nuevos
+            form.base_fields['user'].initial = request.user
+        return form
+
+    def save_model(self, request, obj, form, change):
+        # Al activar una configuración, desactivar otras configuraciones del mismo usuario
+        if obj.is_active:
+            UserEmailConfig.objects.filter(user=obj.user).exclude(
+                id=obj.id).update(is_active=False)
+        super().save_model(request, obj, form, change)
 
 # Admin para Delivery
 
@@ -391,7 +451,8 @@ class BulkSendAdmin(admin.ModelAdmin):
                     template_id=bulk.template_id,
                     recipients=recipients,
                     subject=subject,
-                    adj_list=adj_list
+                    adj_list=adj_list,
+                    user=request.user  # ¡ESTO FALTABA!
                 )
                 bulk.result = response.content.decode(
                     "utf-8") if hasattr(response, 'content') else json.dumps(response)

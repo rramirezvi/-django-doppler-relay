@@ -44,7 +44,7 @@ def validate_email(email: str) -> bool:
     return bool(re.match(pattern, email))
 
 
-def process_bulk_template_send(template_id, recipients, subject=None, adj_list=None, from_email=None, from_name=None):
+def process_bulk_template_send(template_id, recipients, subject=None, adj_list=None, from_email=None, from_name=None, user=None):
     """
     Procesa el envío masivo de correos usando una plantilla.
 
@@ -55,30 +55,49 @@ def process_bulk_template_send(template_id, recipients, subject=None, adj_list=N
         adj_list: Lista de adjuntos (opcional)
         from_email: Email del remitente (opcional)
         from_name: Nombre del remitente (opcional)
+        user: Usuario que realiza el envío (opcional)
 
     Returns:
         Lista con los resultados del envío
     """
+    from .models import UserEmailConfig
     client = DopplerRelayClient()
     resultados = []
     ACCOUNT_ID = str(settings.DOPPLER_RELAY["ACCOUNT_ID"])
 
     # Configuración del remitente
     FROM_EMAIL = None
-    if from_email:
-        FROM_EMAIL = str(from_email).strip()
-    elif "DEFAULT_FROM_EMAIL" in settings.DOPPLER_RELAY:
-        FROM_EMAIL = str(settings.DOPPLER_RELAY["DEFAULT_FROM_EMAIL"]).strip()
-    else:
-        raise ValueError("No se ha configurado un email del remitente")
-
     FROM_NAME = None
-    if from_name:
+
+    # 1. Prioridad: Valores explícitos pasados a la función
+    if from_email and from_name:
+        FROM_EMAIL = str(from_email).strip()
         FROM_NAME = str(from_name).strip()
-    elif "DEFAULT_FROM_NAME" in settings.DOPPLER_RELAY:
-        FROM_NAME = str(settings.DOPPLER_RELAY["DEFAULT_FROM_NAME"]).strip()
-    else:
-        FROM_NAME = ""  # El nombre del remitente es opcional
+
+    # 2. Prioridad: Configuración automática basada en el usuario
+    elif user and user.is_authenticated:
+        FROM_EMAIL = UserEmailConfig.get_from_email_for_user(
+            user,
+            fallback=settings.DOPPLER_RELAY.get("DEFAULT_FROM_EMAIL", "")
+        )
+        FROM_NAME = UserEmailConfig.get_from_name_for_user(
+            user,
+            fallback=settings.DOPPLER_RELAY.get("DEFAULT_FROM_NAME", "")
+        )
+
+    # 3. Prioridad: Valores por defecto de la configuración
+    if not FROM_EMAIL:
+        FROM_EMAIL = str(settings.DOPPLER_RELAY.get(
+            "DEFAULT_FROM_EMAIL", "")).strip()
+
+    if not FROM_NAME:
+        FROM_NAME = str(settings.DOPPLER_RELAY.get(
+            "DEFAULT_FROM_NAME", "")).strip()
+
+    # Validación final
+    if not FROM_EMAIL or not validate_email(FROM_EMAIL):
+        raise ValueError(
+            f"Email del remitente inválido o no configurado: {FROM_EMAIL}")
 
     SUBJECT = str(subject or "").strip()
 
@@ -245,7 +264,8 @@ def send_bulk_email(request: HttpRequest):
                 recipients=recipients,
                 subject=request.POST.get("subject"),
                 from_email=request.POST.get("from_email"),
-                from_name=request.POST.get("from_name")
+                from_name=request.POST.get("from_name"),
+                user=request.user  # ¡ESTO FALTABA!
             )
 
             return JsonResponse({
@@ -328,7 +348,8 @@ def send_bulk_email(request: HttpRequest):
                 subject=data.get("subject"),
                 from_email=data.get("from_email"),
                 from_name=data.get("from_name"),
-                adj_list=attachments
+                adj_list=attachments,
+                user=request.user  # ¡ESTO FALTABA!
             )
 
             return JsonResponse({
@@ -353,3 +374,122 @@ def send_bulk_email(request: HttpRequest):
                 "ok": False,
                 "error": str(e)
             }, status=500)
+
+
+@csrf_exempt
+def get_user_email_config(request: HttpRequest):
+    """
+    Endpoint para obtener la configuración de email del usuario actual.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({
+            "ok": False,
+            "error": "Usuario no autenticado"
+        }, status=401)
+
+    from .models import UserEmailConfig
+
+    try:
+        config = UserEmailConfig.get_user_email_config(request.user)
+
+        if config:
+            return JsonResponse({
+                "ok": True,
+                "config": {
+                    "from_email": config.from_email,
+                    "from_name": config.from_name,
+                    "is_active": config.is_active,
+                    "created_at": config.created_at.isoformat(),
+                    "updated_at": config.updated_at.isoformat()
+                }
+            })
+        else:
+            # Si no tiene configuración, devolver valores por defecto
+            from django.conf import settings
+            return JsonResponse({
+                "ok": True,
+                "config": {
+                    "from_email": settings.DOPPLER_RELAY.get('DEFAULT_FROM_EMAIL', ''),
+                    "from_name": settings.DOPPLER_RELAY.get('DEFAULT_FROM_NAME', ''),
+                    "is_active": False,
+                    "created_at": None,
+                    "updated_at": None
+                }
+            })
+
+    except Exception as e:
+        return JsonResponse({
+            "ok": False,
+            "error": str(e)
+        }, status=500)
+
+
+@require_POST
+@csrf_exempt
+def update_user_email_config(request: HttpRequest):
+    """
+    Endpoint para actualizar la configuración de email del usuario actual.
+    """
+    if not request.user.is_authenticated:
+        return JsonResponse({
+            "ok": False,
+            "error": "Usuario no autenticado"
+        }, status=401)
+
+    from .models import UserEmailConfig
+
+    try:
+        data = json.loads(request.body)
+        from_email = data.get('from_email', '').strip()
+        from_name = data.get('from_name', '').strip()
+
+        if not from_email:
+            return JsonResponse({
+                "ok": False,
+                "error": "El campo from_email es requerido"
+            }, status=400)
+
+        if not validate_email(from_email):
+            return JsonResponse({
+                "ok": False,
+                "error": "El email proporcionado no es válido"
+            }, status=400)
+
+        # Crear o actualizar la configuración
+        config, created = UserEmailConfig.objects.get_or_create(
+            user=request.user,
+            defaults={
+                'from_email': from_email,
+                'from_name': from_name,
+                'is_active': True
+            }
+        )
+
+        if not created:
+            config.from_email = from_email
+            config.from_name = from_name
+            config.is_active = True
+            config.save()
+
+        return JsonResponse({
+            "ok": True,
+            "message": "Configuración actualizada exitosamente",
+            "config": {
+                "from_email": config.from_email,
+                "from_name": config.from_name,
+                "is_active": config.is_active,
+                "created_at": config.created_at.isoformat(),
+                "updated_at": config.updated_at.isoformat()
+            }
+        })
+
+    except json.JSONDecodeError:
+        return JsonResponse({
+            "ok": False,
+            "error": "El cuerpo de la petición no es un JSON válido"
+        }, status=400)
+    except Exception as e:
+        return JsonResponse({
+            "ok": False,
+            "error": str(e)
+        }, status=500)
