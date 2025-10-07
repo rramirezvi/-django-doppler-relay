@@ -18,7 +18,7 @@ Aplicacion Django minimal lista para integrarse con Doppler Relay y enfocada en 
 - Para CSV se requiere al menos una columna `email` (por defecto se usa `email_column=email`).
 - `UserEmailConfig` garantiza que solo una configuracion por usuario este activa; al activar una nueva las demas se desactivan.
 - Los endpoints de configuracion de remitente requieren usuario autenticado.
-- El comando `relay_sync` depende de vistas `deliveries_since` y `events_since`; valida su disponibilidad antes de usarlo.
+- No se incluye comando de sincronizacion; implementa polling segun tus necesidades con `DopplerRelayClient`.
 
 ## Requisitos
 - Python 3.10 o superior
@@ -118,7 +118,7 @@ Respuesta tipica:
 - `EmailMessage` incluye accion "Enviar emails seleccionados" que usa `DopplerRelayClient.send_message` y registra `relay_message_id`.
 
 ## Comandos y scripts
-- `python manage.py relay_sync --hours 24`: invoca vistas de sincronizacion para entregas y eventos (asegura que existan antes de automatizar).
+- Por ahora no se incluye un comando de sincronizacion; crea scripts personalizados para consultar entregas/eventos segun tu programacion.
 - `python examples/send_sample.py`: ejemplo rapido de envio simple usando `send_message`.
 
 ## Pruebas
@@ -126,3 +126,4 @@ Respuesta tipica:
 
 ## Seguridad
 - Revisa `SECURITY.md` para politicas y buenas practicas de credenciales, dependencias y datos sensibles.
+
