@@ -33,9 +33,10 @@ Guia rapida para agentes humanos o automaticos que trabajan con esta base de cod
 ## Configuracion y entorno
 - Cargar variables desde `.env` mediante `environ.Env` al iniciar.
 - Confirmar que `DOPPLER_RELAY_API_KEY` y `DOPPLER_RELAY_ACCOUNT_ID` esten definidos antes de enviar.
-- No hay comando predefinido para sincronizar entregas/eventos; usa `DopplerRelayClient` en scripts de polling segun necesidad.
+- Usa la API de Reports de Doppler Relay con `DopplerRelayClient` para sincronizar entregas/eventos mediante scripts de polling segun necesidad.
 
 ## Operacion en admin
+- No se exponen `Delivery` ni `Event` en el admin; consulta la API de Reports para monitoreo.
 - Accion "Procesar envio masivo" espera CSV delimitado por `;` y valida variables Mustache contra la plantilla remota.
 - Accion "Enviar emails seleccionados" solo funciona para `EmailMessage.status == "created"`.
 - Al activar una configuracion de remitente desde admin, desactiva las otras del mismo usuario.
@@ -43,4 +44,3 @@ Guia rapida para agentes humanos o automaticos que trabajan con esta base de cod
 ## Observaciones
 - Tests existentes no cubren el flujo principal; agregar casos para JSON, CSV y permisos cuando se automatice.
 - Registrar trazas relevantes con `print` solo en entornos de prueba; considerar reemplazar por logging estructurado en produccion.
-

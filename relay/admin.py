@@ -4,7 +4,7 @@ from django.contrib import admin
 from django.conf import settings
 from django.utils.html import format_html
 from django.contrib.admin.widgets import FilteredSelectMultiple
-from .models import EmailMessage, Delivery, Event, BulkSend, Attachment, UserEmailConfig
+from .models import EmailMessage, BulkSend, Attachment, UserEmailConfig
 
 # Formulario para la configuración de email del usuario
 
@@ -210,25 +210,6 @@ class UserEmailConfigAdmin(admin.ModelAdmin):
             UserEmailConfig.objects.filter(user=obj.user).exclude(
                 id=obj.id).update(is_active=False)
         super().save_model(request, obj, form, change)
-
-# Admin para Delivery
-
-
-@admin.register(Delivery)
-class DeliveryAdmin(admin.ModelAdmin):
-    list_display = ("id", "relay_delivery_id", "email", "status", "ts")
-    search_fields = ("relay_delivery_id", "email", "status")
-    list_filter = ("status",)
-
-# Admin para Event
-
-
-@admin.register(Event)
-class EventAdmin(admin.ModelAdmin):
-    list_display = ("id", "kind", "email", "ts", "message_id")
-    search_fields = ("kind", "email", "message_id")
-    list_filter = ("kind",)
-
 
 # Formulario personalizado para BulkSend
 
