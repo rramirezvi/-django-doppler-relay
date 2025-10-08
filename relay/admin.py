@@ -1,10 +1,33 @@
-from .services.doppler_relay import DopplerRelayClient
+import logging
+from types import SimpleNamespace
+from typing import Any
+import threading
+import time
+
 from django import forms
-from django.contrib import admin
 from django.conf import settings
-from django.utils.html import format_html
+from django.contrib import admin, messages
+from django.contrib.admin import helpers
 from django.contrib.admin.widgets import FilteredSelectMultiple
+from django.core.cache import cache
+from django.http import HttpResponse
+from django.template.response import TemplateResponse
+from django.urls import path, reverse
+from django.utils import timezone
+from django.utils.html import format_html
+
 from .models import EmailMessage, BulkSend, Attachment, UserEmailConfig
+from .services.doppler_relay import DopplerRelayClient, DopplerRelayError
+from .services.reports import (
+    create_report_request,
+    download_report_csv,
+    wait_until_processed,
+    ReportError,
+    build_report_filename,
+)
+
+logger = logging.getLogger(__name__)
+
 
 # Formulario para la configuración de email del usuario
 
@@ -228,6 +251,12 @@ class AttachmentAdmin(admin.ModelAdmin):
 
 
 class BulkSendForm(forms.ModelForm):
+    TEMPLATE_CACHE_PREFIX = "relay:templates"
+    TEMPLATE_CACHE_FRESH_SECONDS = 300
+    TEMPLATE_CACHE_TIMEOUT = 600
+    TEMPLATE_CACHE_LOCK_SECONDS = 45
+    TEMPLATE_MAX_CHOICES = 200
+
     template_id = forms.CharField(
         max_length=128,
         help_text="ID de la plantilla en Doppler Relay"
@@ -245,19 +274,25 @@ class BulkSendForm(forms.ModelForm):
         required=False,
         help_text="""Mapeo de columnas CSV a variables de la plantilla (opcional).
         Solo es necesario si los nombres de las columnas en tu CSV no coinciden con las variables de la plantilla.
-        
+
         Ejemplo: Si tu plantilla usa {{nombre}} y {{monto}} pero tu CSV tiene las columnas "nombres_completos" y "valor_deuda":
         {
             "nombre": "nombres_completos",
             "monto": "valor_deuda"
         }
-        
+
         Si los nombres de las columnas en tu CSV coinciden con las variables de la plantilla, deja este campo vacío."""
     )
 
     class Meta:
         model = BulkSend
         fields = "__all__"
+
+    def __init__(self, *args, **kwargs):
+        self.request = kwargs.pop("request", None)
+        super().__init__(*args, **kwargs)
+        self._template_warnings: set[str] = set()
+        self._configure_template_field()
 
     def clean_variables(self):
         data = self.cleaned_data["variables"]
@@ -276,6 +311,188 @@ class BulkSendForm(forms.ModelForm):
             return []
         return data
 
+    def clean_template_id(self):
+        value = self.cleaned_data.get("template_id", "")
+        if value is None:
+            return None
+        return str(value).strip()
+
+    def _configure_template_field(self) -> None:
+        template_field = self.fields['template_id']
+        template_field.required = True
+        template_field.widget.attrs.setdefault('placeholder', 'Ingresa el ID de la plantilla')
+
+        choices = self._fetch_template_choices()
+        if not choices:
+            return
+
+        choices = sorted(choices, key=lambda item: item[1].lower())
+        if len(choices) > self.TEMPLATE_MAX_CHOICES:
+            choices = choices[:self.TEMPLATE_MAX_CHOICES]
+            self._warn("Se muestran solo 200 plantillas. Escribe el ID manual si no aparece.")
+
+        initial_value = (
+            self.initial.get('template_id')
+            or getattr(self.instance, 'template_id', '')
+            or ''
+        )
+
+        select_choices = [('', '— Selecciona una plantilla —')] + choices
+        if initial_value and not any(value == str(initial_value) for value, _ in select_choices):
+            select_choices.append((str(initial_value), f"{initial_value} (actual)"))
+
+        field = forms.ChoiceField(
+            label=template_field.label,
+            help_text=template_field.help_text,
+            required=True,
+            choices=select_choices,
+        )
+        field.widget.attrs.setdefault('required', 'required')
+        if initial_value:
+            field.initial = str(initial_value)
+        self.fields['template_id'] = field
+
+    def _fetch_template_choices(self) -> list[tuple[str, str]]:
+        account_id = self._resolve_account_id()
+        if not account_id:
+            self._warn('No se pudo determinar la cuenta de Doppler Relay. Ingresa el ID manualmente.')
+            return []
+
+        cache_key = self._cache_key(account_id)
+        cache_entry = cache.get(cache_key) if cache_key else None
+        now = time.time()
+        choices: list[tuple[str, str]] = []
+        stale = False
+
+        if isinstance(cache_entry, dict):
+            choices = cache_entry.get('choices') or []
+            fetched_at = cache_entry.get('fetched_at') or 0.0
+            age = now - fetched_at
+            stale = age > self.TEMPLATE_CACHE_FRESH_SECONDS
+            logger.info(
+                'template list cache hit',
+                extra={'account': account_id, 'age': round(age, 2), 'items': len(choices)},
+            )
+        else:
+            logger.info('template list cache miss', extra={'account': account_id})
+
+        if choices and stale:
+            self._schedule_refresh(account_id, cache_key)
+
+        if not choices:
+            choices = self._refresh_templates_cache(account_id, cache_key)
+
+        return choices
+
+    def _cache_key(self, account_id) -> str:
+        return f"{self.TEMPLATE_CACHE_PREFIX}:{account_id}"
+
+    def _schedule_refresh(self, account_id, cache_key: str) -> None:
+        lock_key = f"{self.TEMPLATE_CACHE_PREFIX}:refresh:{account_id}"
+        if not cache.add(lock_key, True, self.TEMPLATE_CACHE_LOCK_SECONDS):
+            return
+
+        def worker():
+            try:
+                self._refresh_templates_cache(account_id, cache_key, suppress_messages=True)
+            finally:
+                cache.delete(lock_key)
+
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except RuntimeError:
+            worker()
+
+    def _refresh_templates_cache(self, account_id, cache_key: str | None, *, suppress_messages: bool = False) -> list[tuple[str, str]]:
+        if cache_key is None:
+            return []
+        try:
+            choices = self._load_templates_from_api(account_id)
+        except DopplerRelayError as exc:
+            logger.warning(
+                'No se pudieron cargar las plantillas (API error)',
+                extra={'account': account_id, 'error': str(exc)},
+            )
+            if not suppress_messages:
+                self._warn('No se pudieron cargar las plantillas de Doppler Relay. Ingresa el ID manualmente.')
+            return []
+        except Exception as exc:
+            logger.exception('Fallo inesperado cargando plantillas', extra={'account': account_id})
+            if not suppress_messages:
+                self._warn('No se pudieron cargar las plantillas de Doppler Relay. Ingresa el ID manualmente.')
+            return []
+
+        cache.set(
+            cache_key,
+            {'choices': choices, 'fetched_at': time.time()},
+            self.TEMPLATE_CACHE_TIMEOUT,
+        )
+        return choices
+
+    def _load_templates_from_api(self, account_id) -> list[tuple[str, str]]:
+        start = time.perf_counter()
+        client = DopplerRelayClient()
+        data = client.list_templates(account_id)
+        latency_ms = (time.perf_counter() - start) * 1000
+        choices = self._normalize_template_items(data)
+        logger.info(
+            'template list fetch',
+            extra={'account': account_id, 'latency_ms': round(latency_ms, 2), 'items': len(choices)},
+        )
+        return choices
+
+    def _normalize_template_items(self, payload: Any) -> list[tuple[str, str]]:
+        items: list[dict[str, Any]] = []
+        if isinstance(payload, list):
+            items = [item for item in payload if isinstance(item, dict)]
+        elif isinstance(payload, dict):
+            for key in ('items', 'templates', 'data'):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    items = [item for item in value if isinstance(item, dict)]
+                    break
+                if isinstance(value, dict) and isinstance(value.get('items'), list):
+                    items = [item for item in value['items'] if isinstance(item, dict)]
+                    break
+            else:
+                if isinstance(payload.get('id'), (str, int)):
+                    items = [payload]
+
+        choices: list[tuple[str, str]] = []
+        seen: set[str] = set()
+        for item in items:
+            tpl_id = item.get('id') or item.get('templateId') or item.get('template_id')
+            name = item.get('name') or tpl_id
+            if not tpl_id:
+                continue
+            tpl_id_str = str(tpl_id).strip()
+            if not tpl_id_str or tpl_id_str in seen:
+                continue
+            seen.add(tpl_id_str)
+            display_name = str(name).strip() if isinstance(name, str) else tpl_id_str
+            label = f"{display_name} (id={tpl_id_str})"
+            choices.append((tpl_id_str, label))
+        return choices
+
+    def _resolve_account_id(self):
+        cfg = getattr(settings, 'DOPPLER_RELAY', {}) or {}
+        account_id = cfg.get('ACCOUNT_ID') or getattr(settings, 'DOPPLER_RELAY_ACCOUNT_ID', None)
+        if not account_id:
+            return None
+        try:
+            return int(account_id)
+        except (TypeError, ValueError):
+            return account_id
+
+    def _warn(self, message: str) -> None:
+        warnings = getattr(self, '_template_warnings', set())
+        if message in warnings:
+            return
+        warnings.add(message)
+        self._template_warnings = warnings
+        if self.request:
+            messages.warning(self.request, message)
+
 # Admin para BulkSend
 
 
@@ -289,6 +506,16 @@ class BulkSendAdmin(admin.ModelAdmin):
     list_filter = ("status",)
     filter_horizontal = ('attachments',)  # Para selección múltiple de adjuntos
 
+    def get_form(self, request, obj=None, **kwargs):
+        form = super().get_form(request, obj, **kwargs)
+
+        class FormWithRequest(form):
+            def __init__(self, *args, **kw):
+                kw['request'] = request
+                super().__init__(*args, **kw)
+
+        return FormWithRequest
+
     def attachment_count(self, obj):
         return obj.attachments.count()
     attachment_count.short_description = 'Adjuntos'
@@ -296,7 +523,6 @@ class BulkSendAdmin(admin.ModelAdmin):
     actions = ["procesar_envio_masivo"]
 
     def procesar_envio_masivo(self, request, queryset):
-        from django.contrib import messages
         import csv
         import io
         import json
@@ -468,3 +694,159 @@ class BulkSendAdmin(admin.ModelAdmin):
             messages.info(request, f"BulkSend {bulk.id} procesado.")
 
     procesar_envio_masivo.short_description = "Procesar envío masivo seleccionado"
+
+class DopplerReportForm(forms.Form):
+    REPORT_CHOICES = [
+        ("deliveries", "Deliveries"),
+        ("bounces", "Bounces"),
+        ("opens", "Opens"),
+        ("clicks", "Clicks"),
+        ("spam", "Spam"),
+        ("unsubscribed", "Unsubscribed"),
+        ("sent", "Sent"),
+    ]
+
+    tipo_reporte = forms.ChoiceField(label="Tipo de reporte", choices=REPORT_CHOICES)
+    fecha_inicio = forms.DateField(label="Fecha inicio", widget=forms.DateInput(attrs={"type": "date"}))
+    fecha_fin = forms.DateField(label="Fecha fin", widget=forms.DateInput(attrs={"type": "date"}))
+
+    def clean(self):
+        cleaned = super().clean()
+        start = cleaned.get("fecha_inicio")
+        end = cleaned.get("fecha_fin")
+        if start and end and start > end:
+            self.add_error("fecha_fin", "La fecha fin debe ser igual o posterior a la fecha inicio.")
+        return cleaned
+
+
+class ReportAdminView:
+    title = "📊 Reportes Doppler Relay"
+    form_class = DopplerReportForm
+
+    def __init__(self, admin_site: admin.AdminSite) -> None:
+        self.admin_site = admin_site
+        self.opts = SimpleNamespace(
+            app_label="relay",
+            model_name="dopplerreport",
+            object_name="DopplerReport",
+            verbose_name="Reporte Doppler",
+            verbose_name_plural="Reportes Doppler",
+            app_config=SimpleNamespace(verbose_name="Relay"),
+        )
+        self._register()
+
+    def _register(self) -> None:
+        if getattr(self.admin_site, "_relay_reports_registered", False):
+            return
+
+        original_get_urls = self.admin_site.get_urls
+
+        def get_urls():
+            custom = [
+                path("relay/reports/", self.admin_site.admin_view(self.view), name="relay_dopplerreport_changelist"),
+                path("relay/reports/", self.admin_site.admin_view(self.view), name="relay_reports"),
+            ]
+            return custom + original_get_urls()
+
+        self.admin_site.get_urls = get_urls
+
+        original_each_context = self.admin_site.each_context
+
+        def each_context(request):
+            context = original_each_context(request)
+            try:
+                report_url = reverse("admin:relay_dopplerreport_changelist")
+            except Exception:
+                report_url = None
+            if report_url:
+                available_apps = context.setdefault("available_apps", [])
+                link_entry = {
+                    "name": self.title,
+                    "object_name": "DopplerReport",
+                    "admin_url": report_url,
+                    "view_only": True,
+                }
+                relay_app = next((app for app in available_apps if app.get("app_label") == "relay"), None)
+                if relay_app is None:
+                    available_apps.append({
+                        "name": "Relay",
+                        "app_label": "relay",
+                        "app_url": reverse("admin:app_list", args=("relay",)),
+                        "has_module_perms": True,
+                        "models": [link_entry],
+                    })
+                else:
+                    models = relay_app.setdefault("models", [])
+                    if not any(model.get("admin_url") == report_url for model in models):
+                        models.append(link_entry)
+            return context
+
+        self.admin_site.each_context = each_context
+        self.admin_site._relay_reports_registered = True
+
+    def view(self, request):
+        if request.method == "POST":
+            form = self.form_class(request.POST)
+            if form.is_valid():
+                report_type = form.cleaned_data["tipo_reporte"]
+                start_date = form.cleaned_data["fecha_inicio"]
+                end_date = form.cleaned_data["fecha_fin"]
+                try:
+                    report_id = create_report_request(start_date, end_date, report_type)
+                    wait_until_processed(report_id)
+                    csv_bytes = download_report_csv(report_id)
+                    filename = build_report_filename(report_type)
+                    response = HttpResponse(csv_bytes, content_type="text/csv")
+                    response["Content-Disposition"] = f'attachment; filename="{filename}"'
+                    messages.success(
+                        request,
+                        "Reporte generado correctamente.",
+                    )
+                    return response
+                except ReportError as exc:
+                    logger.exception("Error generando reporte Doppler: %s", exc)
+                    messages.error(request, f"❌ Error al generar el reporte: {exc}")
+                except Exception as exc:
+                    logger.exception("Error inesperado generando reporte Doppler: %s", exc)
+                    messages.error(request, f"❌ Error al generar el reporte: {exc}")
+        else:
+            today = timezone.localdate()
+            form = self.form_class(initial={
+                "tipo_reporte": "deliveries",
+                "fecha_inicio": today,
+                "fecha_fin": today,
+            })
+
+        fieldsets = ((None, {"fields": list(form.fields.keys())}),)
+        admin_form = helpers.AdminForm(form, fieldsets, {})
+        context = {
+            **self.admin_site.each_context(request),
+            "title": self.title,
+            "adminform": admin_form,
+            "form": form,
+            "media": form.media,
+            "opts": self.opts,
+            "add": True,
+            "change": False,
+            "is_popup": False,
+            "save_on_top": False,
+            "save_on_bottom": True,
+            "show_save": True,
+            "show_save_and_add_another": False,
+            "show_save_and_continue": False,
+            "has_view_permission": True,
+            "has_add_permission": True,
+            "has_change_permission": False,
+            "has_delete_permission": False,
+            "has_editable_inline_admin_formsets": False,
+            "inline_admin_formsets": [],
+            "has_inlines": False,
+            "original": None,
+            "save_as": False,
+            "preserved_filters": getattr(self.admin_site, 'get_preserved_filters', lambda r: '')(request),
+            "form_url": "",
+        }
+        return TemplateResponse(request, "admin/change_form.html", context)
+
+
+ReportAdminView(admin.site)

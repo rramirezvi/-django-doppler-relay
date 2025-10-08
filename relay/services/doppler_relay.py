@@ -1,11 +1,14 @@
 from __future__ import annotations
 from datetime import datetime
+import logging
 import base64
 import json
 from typing import Any, Dict, Iterable, List, Optional, Tuple
+from collections import deque
 from urllib.parse import urljoin
 
 import requests
+import time
 from tenacity import retry, stop_after_attempt, wait_exponential
 from dateutil.parser import isoparse
 from django.conf import settings
@@ -14,6 +17,66 @@ from django.utils import timezone
 
 DEFAULT_BASE_URL = "https://api.dopplerrelay.com/"
 USER_AGENT = "doppler-relay-python/1.0"
+ADMIN_USER_AGENT = "relay-admin/1.0"
+
+logger = logging.getLogger(__name__)
+_TEMPLATE_CIRCUIT_STATE: Dict[str, Dict[str, Any]] = {}
+_TEMPLATE_FAILURE_WINDOW = 60
+_TEMPLATE_CIRCUIT_BLOCK = 60
+
+
+def _template_circuit_state(account_key: str) -> Dict[str, Any]:
+    state = _TEMPLATE_CIRCUIT_STATE.setdefault(
+        account_key,
+        {"failures": deque(), "block_until": 0.0},
+    )
+    return state
+
+
+def _register_template_failure(account_key: str) -> None:
+    state = _template_circuit_state(account_key)
+    now = time.monotonic()
+    failures: deque = state["failures"]
+    failures.append(now)
+    while failures and now - failures[0] > _TEMPLATE_FAILURE_WINDOW:
+        failures.popleft()
+    if len(failures) >= 3:
+        state["block_until"] = now + _TEMPLATE_CIRCUIT_BLOCK
+        logger.error(
+            "list_templates circuit open",
+            extra={"account": account_key, "block_seconds": _TEMPLATE_CIRCUIT_BLOCK},
+        )
+
+
+def _reset_template_circuit(account_key: str) -> None:
+    state = _template_circuit_state(account_key)
+    state["failures"].clear()
+    state["block_until"] = 0.0
+
+
+def _templates_count(payload: Any) -> int:
+    if isinstance(payload, list):
+        return len(payload)
+    if isinstance(payload, dict):
+        for key in ("items", "templates", "data"):
+            value = payload.get(key)
+            if isinstance(value, list):
+                return len(value)
+            if isinstance(value, dict) and isinstance(value.get("items"), list):
+                return len(value["items"])
+        if {"id", "name"} <= payload.keys():
+            return 1
+    return 0
+
+
+def _parse_retry_after(value: str | None) -> float:
+    if not value:
+        return 1.0
+    try:
+        return max(float(value), 0.5)
+    except ValueError:
+        return 1.0
+
 
 
 class DopplerRelayError(RuntimeError):
@@ -501,30 +564,32 @@ class DopplerRelayClient:
             print("Variables disponibles:", recipient_variables)
 
             # Procesar las variables para cada destinatario
-            variables = {}
-            for field in ["identificacion", "nombres", "deuda", "descuento", "total_a_pagar"]:
-                if field in recipient_variables:
-                    variables[field] = recipient_variables[field]
+            variables = {
+                key: value
+                for key, value in recipient_variables.items()
+                if isinstance(key, str) and value not in (None, "")
+            }
 
             print("Variables procesadas:", variables)
 
             # Crear y agregar el recipient al modelo con sus variables
             if variables:
-                print(f"\n📤 Configurando payload para {email}:")
+                print(f"\nConfigurando payload para {email}:")
                 recipient_payload = {
                     "email": email,
                     # Nombre del destinatario
                     "name": recipient.get("name", ""),
-                    "type": "to"  # Tipo de destinatario
+                    "type": "to",  # Tipo de destinatario
+                    "model": variables,
                 }
-                # Agregar las variables al modelo global
-                model["model"].update(variables)
+                # Agregar las variables al modelo global para compatibilidad
+                model.setdefault("model", {}).update(variables)
                 print("Payload del destinatario:")
                 print(json.dumps(recipient_payload, indent=2, ensure_ascii=False))
                 model["recipients"].append(recipient_payload)
-                print("✅ Destinatario agregado al modelo")
+                print("Destinatario agregado al modelo")
             else:
-                print(f"⚠️ No se agregó {email} porque no tiene variables")
+                print(f"No se agrego {email} porque no tiene variables")
 
         if "attachments" in recipients_model:
             attachments = []
