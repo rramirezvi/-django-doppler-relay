@@ -12,6 +12,7 @@ ALLOWED_HOSTS = [h.strip() for h in env(
     'ALLOWED_HOSTS', default='127.0.0.1,localhost').split(',') if h.strip()]
 
 INSTALLED_APPS = [
+    'relay_super',
     'django.contrib.admin',
     'django.contrib.auth',
     'django.contrib.contenttypes',
@@ -82,3 +83,4 @@ DOPPLER_RELAY = {
     "DEFAULT_FROM_EMAIL": env("DOPPLER_RELAY_FROM_EMAIL", default=""),
     "DEFAULT_FROM_NAME": env("DOPPLER_RELAY_FROM_NAME", default=""),
 }
+
