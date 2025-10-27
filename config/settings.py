@@ -56,8 +56,24 @@ MEDIA_URL = '/'  # La URL base para archivos media
 MEDIA_ROOT = BASE_DIR  # La raíz será el directorio base del proyecto
 ASGI_APPLICATION = 'config.asgi.application'
 
-DATABASES = {'default': {'ENGINE': 'django.db.backends.sqlite3',
-                         'NAME': str(BASE_DIR / 'db.sqlite3')}}
+# Base de datos default: PostgreSQL (mismo servidor por defecto)
+DB_HOST = env('DB_HOST', default='127.0.0.1')
+DB_PORT = env('DB_PORT', default='5432')
+DB_NAME = env('DB_NAME', default='relay_app')
+DB_USER = env('DB_USER', default='relay_user')
+DB_PASSWORD = env('DB_PASSWORD', default='')
+
+DATABASES = {
+    'default': {
+        'ENGINE': 'django.db.backends.postgresql',
+        'HOST': DB_HOST,
+        'PORT': DB_PORT,
+        'NAME': DB_NAME,
+        'USER': DB_USER,
+        'PASSWORD': DB_PASSWORD,
+        'CONN_MAX_AGE': 60,
+    }
+}
 
 AUTH_PASSWORD_VALIDATORS = [
     {'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator'},
