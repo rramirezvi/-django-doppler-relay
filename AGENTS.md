@@ -42,3 +42,21 @@ Guía rápida para agentes humanos o automáticos que trabajan en este repositor
 ## Observaciones
 - Extender pruebas para flujos de envío y caché de plantillas.
 - Preferir `logging` sobre `print` fuera de desarrollo.
+
+## Reporteria desacoplada (app `reports`)
+- No bloquear requests web: la solicitud de reportes crea `GeneratedReport` en `PENDING` y retorna.
+- Procesamiento fuera de request: `python manage.py process_reports_pending` (o desde admin con permiso `reports.can_process_reports`).
+- Descarga historica: los CSV quedan en `attachments/reports/` y pueden descargarse desde el admin cuando el estado es `READY`.
+- Carga tipada a BD: usar `load_report_to_db(generated_report_id, target_alias="default|analytics")`. Crea/ALTER tablas `reports_<tipo>` con tipos apropiados.
+- Multi-conexion: el alias de destino se resuelve desde `settings.DATABASES` (ej. `analytics`).
+- Trazabilidad en `GeneratedReport`: `rows_inserted`, `loaded_to_db`, `loaded_at`, `last_loaded_alias`.
+- Doble carga: se evita por alias (no se permite recargar al mismo alias; si ya se cargo en `default` aun puede cargarse en `analytics`).
+- Esquemas y logs: `attachments/reports/schemas/` contiene `schema_*.json`, `summary_all.txt` y `load_<id>.log`.
+
+### Permisos
+- `reports.can_process_reports`: ejecuta procesamiento desde admin.
+- `reports.can_load_to_db`: permite ejecutar carga a BD desde admin.
+
+### Admin
+- "Reports > Solicitar reporte": formulario simple para crear `GeneratedReport`.
+- "Reports > Reportes generados": listado con estados, descarga, boton "Procesar pendientes ahora", y botones de "Cargar BD (alias)". Muestra badge "Cargado en: <alias>" cuando `last_loaded_alias` existe.

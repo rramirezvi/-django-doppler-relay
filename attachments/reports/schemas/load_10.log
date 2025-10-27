@@ -1,0 +1,10 @@
+Load report 10 type=unsubscribed alias=default
+Table reports_unsubscribed
+  Subject -> subject (text)
+  Sender -> sender (email)
+  SenderName -> sendername (text)
+  Email -> email (email)
+  Status -> status (text)
+  Date -> date (timestamp)
+  Opens -> opens (integer)
+  Clicks -> clicks (integer)

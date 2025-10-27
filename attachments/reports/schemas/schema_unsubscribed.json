@@ -1,0 +1,101 @@
+{
+  "columns": [
+    {
+      "name": "Subject",
+      "non_null": 4,
+      "nulls": 0,
+      "samples": [
+        "Descuento en su deuda",
+        "Descuento en su deuda",
+        "Descuento en su deuda",
+        "Descuento en su deuda"
+      ],
+      "inferred_type": "text"
+    },
+    {
+      "name": "Sender",
+      "non_null": 4,
+      "nulls": 0,
+      "samples": [
+        "supervisor.cobranzas@estradacrow.com.ec",
+        "supervisor.cobranzas@estradacrow.com.ec",
+        "supervisor.cobranzas@estradacrow.com.ec",
+        "supervisor.cobranzas@estradacrow.com.ec"
+      ],
+      "inferred_type": "email"
+    },
+    {
+      "name": "SenderName",
+      "non_null": 4,
+      "nulls": 0,
+      "samples": [
+        "ricardo",
+        "ricardo",
+        "ricardo",
+        "ricardo"
+      ],
+      "inferred_type": "text"
+    },
+    {
+      "name": "Email",
+      "non_null": 4,
+      "nulls": 0,
+      "samples": [
+        "kike.rjramire@gmail.com",
+        "desarrollo@collserv.com.ec",
+        "kike.rjramire@gmail.com",
+        "desarrollo@collserv.com.ec"
+      ],
+      "inferred_type": "email"
+    },
+    {
+      "name": "Status",
+      "non_null": 4,
+      "nulls": 0,
+      "samples": [
+        "Sent",
+        "Sent",
+        "Sent",
+        "Sent"
+      ],
+      "inferred_type": "text"
+    },
+    {
+      "name": "Date",
+      "non_null": 4,
+      "nulls": 0,
+      "samples": [
+        "2025-10-25 16:40:25",
+        "2025-10-25 16:40:26",
+        "2025-10-26 20:59:02",
+        "2025-10-26 20:59:02"
+      ],
+      "inferred_type": "timestamp"
+    },
+    {
+      "name": "Opens",
+      "non_null": 4,
+      "nulls": 0,
+      "samples": [
+        "1",
+        "0",
+        "0",
+        "0"
+      ],
+      "inferred_type": "integer"
+    },
+    {
+      "name": "Clicks",
+      "non_null": 4,
+      "nulls": 0,
+      "samples": [
+        "0",
+        "0",
+        "0",
+        "0"
+      ],
+      "inferred_type": "integer"
+    }
+  ],
+  "rows_scanned": 4
+}

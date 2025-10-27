@@ -123,6 +123,42 @@ Respuesta típica:
 - Bulk Sends (por remitente) [solo superusuarios]: mismas funciones que BulkSend, con campo para elegir remitente (`UserEmailConfig`).
 
 ## Reportes y sincronización
+## Reportes (app `reports`)
+- Reporteria desacoplada del request web. La generacion y gestion de reportes vive en la app `reports`.
+- Flujo basado en `GeneratedReport` con estados: `PENDING` -> `PROCESSING` -> `READY` -> `ERROR`.
+- Creacion desde admin: "Reports > Solicitar reporte" (no bloquea). Los reportes aparecen en "Reports > Reportes generados".
+- Procesamiento: ejecutar `python manage.py process_reports_pending` (o usar el boton "Procesar pendientes ahora" en el listado con permiso `reports.can_process_reports`).
+- Descarga: cuando el estado es `READY`, aparece el enlace "Descargar CSV".
+- Carga a base tipada: boton "Cargar BD (default|analytics)" que invoca `load_report_to_db(generated_report_id, target_alias)` y persiste en tablas `reports_<tipo>` con columnas tipadas (INTEGER/REAL/BOOLEAN/TIMESTAMP/TEXT). Soporta multiples conexiones (`default`, `analytics`).
+- Trazabilidad en `GeneratedReport`: `rows_inserted`, `loaded_to_db`, `loaded_at`, `last_loaded_alias`.
+- Evita doble carga por alias: si un reporte ya se cargo en un alias, el boton para ese alias no se muestra y la vista rechaza recargas.
+- Logs y esquemas inferidos: `attachments/reports/schemas/` (archivos `schema_<tipo>.json`, `summary_all.txt`, `load_<id>.log`).
+
+### Comandos utiles
+- `python manage.py process_reports_pending` procesa `PENDING/PROCESSING` y descarga los CSV.
+- `python manage.py inspect_reports_schema --days 1` solicita una muestra por tipo y genera `schema_*.json` con tipos inferidos.
+
+### Permisos
+- `reports.can_process_reports`: ver y usar "Procesar pendientes ahora".
+- `reports.can_load_to_db`: ver y usar "Cargar BD (...)".
+
+### Ejemplo de DATABASES con alias `analytics`
+```
+DATABASES = {
+  "default": {
+    "ENGINE": "django.db.backends.sqlite3",
+    "NAME": BASE_DIR / "db.sqlite3",
+  },
+  "analytics": {
+    "ENGINE": "django.db.backends.postgresql",
+    "HOST": "db-analytics.local",
+    "PORT": "5432",
+    "NAME": "relay_analytics",
+    "USER": "analytics_user",
+    "PASSWORD": "********",
+  }
+}
+```
 - Usa la API de Reports (reportrequest) para consultar entregas, eventos y agregados.
 - Scripts de polling o CLI pueden basarse en `relay/services/reports.py`.
 

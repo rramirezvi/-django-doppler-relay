@@ -1,0 +1,14 @@
+{% extends "admin/change_list.html" %}
+
+{% block object-tools-items %}
+  {{ block.super }}
+  {% if perms.reports.can_process_reports %}
+    <li>
+      <form method="post" action="{% url 'admin:reports_generatedreport_process_pending' %}" style="display:inline;">
+        {% csrf_token %}
+        <button type="submit" class="button default">Procesar pendientes ahora</button>
+      </form>
+    </li>
+  {% endif %}
+{% endblock %}
+

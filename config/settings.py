@@ -20,6 +20,7 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
     'relay',
+    'reports',
 ]
 
 MIDDLEWARE = [
@@ -82,5 +83,13 @@ DOPPLER_RELAY = {
     "TIMEOUT": 30,
     "DEFAULT_FROM_EMAIL": env("DOPPLER_RELAY_FROM_EMAIL", default=""),
     "DEFAULT_FROM_NAME": env("DOPPLER_RELAY_FROM_NAME", default=""),
+}
+
+# Config por defecto para reportería (ajustable por .env via environ.Env si se desea)
+DOPPLER_REPORTS = {
+    "TIMEOUT": int(env("DOPPLER_REPORTS_TIMEOUT", default=30)),
+    "POLL_INITIAL_DELAY": int(env("DOPPLER_REPORTS_POLL_INITIAL_DELAY", default=2)),
+    "POLL_MAX_DELAY": int(env("DOPPLER_REPORTS_POLL_MAX_DELAY", default=15)),
+    "POLL_TOTAL_TIMEOUT": int(env("DOPPLER_REPORTS_POLL_TOTAL_TIMEOUT", default=15 * 60)),
 }
 
