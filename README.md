@@ -175,6 +175,18 @@ DATABASES = {
 
 ### Variables de entorno obligatorias (.env)
 - SECRET_KEY (obligatoria, cadena larga y aleatoria)
+
+### Entornos: desarrollo vs producción
+- Desarrollo:
+  - `DEBUG=True`
+  - `USE_SQLITE=1`
+  - No hace falta tener PostgreSQL local ni instalar `psycopg/psycopg2` en el venv.
+- Producción (Droplet):
+  - `DEBUG=False`
+  - `USE_SQLITE=0`
+  - Completar `DB_HOST`, `DB_PORT`, `DB_NAME`, `DB_USER`, `DB_PASSWORD` apuntando al PostgreSQL de la VPS.
+  - El servidor sí debe tener instalado el driver (`psycopg2-binary` o `psycopg[binary]`) en el virtualenv.
+- `analytics` (base externa) es opcional: puede configurarse después como segunda conexión; no es requerida para que la app levante.
 - DEBUG debe ser False en producción
 - ALLOWED_HOSTS (coma separada, por ejemplo: mi-dominio.com,api.mi-dominio.com)
 
