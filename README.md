@@ -170,3 +170,75 @@ DATABASES = {
 
 ## Seguridad
 - Revisa `SECURITY.md` para polÃ­ticas y buenas prÃ¡cticas de credenciales, dependencias y datos sensibles.
+
+## Deploy en producción
+
+### Variables de entorno obligatorias (.env)
+- SECRET_KEY (obligatoria, cadena larga y aleatoria)
+- DEBUG debe ser False en producción
+- ALLOWED_HOSTS (coma separada, por ejemplo: mi-dominio.com,api.mi-dominio.com)
+
+Credenciales Doppler Relay:
+- DOPPLER_RELAY_API_KEY
+- DOPPLER_RELAY_ACCOUNT_ID
+- DOPPLER_RELAY_AUTH_SCHEME (p.ej. Bearer)
+- DOPPLER_RELAY_BASE_URL (por defecto https://api.dopplerrelay.com/)
+- DOPPLER_RELAY_FROM_EMAIL, DOPPLER_RELAY_FROM_NAME (remitente por defecto)
+
+Parámetros de reportería (opcional, ya usan defaults razonables):
+- DOPPLER_REPORTS_TIMEOUT
+- DOPPLER_REPORTS_POLL_INITIAL_DELAY
+- DOPPLER_REPORTS_POLL_MAX_DELAY
+- DOPPLER_REPORTS_POLL_TOTAL_TIMEOUT
+
+Base de datos por defecto (default):
+- Por defecto es SQLite en BASE_DIR/db.sqlite3 (no requiere env). Si migras a Postgres/MySQL para default, ajusta config/settings.py -> DATABASES['default'] según tu motor y usa envs propios para host/usuario/password.
+
+Base analítica externa (analytics):
+- Se recomienda DigitalOcean Managed PostgreSQL.
+- Define en config/settings.py un alias analytics usando variables del .env para no exponer credenciales. Ejemplo:
+
+```
+# En config/settings.py
+AN_HOST = env('ANALYTICS_DB_HOST', default='')
+AN_PORT = env('ANALYTICS_DB_PORT', default='5432')
+AN_NAME = env('ANALYTICS_DB_NAME', default='')
+AN_USER = env('ANALYTICS_DB_USER', default='')
+AN_PASSWORD = env('ANALYTICS_DB_PASSWORD', default='')
+if AN_HOST and AN_NAME and AN_USER:
+    DATABASES['analytics'] = {
+        'ENGINE': 'django.db.backends.postgresql',
+        'HOST': AN_HOST,
+        'PORT': AN_PORT,
+        'NAME': AN_NAME,
+        'USER': AN_USER,
+        'PASSWORD': AN_PASSWORD,
+        'OPTIONS': {
+            'sslmode': env('ANALYTICS_DB_SSLMODE', default='require'),
+        },
+    }
+```
+
+Y en tu .env:
+
+```
+ANALYTICS_DB_HOST=db-analytics.example.com
+ANALYTICS_DB_PORT=5432
+ANALYTICS_DB_NAME=relay_analytics
+ANALYTICS_DB_USER=analytics_user
+ANALYTICS_DB_PASSWORD=********
+ANALYTICS_DB_SSLMODE=require
+```
+
+Adjuntos y reportería (CSV):
+- Los CSV se guardan en attachments/reports/ (ruta relativa a BASE_DIR).
+- En producción se recomienda montar un Volume y apuntar attachments/ a ese volumen: por ejemplo, montar en /mnt/attachments y crear un symlink attachments -> /mnt/attachments dentro del proyecto (o ajustar BASE_DIR).
+
+### Paso post-deploy en Admin (manual)
+- Entrar al admin de producción: /admin
+- Crear el grupo Report Managers
+- Otorgar permisos al grupo:
+  - reports.can_process_reports
+  - reports.can_load_to_db
+  - Permisos sobre GeneratedReport: ver/agregar/cambiar
+- Asignar el grupo Report Managers al/los usuarios operativos
