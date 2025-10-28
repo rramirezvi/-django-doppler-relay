@@ -37,7 +37,7 @@ ROOT_URLCONF = 'config.urls'
 
 TEMPLATES = [{
     'BACKEND': 'django.template.backends.django.DjangoTemplates',
-    'DIRS': [],
+    'DIRS': [str(BASE_DIR / 'config' / 'templates')],
     'APP_DIRS': True,
     'OPTIONS': {
         'context_processors': [
@@ -102,6 +102,9 @@ USE_TZ = True
 STATIC_URL = 'static/'
 STATIC_ROOT = str(BASE_DIR / 'staticfiles')
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
+# Asegurar redirección /admin -> /admin/
+APPEND_SLASH = True
 
 DOPPLER_RELAY = {
     "API_KEY": env("DOPPLER_RELAY_API_KEY", default=""),
