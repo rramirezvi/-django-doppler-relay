@@ -104,6 +104,36 @@ Notas:
 - En producción: `USE_SQLITE=0` y completar `DB_*` (el servidor SÍ necesita `psycopg2-binary` o `psycopg[binary]` en el venv).
 - `analytics` es opcional (segunda conexión Postgres, por ejemplo una base administrada). Se usa para el botón “Cargar BD (analytics)”.
 
+ALLOWED_HOSTS debe incluir el dominio, la IP pública del droplet y hosts locales:
+- Dominio: por ejemplo `app1.ramirezvi.com`
+- IP pública de la VPS
+- `localhost` y `127.0.0.1` (para pruebas internas)
+
+Ejemplo final recomendado para producción:
+```dotenv
+DEBUG=False
+USE_SQLITE=0
+
+DB_HOST=127.0.0.1
+DB_PORT=5432
+DB_NAME=doppler_prod
+DB_USER=doppler_user
+DB_PASSWORD=la_password_segura
+
+ALLOWED_HOSTS=app1.ramirezvi.com,165.232.xx.xx,localhost,127.0.0.1
+
+DOPPLER_RELAY_API_KEY=...
+DOPPLER_RELAY_ACCOUNT_ID=...
+DOPPLER_RELAY_FROM_EMAIL=...
+DOPPLER_RELAY_FROM_NAME=...
+DOPPLER_RELAY_BASE_URL=https://api.dopplerrelay.com/
+DOPPLER_RELAY_AUTH_SCHEME=Bearer
+```
+Importante: si cambias o agregas un dominio nuevo, actualiza `ALLOWED_HOSTS` en `.env` y reinicia Django para que Gunicorn lea las nuevas variables:
+```bash
+sudo systemctl restart django
+```
+
 7) Migraciones, collectstatic y superusuario (orden real)
 ```bash
 cd /opt/app/django-doppler-relay
@@ -175,6 +205,75 @@ Certbot (opcional si ya tienes dominio):
 sudo certbot --nginx -d midominio.com
 ```
 Con IP directa solo se usa HTTP y el navegador mostrará “no seguro” (esperado).
+
+9.1) Dominio + HTTPS (Let's Encrypt)
+
+Objetivo: servir la app en `https://subdominio.tu-dominio.com` con certificado válido de Let's Encrypt.
+
+Paso A. DNS
+- Crear un registro A en el DNS del dominio:
+  - Host/Name: `app1` (o el subdominio que quieres usar)
+  - Valor/IP: la IP pública del droplet (ej: `165.232.xx.xx`)
+- Esperar a que `ping app1.tu-dominio.com` resuelva a esa IP.
+
+Paso B. Bloque inicial de Nginx
+Editar `/etc/nginx/sites-available/django` para que escuche en ese dominio. Ejemplo:
+```
+server {
+    listen 80;
+    server_name app1.tu-dominio.com;
+
+    location /static/ {
+        alias /opt/app/django-doppler-relay/staticfiles/;
+    }
+
+    location / {
+        include proxy_params;
+        proxy_pass http://unix:/run/django/django.sock;
+    }
+}
+```
+Activar y validar:
+```bash
+sudo ln -sf /etc/nginx/sites-available/django /etc/nginx/sites-enabled/django
+sudo nginx -t
+sudo systemctl reload nginx
+```
+En este punto `http://app1.tu-dominio.com/admin` debe cargar (aún “no seguro”).
+
+Paso C. Emitir certificado SSL con Certbot
+
+Instalar Certbot (si no está):
+```bash
+sudo apt install -y certbot python3-certbot-nginx
+```
+Ejecutar:
+```bash
+sudo certbot --nginx -d app1.tu-dominio.com
+```
+Durante el asistente:
+- Poner un correo válido
+- Aceptar términos
+- Elegir la opción que redirige HTTP → HTTPS (force redirect)
+
+Esto hace dos cosas automáticamente:
+- Crea configuración `listen 443 ssl;` con el certificado de Let's Encrypt
+- Configura redirección `80 → 443`
+
+Después de esto, la app queda disponible en `https://app1.tu-dominio.com/admin` con candado verde.
+
+Paso D. Renovación automática
+Certbot deja una tarea en cron/systemd. Probar con:
+```bash
+sudo certbot renew --dry-run
+```
+
+Importante: cada vez que agregues un nuevo dominio/subdominio:
+- Añádelo en DNS apuntando al droplet
+- Agrégalo a `server_name` en Nginx
+- Agrégalo a `ALLOWED_HOSTS` en `.env`
+- Reinicia Django: `sudo systemctl restart django`
+- Corre: `sudo certbot --nginx -d nuevo-subdominio.dominio.com`
 
 10) Timer de reportería (opcional)
 Servicio `/etc/systemd/system/reports-process.service`:
@@ -258,3 +357,15 @@ Solución de problemas
 - Gunicorn: `journalctl -u django -f`
 - Nginx: `sudo nginx -t && sudo tail -f /var/log/nginx/error.log`
 - Timer: `journalctl -u reports-process -f`
+
+### Errores comunes
+- `DisallowedHost at /admin/` con “You may need to add 'app1.tu-dominio.com' to ALLOWED_HOSTS.”
+  - El dominio no está incluido en `ALLOWED_HOSTS`.
+  - Solución: editar `/opt/app/django-doppler-relay/.env`, añadir el dominio a `ALLOWED_HOSTS` y reiniciar:
+    ```bash
+    sudo systemctl restart django
+    ```
+- `502 Bad Gateway` en el navegador:
+  - Revisa que `django.service` esté activo: `sudo systemctl status django`
+  - Revisa que exista `/run/django/django.sock`: `ls -l /run/django/django.sock`
+  - Revisa que Nginx apunte a `proxy_pass http://unix:/run/django/django.sock;`
