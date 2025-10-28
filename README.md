@@ -254,3 +254,12 @@ Adjuntos y reportería (CSV):
   - reports.can_load_to_db
   - Permisos sobre GeneratedReport: ver/agregar/cambiar
 - Asignar el grupo Report Managers al/los usuarios operativos
+
+### Permisos del módulo relay_super (Bulk Send por remitente)
+- Visible para usuarios `is_staff` con permisos del proxy `BulkSendUserConfigProxy` en la app `relay_super` (no requiere superusuario).
+- Permisos:
+  - Ver: `relay_super.view_bulksenduserconfigproxy`
+  - Crear: `relay_super.add_bulksenduserconfigproxy`
+  - Editar/Procesar (action): `relay_super.change_bulksenduserconfigproxy`
+  - Borrar: deshabilitado por defecto
+- El action administrativo de envío masivo valida el permiso `change` antes de ejecutar.
