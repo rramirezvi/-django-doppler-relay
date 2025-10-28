@@ -288,16 +288,16 @@ Type=simple
 User=app
 Group=www-data
 WorkingDirectory=/opt/app/django-doppler-relay
+EnvironmentFile=/opt/app/django-doppler-relay/.env
 Environment="PATH=/opt/app/django-doppler-relay/.venv/bin"
 ExecStart=/opt/app/django-doppler-relay/.venv/bin/python manage.py process_reports_pending
 Restart=on-failure
 RestartSec=10
-RuntimeDirectory=django
-RuntimeDirectoryMode=0775
 
 [Install]
 WantedBy=multi-user.target
 ```
+⚠️ No declares `RuntimeDirectory` en este servicio. Ese directorio (`/run/django/`) es del servicio principal `django.service` (Gunicorn). Si el timer reclama ese directorio, Nginx puede perder el socket `/run/django/django.sock` y la app devolverá 502 Bad Gateway hasta reiniciar `django`.
 
 Timer `/etc/systemd/system/reports-process.timer`:
 ```
@@ -314,14 +314,30 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 ```
-Comandos:
+`OnUnitActiveSec=15min` controla la frecuencia. Si quieres otra (p. ej. 10 minutos), cambia ese valor.
+
+Comandos (recarga/enable y verificación):
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now reports-process.timer
-sudo systemctl list-timers | grep reports-process
-sudo journalctl -u reports-process -n 20 --no-pager
+sudo systemctl status reports-process.timer
+sudo systemctl status reports-process.service
+sudo journalctl -u reports-process.service -n 50 --no-pager
 ```
-Este timer es OPCIONAL: sin timer puedes ir al admin y usar “Procesar pendientes ahora”. Con timer, el servidor procesa PENDING cada 15 min automáticamente.
+
+#### ¿Qué pasa si el operador también hace clic en “Procesar pendientes ahora” desde el admin?
+Es seguro tener timer automático y botón manual a la vez. Si se solapan ejecuciones, no se envían correos duplicados ni se rompe nada; puede haber trabajo duplicado sobre un mismo `GeneratedReport`, pero el flujo termina marcándolo `READY` igual. La reportería corre sobre `GeneratedReport` (PENDING → PROCESSING → READY); no dispara campañas ni reenvía emails.
+
+#### Flujo del timer
+Cada vez que corre el timer:
+- Ejecuta `manage.py process_reports_pending`.
+- Busca reportes en estado `PENDING`/`PROCESSING`.
+- Pide el CSV a Doppler Relay.
+- Descarga el archivo a `attachments/reports/...`.
+- Marca el reporte como `READY` (o `ERROR` si falló).
+Si no hay pendientes, termina en 1–2 segundos. El timer no queda residente: systemd lo despierta cada X minutos.
+
+Nota: este timer es opcional. Si no lo habilitas, todo sigue funcionando y el operador puede procesar manualmente desde el admin. Si lo habilitas (`enable --now`), la reportería se procesa en background y los reportes pasarán a `READY` sin intervención humana.
 
 11) Adjuntos y CSV (Volume recomendado)
 - Crear Volume en DO, montarlo (ej. `/mnt/attachments`)
@@ -369,3 +385,18 @@ Solución de problemas
   - Revisa que `django.service` esté activo: `sudo systemctl status django`
   - Revisa que exista `/run/django/django.sock`: `ls -l /run/django/django.sock`
   - Revisa que Nginx apunte a `proxy_pass http://unix:/run/django/django.sock;`
+
+#### Par�metros opcionales de reporter�a y timer (pueden ir tambi�n en .env)
+
+DOPPLER_REPORTS_TIMEOUT=30
+DOPPLER_REPORTS_POLL_INITIAL_DELAY=5
+DOPPLER_REPORTS_POLL_MAX_DELAY=15
+DOPPLER_REPORTS_POLL_TOTAL_TIMEOUT=900
+
+REPORTS_TIMER_ENABLED=True
+REPORTS_TIMER_INTERVAL=15
+REPORTS_TIMER_LOCK_PATH=/opt/app/django-doppler-relay/tmp/timer.lock
+
+Los `DOPPLER_REPORTS_*` controlan la paciencia y la frecuencia del polling contra Doppler Relay cuando se genera la reporter�a.
+Los `REPORTS_TIMER_*` documentan la operaci�n del systemd timer.
+Estas variables son opcionales: la app sigue funcionando aunque no est�n presentes. Si no activas el timer en systemd, puedes procesar reportes manualmente desde el admin.
