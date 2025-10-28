@@ -208,3 +208,9 @@ class BulkSendUserConfigAdmin(admin.ModelAdmin):
             messages.info(request, f"BulkSend {bulk.id} procesado.")
 
     procesar_envio_masivo.short_description = "Procesar envío masivo seleccionado"
+
+# Branding global del admin
+from django.contrib import admin as _dj_admin
+_dj_admin.site.site_header = "Ramirezvi Email Platform"
+_dj_admin.site.site_title = "Ramirezvi Email Platform"
+_dj_admin.site.index_title = "Welcome to Ramirezvi Email Platform"
