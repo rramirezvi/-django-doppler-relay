@@ -54,23 +54,48 @@ class BulkSendUserConfigAdmin(admin.ModelAdmin):
     actions = ["procesar_envio_masivo"]
     filter_horizontal = ("attachments",)
 
-    # Visibilidad solo para superusuarios
+    # Permisos basados en el modelo proxy y usuarios staff
+    def _has_any_relay_super_perm(self, request) -> bool:
+        perms = (
+            "relay_super.view_bulksenduserconfigproxy",
+            "relay_super.add_bulksenduserconfigproxy",
+            "relay_super.change_bulksenduserconfigproxy",
+            "relay_super.delete_bulksenduserconfigproxy",
+        )
+        return any(request.user.has_perm(p) for p in perms)
+
     def has_module_permission(self, request):
-        return request.user.is_active and request.user.is_superuser
+        return (
+            request.user.is_active
+            and request.user.is_staff
+            and (
+                request.user.has_module_perms("relay_super")
+                or self._has_any_relay_super_perm(request)
+            )
+        )
 
     def has_view_permission(self, request, obj=None):
-        return request.user.is_active and request.user.is_superuser
+        return request.user.is_active and request.user.is_staff and request.user.has_perm(
+            "relay_super.view_bulksenduserconfigproxy"
+        )
 
     def has_add_permission(self, request):
-        return request.user.is_active and request.user.is_superuser
+        return request.user.is_active and request.user.is_staff and request.user.has_perm(
+            "relay_super.add_bulksenduserconfigproxy"
+        )
 
     def has_change_permission(self, request, obj=None):
-        return request.user.is_active and request.user.is_superuser
+        return request.user.is_active and request.user.is_staff and request.user.has_perm(
+            "relay_super.change_bulksenduserconfigproxy"
+        )
 
     def has_delete_permission(self, request, obj=None):
-        return request.user.is_active and request.user.is_superuser
+        # Bloquear borrados siempre (ajustable si se desea con permiso delete)
+        return False
 
     def procesar_envio_masivo(self, request, queryset):
+        if not (request.user.is_active and request.user.is_staff and request.user.has_perm("relay_super.change_bulksenduserconfigproxy")):
+            raise PermissionDenied("No tiene permiso para procesar envíos masivos.")
         # Basado en el flujo existente de BulkSendAdmin, pero forzando remitente explícito
         import csv
         import io
