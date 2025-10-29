@@ -4,7 +4,7 @@ from django.conf import settings
 
 class Migration(migrations.Migration):
     dependencies = [
-        ('relay', '0003_bulksend'),
+        ('relay', '0007_useremailconfig'),
         migrations.swappable_dependency(settings.AUTH_USER_MODEL),
     ]
 
