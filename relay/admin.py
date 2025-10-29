@@ -261,7 +261,8 @@ class BulkSendForm(forms.ModelForm):
         help_text="Asunto del correo (opcional, se puede usar el de la plantilla)"
     )
     recipients_file = forms.FileField(
-        help_text="Archivo CSV con los destinatarios. Debe tener al menos una columna 'email'"
+        help_text="Archivo CSV con los destinatarios. Debe tener al menos una columna 'email'",
+        widget=forms.ClearableFileInput(attrs={'accept': '.csv,text/csv'})
     )
     variables = forms.CharField(
         widget=forms.Textarea,
