@@ -294,6 +294,12 @@ class BulkSendForm(forms.ModelForm):
         super().__init__(*args, **kwargs)
         self._template_warnings: set[str] = set()
         self._configure_template_field()
+        # Evitar edición manual de la marca técnica del scheduler
+        if 'processing_started_at' in self.fields:
+            self.fields['processing_started_at'].disabled = True
+            self.fields['processing_started_at'].help_text = (
+                "Se completa automáticamente cuando el scheduler toma el envío (solo lectura)."
+            )
 
     def clean_variables(self):
         data = self.cleaned_data["variables"]
@@ -502,7 +508,7 @@ class BulkSendAdmin(admin.ModelAdmin):
     form = BulkSendForm
     list_display = ("id", "template_id", "created_at", "scheduled_at",
                     "status", "attachment_count")
-    readonly_fields = ("result", "log", "status", "created_at")
+    readonly_fields = ("result", "log", "status", "created_at", "processing_started_at")
     search_fields = ("template_id", "subject")
     list_filter = ("status", "scheduled_at")
     filter_horizontal = ('attachments',)  # Para selección múltiple de adjuntos

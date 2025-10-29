@@ -48,7 +48,7 @@ class BulkSendSenderForm(BaseBulkSendForm):
 class BulkSendUserConfigAdmin(admin.ModelAdmin):
     form = BulkSendSenderForm
     list_display = ("id", "template_id", "created_at", "status",)
-    readonly_fields = ("result", "log", "status", "created_at")
+    readonly_fields = ("result", "log", "status", "created_at", "processing_started_at")
     search_fields = ("template_id", "subject")
     list_filter = ("status",)
     actions = ["procesar_envio_masivo"]
