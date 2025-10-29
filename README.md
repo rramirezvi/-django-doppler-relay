@@ -263,3 +263,28 @@ Adjuntos y reportería (CSV):
   - Editar/Procesar (action): `relay_super.change_bulksenduserconfigproxy`
   - Borrar: deshabilitado por defecto
 - El action administrativo de envío masivo valida el permiso `change` antes de ejecutar.
+
+## Envíos programados (BulkSend)
+
+- Campos en el admin:
+  - `Programar envío` (`scheduled_at`): deja vacío para enviar ahora; si defines una fecha/hora futura, se programa automáticamente.
+  - `Scheduled by`: quién programó (para trazabilidad).
+  - `Processing started at`: se completa automáticamente cuando el scheduler toma el envío (lock anti-solape). Es de solo lectura.
+  - `Status`: `pending | done | error`.
+
+- Envío inmediato (igual que antes): deja `Programar envío` vacío (o pon una hora pasada), guarda y usa la acción “Procesar envío masivo”.
+- Envío programado: define `Programar envío` en el futuro y guarda. El scheduler lo ejecutará cuando `scheduled_at <= ahora`.
+
+- Comando manual del scheduler (sin Celery):
+  ```bash
+  python manage.py process_bulk_scheduled
+  ```
+  Procesa en lotes los `BulkSend` `pending` con `scheduled_at <= now()`; evita solapes usando `select_for_update(skip_locked=True)` y marca `processing_started_at`.
+
+- Timer opcional (systemd): consulta DEPLOY.md, sección “Scheduler de envíos programados (opcional)” para los units `bulk-scheduler.service` y `bulk-scheduler.timer` y comandos de activación.
+
+Nota de migración
+- Requiere la migración `relay/migrations/20251029151212_scheduled_fields.py`. Si vienes de una versión previa, ejecuta:
+  ```bash
+  python manage.py migrate
+  ```
