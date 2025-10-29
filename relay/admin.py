@@ -264,6 +264,12 @@ class BulkSendForm(forms.ModelForm):
         help_text="Archivo CSV con los destinatarios. Debe tener al menos una columna 'email'",
         widget=forms.ClearableFileInput(attrs={'accept': '.csv,text/csv'})
     )
+    scheduled_at = forms.DateTimeField(
+        required=False,
+        widget=forms.DateTimeInput(attrs={'type': 'datetime-local'}),
+        help_text="Déjalo vacío para enviar ahora. Si especificas fecha/hora futura, se programará automáticamente.",
+        label="Programar envío"
+    )
     variables = forms.CharField(
         widget=forms.Textarea,
         required=False,
@@ -494,11 +500,11 @@ class BulkSendForm(forms.ModelForm):
 @admin.register(BulkSend)
 class BulkSendAdmin(admin.ModelAdmin):
     form = BulkSendForm
-    list_display = ("id", "template_id", "created_at",
+    list_display = ("id", "template_id", "created_at", "scheduled_at",
                     "status", "attachment_count")
     readonly_fields = ("result", "log", "status", "created_at")
     search_fields = ("template_id", "subject")
-    list_filter = ("status",)
+    list_filter = ("status", "scheduled_at")
     filter_horizontal = ('attachments',)  # Para selección múltiple de adjuntos
 
     def get_form(self, request, obj=None, **kwargs):
