@@ -1,28 +1,28 @@
-# Guía de Deploy en Producción (DigitalOcean)
+# GuÃ­a de Deploy en ProducciÃ³n (DigitalOcean)
 
-Objetivo: provisionar una Droplet limpia y dejar el proyecto corriendo con Nginx + Gunicorn + PostgreSQL local + systemd timer opcional para reportería. Este documento es el flujo final que usamos en producción real.
+Objetivo: provisionar una Droplet limpia y dejar el proyecto corriendo con Nginx + Gunicorn + PostgreSQL local + systemd timer opcional para reporterÃ­a. Este documento es el flujo final que usamos en producciÃ³n real.
 
 Requisitos previos
-- Dominio apuntando a la IP pública de la Droplet (A record)
+- Dominio apuntando a la IP pÃºblica de la Droplet (A record)
 - Llave SSH para acceso
 - Credenciales/API de Doppler Relay
-- (Opcional) Credenciales de la base analítica `analytics`
+- (Opcional) Credenciales de la base analÃ­tica `analytics`
 
-Tamaño recomendado
+TamaÃ±o recomendado
 - Droplet Ubuntu LTS (24.04 o 22.04)
-- 2 vCPU / 4 GB RAM / 80–160 GB SSD
-- Si almacenarás muchos CSV: añade un Volume (100–250 GB) y móntalo en `attachments/`
-- Base analítica: DO Managed PostgreSQL (opcional)
+- 2 vCPU / 4 GB RAM / 80â€“160 GB SSD
+- Si almacenarÃ¡s muchos CSV: aÃ±ade un Volume (100â€“250 GB) y mÃ³ntalo en `attachments/`
+- Base analÃ­tica: DO Managed PostgreSQL (opcional)
 
 1) Acceso inicial, usuario no root y hardening
-- Conéctate por SSH como `root`
+- ConÃ©ctate por SSH como `root`
 - Crea usuario y dale sudo:
   ```bash
   adduser app
   usermod -aG sudo app
   ```
 - Copia tu llave a `app`: `ssh-copy-id app@IP`
-- Firewall básico:
+- Firewall bÃ¡sico:
   ```bash
   ufw allow OpenSSH
   ufw allow http
@@ -57,10 +57,10 @@ source .venv/bin/activate
 
 /opt/app/django-doppler-relay/.venv/bin/gunicorn --version
 ```
-Si `gunicorn` no está en esa ruta exacta, systemd fallará con `status=203/EXEC`.
+Si `gunicorn` no estÃ¡ en esa ruta exacta, systemd fallarÃ¡ con `status=203/EXEC`.
 
-5) Base de datos en producción (PostgreSQL local)
-En producción NO usamos SQLite. Creamos PostgreSQL local y asignamos propietario y permisos al esquema `public` para evitar errores de migración.
+5) Base de datos en producciÃ³n (PostgreSQL local)
+En producciÃ³n NO usamos SQLite. Creamos PostgreSQL local y asignamos propietario y permisos al esquema `public` para evitar errores de migraciÃ³n.
 
 ```bash
 sudo -u postgres psql
@@ -78,7 +78,7 @@ GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO doppler_user;
 GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO doppler_user;
 \q
 ```
-Si esto no se hace, Django no puede crear la tabla `django_migrations` y `migrate` falla con “permission denied for schema public”.
+Si esto no se hace, Django no puede crear la tabla `django_migrations` y `migrate` falla con â€œpermission denied for schema publicâ€.
 
 6) Variables de entorno (.env)
 ```dotenv
@@ -101,15 +101,15 @@ DOPPLER_RELAY_AUTH_SCHEME=Bearer
 ```
 Notas:
 - En desarrollo: `DEBUG=True`, `USE_SQLITE=1` (no se necesita Postgres ni psycopg).
-- En producción: `USE_SQLITE=0` y completar `DB_*` (el servidor SÍ necesita `psycopg2-binary` o `psycopg[binary]` en el venv).
-- `analytics` es opcional (segunda conexión Postgres, por ejemplo una base administrada). Se usa para el botón “Cargar BD (analytics)”.
+- En producciÃ³n: `USE_SQLITE=0` y completar `DB_*` (el servidor SÃ necesita `psycopg2-binary` o `psycopg[binary]` en el venv).
+- `analytics` es opcional (segunda conexiÃ³n Postgres, por ejemplo una base administrada). Se usa para el botÃ³n â€œCargar BD (analytics)â€.
 
-ALLOWED_HOSTS debe incluir el dominio, la IP pública del droplet y hosts locales:
+ALLOWED_HOSTS debe incluir el dominio, la IP pÃºblica del droplet y hosts locales:
 - Dominio: por ejemplo `app1.ramirezvi.com`
-- IP pública de la VPS
+- IP pÃºblica de la VPS
 - `localhost` y `127.0.0.1` (para pruebas internas)
 
-Ejemplo final recomendado para producción:
+Ejemplo final recomendado para producciÃ³n:
 ```dotenv
 DEBUG=False
 USE_SQLITE=0
@@ -175,7 +175,7 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now django
 sudo systemctl status django
 ```
-El socket es `/run/django/django.sock`. Si ves “Permission denied creating /run/django.sock”, no usaron este archivo actualizado.
+El socket es `/run/django/django.sock`. Si ves â€œPermission denied creating /run/django.sockâ€, no usaron este archivo actualizado.
 
 9) Nginx
 `/etc/nginx/sites-available/django`
@@ -204,16 +204,16 @@ Certbot (opcional si ya tienes dominio):
 ```bash
 sudo certbot --nginx -d midominio.com
 ```
-Con IP directa solo se usa HTTP y el navegador mostrará “no seguro” (esperado).
+Con IP directa solo se usa HTTP y el navegador mostrarÃ¡ â€œno seguroâ€ (esperado).
 
 9.1) Dominio + HTTPS (Let's Encrypt)
 
-Objetivo: servir la app en `https://subdominio.tu-dominio.com` con certificado válido de Let's Encrypt.
+Objetivo: servir la app en `https://subdominio.tu-dominio.com` con certificado vÃ¡lido de Let's Encrypt.
 
 Paso A. DNS
 - Crear un registro A en el DNS del dominio:
   - Host/Name: `app1` (o el subdominio que quieres usar)
-  - Valor/IP: la IP pública del droplet (ej: `165.232.xx.xx`)
+  - Valor/IP: la IP pÃºblica del droplet (ej: `165.232.xx.xx`)
 - Esperar a que `ping app1.tu-dominio.com` resuelva a esa IP.
 
 Paso B. Bloque inicial de Nginx
@@ -239,11 +239,11 @@ sudo ln -sf /etc/nginx/sites-available/django /etc/nginx/sites-enabled/django
 sudo nginx -t
 sudo systemctl reload nginx
 ```
-En este punto `http://app1.tu-dominio.com/admin` debe cargar (aún “no seguro”).
+En este punto `http://app1.tu-dominio.com/admin` debe cargar (aÃºn â€œno seguroâ€).
 
 Paso C. Emitir certificado SSL con Certbot
 
-Instalar Certbot (si no está):
+Instalar Certbot (si no estÃ¡):
 ```bash
 sudo apt install -y certbot python3-certbot-nginx
 ```
@@ -252,30 +252,30 @@ Ejecutar:
 sudo certbot --nginx -d app1.tu-dominio.com
 ```
 Durante el asistente:
-- Poner un correo válido
-- Aceptar términos
-- Elegir la opción que redirige HTTP → HTTPS (force redirect)
+- Poner un correo vÃ¡lido
+- Aceptar tÃ©rminos
+- Elegir la opciÃ³n que redirige HTTP â†’ HTTPS (force redirect)
 
-Esto hace dos cosas automáticamente:
-- Crea configuración `listen 443 ssl;` con el certificado de Let's Encrypt
-- Configura redirección `80 → 443`
+Esto hace dos cosas automÃ¡ticamente:
+- Crea configuraciÃ³n `listen 443 ssl;` con el certificado de Let's Encrypt
+- Configura redirecciÃ³n `80 â†’ 443`
 
-Después de esto, la app queda disponible en `https://app1.tu-dominio.com/admin` con candado verde.
+DespuÃ©s de esto, la app queda disponible en `https://app1.tu-dominio.com/admin` con candado verde.
 
-Paso D. Renovación automática
+Paso D. RenovaciÃ³n automÃ¡tica
 Certbot deja una tarea en cron/systemd. Probar con:
 ```bash
 sudo certbot renew --dry-run
 ```
 
 Importante: cada vez que agregues un nuevo dominio/subdominio:
-- Añádelo en DNS apuntando al droplet
-- Agrégalo a `server_name` en Nginx
-- Agrégalo a `ALLOWED_HOSTS` en `.env`
+- AÃ±Ã¡delo en DNS apuntando al droplet
+- AgrÃ©galo a `server_name` en Nginx
+- AgrÃ©galo a `ALLOWED_HOSTS` en `.env`
 - Reinicia Django: `sudo systemctl restart django`
 - Corre: `sudo certbot --nginx -d nuevo-subdominio.dominio.com`
 
-10) Timer de reportería (opcional)
+10) Timer de reporterÃ­a (opcional)
 Servicio `/etc/systemd/system/reports-process.service`:
 ```
 [Unit]
@@ -297,7 +297,7 @@ RestartSec=10
 [Install]
 WantedBy=multi-user.target
 ```
-⚠️ No declares `RuntimeDirectory` en este servicio. Ese directorio (`/run/django/`) es del servicio principal `django.service` (Gunicorn). Si el timer reclama ese directorio, Nginx puede perder el socket `/run/django/django.sock` y la app devolverá 502 Bad Gateway hasta reiniciar `django`.
+âš ï¸ No declares `RuntimeDirectory` en este servicio. Ese directorio (`/run/django/`) es del servicio principal `django.service` (Gunicorn). Si el timer reclama ese directorio, Nginx puede perder el socket `/run/django/django.sock` y la app devolverÃ¡ 502 Bad Gateway hasta reiniciar `django`.
 
 Timer `/etc/systemd/system/reports-process.timer`:
 ```
@@ -316,7 +316,7 @@ WantedBy=timers.target
 ```
 `OnUnitActiveSec=15min` controla la frecuencia. Si quieres otra (p. ej. 10 minutos), cambia ese valor.
 
-Comandos (recarga/enable y verificación):
+Comandos (recarga/enable y verificaciÃ³n):
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now reports-process.timer
@@ -325,8 +325,8 @@ sudo systemctl status reports-process.service
 sudo journalctl -u reports-process.service -n 50 --no-pager
 ```
 
-#### ¿Qué pasa si el operador también hace clic en “Procesar pendientes ahora” desde el admin?
-Es seguro tener timer automático y botón manual a la vez. Si se solapan ejecuciones, no se envían correos duplicados ni se rompe nada; puede haber trabajo duplicado sobre un mismo `GeneratedReport`, pero el flujo termina marcándolo `READY` igual. La reportería corre sobre `GeneratedReport` (PENDING → PROCESSING → READY); no dispara campañas ni reenvía emails.
+#### Â¿QuÃ© pasa si el operador tambiÃ©n hace clic en â€œProcesar pendientes ahoraâ€ desde el admin?
+Es seguro tener timer automÃ¡tico y botÃ³n manual a la vez. Si se solapan ejecuciones, no se envÃ­an correos duplicados ni se rompe nada; puede haber trabajo duplicado sobre un mismo `GeneratedReport`, pero el flujo termina marcÃ¡ndolo `READY` igual. La reporterÃ­a corre sobre `GeneratedReport` (PENDING â†’ PROCESSING â†’ READY); no dispara campaÃ±as ni reenvÃ­a emails.
 
 #### Flujo del timer
 Cada vez que corre el timer:
@@ -334,17 +334,17 @@ Cada vez que corre el timer:
 - Busca reportes en estado `PENDING`/`PROCESSING`.
 - Pide el CSV a Doppler Relay.
 - Descarga el archivo a `attachments/reports/...`.
-- Marca el reporte como `READY` (o `ERROR` si falló).
-Si no hay pendientes, termina en 1–2 segundos. El timer no queda residente: systemd lo despierta cada X minutos.
+- Marca el reporte como `READY` (o `ERROR` si fallÃ³).
+Si no hay pendientes, termina en 1â€“2 segundos. El timer no queda residente: systemd lo despierta cada X minutos.
 
-Nota: este timer es opcional. Si no lo habilitas, todo sigue funcionando y el operador puede procesar manualmente desde el admin. Si lo habilitas (`enable --now`), la reportería se procesa en background y los reportes pasarán a `READY` sin intervención humana.
+Nota: este timer es opcional. Si no lo habilitas, todo sigue funcionando y el operador puede procesar manualmente desde el admin. Si lo habilitas (`enable --now`), la reporterÃ­a se procesa en background y los reportes pasarÃ¡n a `READY` sin intervenciÃ³n humana.
 
 11) Adjuntos y CSV (Volume recomendado)
 - Crear Volume en DO, montarlo (ej. `/mnt/attachments`)
 - Dentro del proyecto: `ln -s /mnt/attachments attachments` para que `attachments/reports/` quede en el volumen (o ajusta rutas en settings)
 
-12) Admin post‑deploy (permisos y UI)
-- El admin incluye: badge “Cargado en: <alias>”, bloqueo de doble carga por alias, botones “Cargar BD (default)” y opcional “Cargar BD (analytics)”, y “Procesar pendientes ahora”.
+12) Admin postâ€‘deploy (permisos y UI)
+- El admin incluye: badge â€œCargado en: <alias>â€, bloqueo de doble carga por alias, botones â€œCargar BD (default)â€ y opcional â€œCargar BD (analytics)â€, y â€œProcesar pendientes ahoraâ€.
 - Crear grupo `Report Managers` y asignar:
   - Ver/descargar reportes
   - `reports.can_process_reports`
@@ -362,31 +362,31 @@ python manage.py migrate
 python manage.py collectstatic --noinput
 sudo systemctl restart django
 ```
-Si cambió la tarea de reportería:
+Si cambiÃ³ la tarea de reporterÃ­a:
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl restart reports-process.timer
 ```
 
-Solución de problemas
+SoluciÃ³n de problemas
 - 502 Bad Gateway: verifica `systemctl status django`, que exista `/run/django/django.sock` y que Nginx apunte a ese socket.
 - Gunicorn: `journalctl -u django -f`
 - Nginx: `sudo nginx -t && sudo tail -f /var/log/nginx/error.log`
 - Timer: `journalctl -u reports-process -f`
 
 ### Errores comunes
-- `DisallowedHost at /admin/` con “You may need to add 'app1.tu-dominio.com' to ALLOWED_HOSTS.”
-  - El dominio no está incluido en `ALLOWED_HOSTS`.
-  - Solución: editar `/opt/app/django-doppler-relay/.env`, añadir el dominio a `ALLOWED_HOSTS` y reiniciar:
+- `DisallowedHost at /admin/` con â€œYou may need to add 'app1.tu-dominio.com' to ALLOWED_HOSTS.â€
+  - El dominio no estÃ¡ incluido en `ALLOWED_HOSTS`.
+  - SoluciÃ³n: editar `/opt/app/django-doppler-relay/.env`, aÃ±adir el dominio a `ALLOWED_HOSTS` y reiniciar:
     ```bash
     sudo systemctl restart django
     ```
 - `502 Bad Gateway` en el navegador:
-  - Revisa que `django.service` esté activo: `sudo systemctl status django`
+  - Revisa que `django.service` estÃ© activo: `sudo systemctl status django`
   - Revisa que exista `/run/django/django.sock`: `ls -l /run/django/django.sock`
   - Revisa que Nginx apunte a `proxy_pass http://unix:/run/django/django.sock;`
 
-#### Par�metros opcionales de reporter�a y timer (pueden ir tambi�n en .env)
+#### Parámetros opcionales de reportería y timer (pueden ir también en .env)
 
 DOPPLER_REPORTS_TIMEOUT=30
 DOPPLER_REPORTS_POLL_INITIAL_DELAY=5
@@ -397,6 +397,66 @@ REPORTS_TIMER_ENABLED=True
 REPORTS_TIMER_INTERVAL=15
 REPORTS_TIMER_LOCK_PATH=/opt/app/django-doppler-relay/tmp/timer.lock
 
-Los `DOPPLER_REPORTS_*` controlan la paciencia y la frecuencia del polling contra Doppler Relay cuando se genera la reporter�a.
-Los `REPORTS_TIMER_*` documentan la operaci�n del systemd timer.
-Estas variables son opcionales: la app sigue funcionando aunque no est�n presentes. Si no activas el timer en systemd, puedes procesar reportes manualmente desde el admin.
+Los `DOPPLER_REPORTS_*` controlan la paciencia y la frecuencia del polling contra Doppler Relay cuando se genera la reportería.
+Los `REPORTS_TIMER_*` documentan la operación del systemd timer.
+Estas variables son opcionales: la app sigue funcionando aunque no estén presentes. Si no activas el timer en systemd, puedes procesar reportes manualmente desde el admin.
+
+14) Scheduler de envíos programados (opcional)
+
+Nota previa
+- Requiere la migración `relay/migrations/20251029151212_scheduled_fields.py` (corre `python manage.py migrate`).
+
+Servicio `/etc/systemd/system/bulk-scheduler.service`
+```
+[Unit]
+Description=Process scheduled bulk sends (process_bulk_scheduled)
+After=network.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=app
+Group=www-data
+WorkingDirectory=/opt/app/django-doppler-relay
+Environment="PATH=/opt/app/django-doppler-relay/.venv/bin"
+ExecStart=/opt/app/django-doppler-relay/.venv/bin/python manage.py process_bulk_scheduled
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Timer `/etc/systemd/system/bulk-scheduler.timer`
+```
+[Unit]
+Description=Run bulk scheduler periodically
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+Unit=bulk-scheduler.service
+AccuracySec=30s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Comandos
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now bulk-scheduler.timer
+sudo systemctl list-timers | grep bulk-scheduler
+journalctl -u bulk-scheduler -n 50 --no-pager
+```
+
+Concurrencia y seguridad
+- El scheduler usa `select_for_update(skip_locked=True)` y `processing_started_at` para evitar solapes/doble ejecución.
+- Si un operador dispara manualmente antes de la hora, el envío se hace inmediato; el scheduler ya lo encontrará como `done`/`error`.
+
+Variables de entorno (documentativas, opcionales; el intervalo real lo define systemd)
+```dotenv
+BULK_SCHEDULER_ENABLED=True
+BULK_SCHEDULER_INTERVAL_MIN=2
+```
