@@ -1,0 +1,11 @@
+{% extends "admin/base_site.html" %}
+{% block content %}
+  <h1>Confirm delete</h1>
+  <p>Are you sure you want to delete template <code>{{ template_id }}</code>?</p>
+  <form method="post">
+    {% csrf_token %}
+    <input type="submit" value="Yes, delete" class="deletelink"/>
+    <a class="button" href="{% url 'admin:templates_admin_list' %}">Cancel</a>
+  </form>
+{% endblock %}
+

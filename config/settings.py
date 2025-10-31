@@ -21,6 +21,7 @@ INSTALLED_APPS = [
     'django.contrib.staticfiles',
     'relay',
     'reports',
+    'templates_admin',
 ]
 
 MIDDLEWARE = [
@@ -123,4 +124,5 @@ DOPPLER_REPORTS = {
     "POLL_MAX_DELAY": int(env("DOPPLER_REPORTS_POLL_MAX_DELAY", default=15)),
     "POLL_TOTAL_TIMEOUT": int(env("DOPPLER_REPORTS_POLL_TOTAL_TIMEOUT", default=15 * 60)),
 }
+
 

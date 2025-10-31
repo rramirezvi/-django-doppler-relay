@@ -1,0 +1,43 @@
+{% extends "admin/base_site.html" %}
+{% load static %}
+
+{% block content %}
+  <div class="app-templates">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <h1>Templates</h1>
+      <a class="button" href="{% url 'admin:templates_admin_new' %}">Create template</a>
+    </div>
+
+    {% if templates_items %}
+      <table class="adminlist" style="width:100%;">
+        <thead>
+          <tr>
+            <th style="width:28%;">Name</th>
+            <th>Subject</th>
+            <th style="width:28%;">ID</th>
+            <th style="width:160px;">Actions</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for it in templates_items %}
+            <tr>
+              <td>{{ it.name|default:it.id }}</td>
+              <td>{{ it.subject|default:"" }}</td>
+              <td><code>{{ it.id }}</code></td>
+              <td>
+                <a class="button" href="{% url 'admin:templates_admin_edit' it.id %}">Edit</a>
+                <form method="post" action="{% url 'admin:templates_admin_delete' it.id %}" style="display:inline;">
+                  {% csrf_token %}
+                  <button class="button" onclick="return confirm('Delete template {{ it.name|default:it.id }}?')">Delete</button>
+                </form>
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p>No templates found.</p>
+    {% endif %}
+  </div>
+{% endblock %}
+

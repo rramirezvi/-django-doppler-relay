@@ -477,6 +477,29 @@ class DopplerRelayClient:
             "DELETE", f"/accounts/{account_id}/templates/{template_id}")
         return None
 
+    # Helper to obtain HTML body using only the main GET endpoint
+    def get_template_html(self, account_id: int, template_id: str) -> str:
+        def _extract_html(payload: dict) -> str:
+            for key in ("html", "htmlContent", "body", "content", "textContent"):
+                val = payload.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val
+            for k in ("template", "data", "attributes"):
+                sub = payload.get(k)
+                if isinstance(sub, dict):
+                    v = _extract_html(sub)
+                    if v:
+                        return v
+            return ""
+
+        try:
+            data = self.get_template(account_id, template_id)
+            if isinstance(data, dict):
+                return _extract_html(data) or ""
+        except Exception:
+            return ""
+        return ""
+
     def send_template_message(self, account_id: int, template_id: str, recipients_model: dict[str, Any]) -> dict[str, Any]:
         """
         Envía un mensaje usando una plantilla de Doppler Relay con variables Mustache.

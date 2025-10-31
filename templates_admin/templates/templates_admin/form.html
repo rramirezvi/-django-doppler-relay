@@ -1,0 +1,70 @@
+{% extends "admin/base_site.html" %}
+{% block content %}
+  <style>
+    #content-main form { max-width: 100%; }
+    .module.aligned .form-row > div { width: 100%; }
+    .module.aligned label { min-width: 12rem; display: inline-block; vertical-align: top; }
+    .module.aligned .form-row input[type="text"],
+    .module.aligned .form-row input[type="email"],
+    .module.aligned .form-row textarea { width: 100% !important; }
+    #tpl-preview { width: 100%; min-height: 560px; border:1px solid #444; background:#fff; }
+  </style>
+  <div class="breadcrumbs">
+    <a href="{% url 'admin:index' %}">Home</a> ›
+    <a href="{% url 'admin:templates_admin_list' %}">Templates</a> ›
+    {{ title }}
+  </div>
+
+  <div id="content-main">
+    <form method="post" novalidate>
+      {% csrf_token %}
+      <div>
+        {{ form.non_field_errors }}
+        <fieldset class="module aligned">
+          {% for field in form %}
+            <div class="form-row">
+              {{ field.errors }}
+              <div>
+                <label>{{ field.label }}:</label>
+                {{ field }}
+                {% if field.help_text %}<p class="help">{{ field.help_text }}</p>{% endif %}
+              </div>
+            </div>
+          {% endfor %}
+        </fieldset>
+      </div>
+      <div class="submit-row">
+        <input type="submit" value="Save" class="default" />
+        <a href="{% url 'admin:templates_admin_list' %}" class="deletelink">Cancel</a>
+      </div>
+    </form>
+
+    <h2>Preview</h2>
+    <p class="help">Live preview of the HTML body. External assets must allow direct access from the server.</p>
+    <iframe id="tpl-preview"></iframe>
+  </div>
+  <script>
+    (function(){
+      function updatePreview(){
+        var ta = document.getElementById('id_body_html');
+        if(!ta) return;
+        var ifr = document.getElementById('tpl-preview');
+        var doc = ifr.contentDocument || ifr.contentWindow.document;
+        doc.open();
+        doc.write(ta.value || '<!doctype html><html><body><p style="font:14px system-ui;color:#666">(Empty)</p></body></html>');
+        doc.close();
+      }
+      document.addEventListener('DOMContentLoaded', function(){
+        var ta = document.getElementById('id_body_html');
+        if(ta){
+          updatePreview();
+          ta.addEventListener('input', function(){
+            // debounce simple
+            clearTimeout(window.__tplPrev);
+            window.__tplPrev = setTimeout(updatePreview, 250);
+          });
+        }
+      });
+    })();
+  </script>
+{% endblock %}
