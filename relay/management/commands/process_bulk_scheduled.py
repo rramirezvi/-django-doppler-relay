@@ -73,25 +73,83 @@ class Command(BaseCommand):
         recipients: list[dict] = []
         try:
             with bulk.recipients_file.open("rb") as f:
+                # Leer con tolerancia a BOM y saltos de línea
                 content = f.read().decode("utf-8-sig")
-                reader = csv.DictReader(io.StringIO(content))  # CSV esperado delimitado por comas
-                headers = [h.strip().lower() for h in (reader.fieldnames or [])]
-                if "email" not in headers:
-                    raise ValueError("El archivo CSV debe tener una columna 'email'")
+
+                # Detectar delimitador o probar variantes comunes (; y ,)
+                def parse_with(delim: str):
+                    rdr = csv.DictReader(io.StringIO(content), delimiter=delim)
+                    raw_headers = rdr.fieldnames or []
+                    headers = [h.strip().lower() for h in raw_headers]
+                    return rdr, headers, raw_headers
+
+                reader = None
+                headers = []
+                raw_headers = []
+                chosen_delim = None
+                for delim in [";", ","]:
+                    rdr, hdrs, raw = parse_with(delim)
+                    # Variantes aceptadas para columna email
+                    email_variants = [
+                        "email", "correo", "e-mail", "mail", "email_address", "correo_electronico",
+                        "\ufeffemail",  # por si arrastra BOM
+                    ]
+                    if any(v in hdrs for v in email_variants):
+                        reader, headers, raw_headers, chosen_delim = rdr, hdrs, raw, delim
+                        break
+
+                # Si no se detectó, intentar con csv.Sniffer como último recurso
+                if reader is None:
+                    try:
+                        sample = content[:2048]
+                        dialect = csv.Sniffer().sniff(sample, delimiters=",;")
+                        rdr, hdrs, raw = parse_with(dialect.delimiter)
+                        if any(v in hdrs for v in ["email", "\ufeffemail"]):
+                            reader, headers, raw_headers, chosen_delim = rdr, hdrs, raw, dialect.delimiter
+                    except Exception:
+                        pass
+
+                if reader is None:
+                    raise ValueError(
+                        f"No se pudo detectar el delimitador ni la columna de email. Columnas encontradas: {raw_headers}")
+
+                # Determinar columna de email real
+                email_column = None
+                for v in ["email", "\ufeffemail", "correo", "e-mail", "mail", "email_address", "correo_electronico"]:
+                    if v in headers:
+                        email_column = v
+                        break
+                if not email_column:
+                    raise ValueError(
+                        f"El archivo CSV debe tener una columna 'email' (o variantes). Columnas: {headers}. Delimitador detectado: {chosen_delim!r}")
+
+                # Map de variables personalizado (si existe)
+                try:
+                    variables_mapping = json.loads(bulk.variables) if getattr(bulk, "variables", None) else {}
+                except json.JSONDecodeError:
+                    raise ValueError("El mapeo de variables no es un JSON válido")
+
                 for row in reader:
-                    clean = {k.strip().lower(): (v.strip() if v else v) for k, v in row.items()}
-                    email_value = clean.get("email")
+                    clean = {str(k).strip().lower(): (v.strip() if isinstance(v, str) else v)
+                             for k, v in row.items()}
+                    email_value = (clean.get(email_column) or clean.get("email") or clean.get("\ufeffemail"))
                     if not email_value:
                         continue
-                    variables = {k: v for k, v in clean.items() if k != "email" and v}
-                    missing = required_vars - set(variables.keys())
+
+                    # Construcción de variables: por mapeo o por todas las columnas excepto email
+                    if variables_mapping:
+                        variables = {tpl_var: clean.get(csv_col.lower()) for tpl_var, csv_col in variables_mapping.items()}
+                    else:
+                        variables = {k: v for k, v in clean.items() if k not in (email_column, "email", "\ufeffemail") and v}
+
+                    missing = required_vars - set(variables.keys()) if required_vars else set()
                     if missing:
                         raise ValueError(
-                            f"Faltan variables requeridas para {email_value}: {', '.join(missing)}"
-                        )
+                            f"Faltan variables requeridas para {email_value}: {', '.join(sorted(missing))}")
+
                     recipients.append({
                         "email": email_value,
-                        "name": clean.get("nombres", ""),
+                        "name": clean.get("nombres", "") or clean.get("name", ""),
                         "variables": variables,
                     })
         except Exception as e:
@@ -137,4 +195,3 @@ class Command(BaseCommand):
             bulk.status = "error"
             bulk.log = (bulk.log or "") + f"\n[Scheduler] Error en envío: {e}"
         bulk.save(update_fields=["result", "status", "log", "processing_started_at"])
-
