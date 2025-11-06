@@ -125,7 +125,7 @@ class Command(BaseCommand):
 
                 # Map de variables personalizado (si existe)
                 try:
-                    variables_mapping = json.loads(bulk.variables) if getattr(bulk, "variables", None) else {}
+                    variables_mapping = (bulk.variables if isinstance(bulk.variables, dict) else (json.loads(bulk.variables) if getattr(bulk, "variables", None) else {}))
                 except json.JSONDecodeError:
                     raise ValueError("El mapeo de variables no es un JSON válido")
 
