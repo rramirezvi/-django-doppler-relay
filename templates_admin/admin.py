@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from django.contrib import admin, messages
+from django.core.exceptions import PermissionDenied
 from django.template.response import TemplateResponse
 from django.urls import path, reverse
 from django.shortcuts import redirect
@@ -27,6 +28,8 @@ class TemplatesAdminViews:
 
     # ---- list ----
     def list_view(self, request):
+        if not request.user.has_perm("templates_admin.manage_templates"):
+            raise PermissionDenied
         client = self._client()
         items: list[dict] = []
         try:
@@ -54,6 +57,8 @@ class TemplatesAdminViews:
 
     # ---- create/edit ----
     def create_view(self, request):
+        if not request.user.has_perm("templates_admin.manage_templates"):
+            raise PermissionDenied
         if request.method == "POST":
             form = TemplateForm(request.POST)
             if form.is_valid():
@@ -86,6 +91,8 @@ class TemplatesAdminViews:
         return TemplateResponse(request, "templates_admin/form.html", context)
 
     def edit_view(self, request, template_id: str):
+        if not request.user.has_perm("templates_admin.manage_templates"):
+            raise PermissionDenied
         client = self._client()
         try:
             data = client.get_template(self._account_id(), template_id)
@@ -184,6 +191,8 @@ class TemplatesAdminViews:
         return TemplateResponse(request, "templates_admin/form.html", context)
 
     def delete_view(self, request, template_id: str):
+        if not request.user.has_perm("templates_admin.manage_templates"):
+            raise PermissionDenied
         if request.method != "POST":
             # small confirmation page
             context = {
@@ -227,7 +236,7 @@ class TemplatesAdminViews:
                 list_url = reverse("admin:templates_admin_list")
             except Exception:
                 list_url = None
-            if list_url:
+            if list_url and request.user.has_perm("templates_admin.manage_templates"):
                 apps = context.setdefault("available_apps", [])
                 entry = {
                     "name": self.title,
@@ -260,7 +269,7 @@ class TemplatesAdminViews:
                 list_url = reverse("admin:templates_admin_list")
             except Exception:
                 list_url = None
-            if list_url:
+            if list_url and request.user.has_perm("templates_admin.manage_templates"):
                 # If not present, append a minimal entry so it shows up on index
                 found = any(app.get("app_label") == "templates_admin" for app in app_list)
                 if not found:
@@ -281,4 +290,3 @@ class TemplatesAdminViews:
 
 # Register the custom admin views
 TemplatesAdminViews(admin.site)
-
