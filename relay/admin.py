@@ -586,6 +586,13 @@ class BulkSendAdmin(admin.ModelAdmin):
                     # Obtener el mapeo de variables (si existe)
                     try:
                         variables_mapping = (bulk.variables if isinstance(bulk.variables, dict) else (json.loads(bulk.variables) if bulk.variables else {}))
+                        # Filtrar claves reservadas y valores no-string
+                        if isinstance(variables_mapping, dict):
+                            variables_mapping = {
+                                k: v
+                                for k, v in variables_mapping.items()
+                                if isinstance(k, str) and isinstance(v, str) and not k.startswith("__")
+                            }
                         if variables_mapping:
                             bulk.log += f"Usando mapeo personalizado: {json.dumps(variables_mapping, indent=2)}\n"
                         else:

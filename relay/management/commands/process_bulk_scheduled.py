@@ -126,6 +126,13 @@ class Command(BaseCommand):
                 # Map de variables personalizado (si existe)
                 try:
                     variables_mapping = (bulk.variables if isinstance(bulk.variables, dict) else (json.loads(bulk.variables) if getattr(bulk, "variables", None) else {}))
+                    # Filtrar claves reservadas y valores no-string
+                    if isinstance(variables_mapping, dict):
+                        variables_mapping = {
+                            k: v
+                            for k, v in variables_mapping.items()
+                            if isinstance(k, str) and isinstance(v, str) and not k.startswith("__")
+                        }
                 except json.JSONDecodeError:
                     raise ValueError("El mapeo de variables no es un JSON válido")
 
