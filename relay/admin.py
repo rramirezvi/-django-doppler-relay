@@ -535,11 +535,14 @@ class BulkSendAdmin(admin.ModelAdmin):
     template_display.short_description = 'Plantilla'
 
     def report_link(self, obj: BulkSend):
-        try:
-            url = reverse("admin:relay_bulksend_report", args=[obj.pk])
-            return format_html('<a class="button" href="{}">Ver reporte</a>', url)
-        except Exception:
-            return ""
+        # Mostrar solo cuando el envío terminó y la carga post‑envío está lista
+        if getattr(obj, "status", "") == "done" and getattr(obj, "post_reports_loaded_at", None):
+            try:
+                url = reverse("admin:relay_bulksend_report", args=[obj.pk])
+                return format_html('<a class="button" href="{}">Ver reporte</a>', url)
+            except Exception:
+                return ""
+        return ""
     report_link.short_description = 'Reporte'
 
     def save_model(self, request, obj: BulkSend, form, change):

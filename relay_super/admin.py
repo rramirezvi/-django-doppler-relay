@@ -4,6 +4,8 @@ from django import forms
 from django.contrib import admin, messages
 from django.core.exceptions import PermissionDenied
 from django.utils.translation import gettext_lazy as _
+from django.utils.html import format_html
+from django.urls import reverse
 
 from relay.models import BulkSend, UserEmailConfig
 from relay_super.models import BulkSendUserConfigProxy
@@ -45,7 +47,7 @@ class BulkSendSenderForm(BaseBulkSendForm):
 @admin.register(BulkSendUserConfigProxy)
 class BulkSendUserConfigAdmin(admin.ModelAdmin):
     form = BulkSendSenderForm
-    list_display = ("id", "template_display", "subject", "created_at", "status",)
+    list_display = ("id", "template_display", "subject", "created_at", "status", "report_link")
     readonly_fields = ("result", "log", "status", "created_at", "processing_started_at")
     search_fields = ("template_id", "subject")
     list_filter = ("status",)
@@ -56,6 +58,17 @@ class BulkSendUserConfigAdmin(admin.ModelAdmin):
     def template_display(self, obj: BulkSend):
         return obj.template_name or obj.template_id
     template_display.short_description = "Plantilla"
+
+    def report_link(self, obj: BulkSend):
+        # Mostrar solo cuando el envío terminó y la carga post‑envío está lista
+        if getattr(obj, "status", "") == "done" and getattr(obj, "post_reports_loaded_at", None):
+            try:
+                url = reverse("admin:relay_bulksend_report", args=[obj.pk])
+                return format_html('<a class="button" href="{}">Ver reporte</a>', url)
+            except Exception:
+                return ""
+        return ""
+    report_link.short_description = "Reporte"
 
     def procesar_envio_masivo(self, request, queryset):
         if not (request.user.is_active and request.user.is_staff and request.user.has_perm("relay_super.change_bulksenduserconfigproxy")):
