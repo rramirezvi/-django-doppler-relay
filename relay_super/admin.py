@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from django import forms
 from django.contrib import admin, messages
@@ -7,15 +7,14 @@ from django.utils.translation import gettext_lazy as _
 
 from relay.models import BulkSend, UserEmailConfig
 from relay_super.models import BulkSendUserConfigProxy
-from relay.views import process_bulk_template_send
-from relay.services.doppler_relay import DopplerRelayClient
+from relay.views import process_bulk_template_send`r`nfrom relay.services.bulk_processing import process_bulk_id`r`nfrom relay.services.doppler_relay import DopplerRelayClient
 from django.conf import settings
 from relay.admin import BulkSendForm as BaseBulkSendForm
 
 
 class SenderChoiceField(forms.ModelChoiceField):
     def label_from_instance(self, obj: UserEmailConfig) -> str:  # type: ignore[override]
-        return f"{obj.user.username} – {obj.from_email}"
+        return f"{obj.user.username} â€“ {obj.from_email}"
 
 
 class BulkSendSenderForm(BaseBulkSendForm):
@@ -23,7 +22,7 @@ class BulkSendSenderForm(BaseBulkSendForm):
         queryset=UserEmailConfig.objects.filter(is_active=True).select_related("user"),
         required=True,
         label=_("Remitente (UserEmailConfig)"),
-        help_text=_("Seleccione el remitente (from_name / from_email) para este envío."),
+        help_text=_("Seleccione el remitente (from_name / from_email) para este envÃ­o."),
     )
 
     class Meta(BaseBulkSendForm.Meta):
@@ -102,7 +101,7 @@ class BulkSendUserConfigAdmin(admin.ModelAdmin):
                 messages.warning(request, f"BulkSend {bulk.id} ya procesado.")
                 continue
             bulk.processing_started_at = timezone.now()
-            bulk.log = ((bulk.log or "") + "\n[BG] Envío iniciado desde admin (por remitente)").strip()
+            bulk.log = ((bulk.log or "") + "\n[BG] EnvÃ­o iniciado desde admin (por remitente)").strip()
             bulk.save(update_fields=["processing_started_at", "log"]) 
             threading.Thread(target=process_bulk_id, args=(bulk.id,), daemon=True).start()
             messages.info(request, f"BulkSend {bulk.id} en proceso (background). Revise el estado en la lista.")
@@ -110,8 +109,8 @@ class BulkSendUserConfigAdmin(admin.ModelAdmin):
         if scheduled_any:
             return
         if not (request.user.is_active and request.user.is_staff and request.user.has_perm("relay_super.change_bulksenduserconfigproxy")):
-            raise PermissionDenied("No tiene permiso para procesar envíos masivos.")
-        # Basado en el flujo existente de BulkSendAdmin, pero forzando remitente explícito
+            raise PermissionDenied("No tiene permiso para procesar envÃ­os masivos.")
+        # Basado en el flujo existente de BulkSendAdmin, pero forzando remitente explÃ­cito
         import csv
         import io
         import json
@@ -135,7 +134,7 @@ class BulkSendUserConfigAdmin(admin.ModelAdmin):
                 sender_config = None
 
             if not sender_config:
-                messages.error(request, f"BulkSend {bulk.id}: Seleccione un remitente válido (UserEmailConfig).")
+                messages.error(request, f"BulkSend {bulk.id}: Seleccione un remitente vÃ¡lido (UserEmailConfig).")
                 continue
 
             recipients = []
@@ -202,7 +201,7 @@ class BulkSendUserConfigAdmin(admin.ModelAdmin):
                     response.content.decode("utf-8") if hasattr(response, 'content') else json.dumps(response)
                 )
                 bulk.status = "done"
-                bulk.log = f"Envío realizado con remitente {sender_config.from_email}"
+                bulk.log = f"EnvÃ­o realizado con remitente {sender_config.from_email}"
             except Exception as e:
                 import traceback
                 api_error = None
@@ -218,14 +217,15 @@ class BulkSendUserConfigAdmin(admin.ModelAdmin):
                     "api_error": api_error
                 })
                 bulk.status = "error"
-                bulk.log = f"Error en envío: {e}"
+                bulk.log = f"Error en envÃ­o: {e}"
             bulk.save()
             messages.info(request, f"BulkSend {bulk.id} procesado.")
 
-    procesar_envio_masivo.short_description = "Procesar envío masivo seleccionado"
+    procesar_envio_masivo.short_description = "Procesar envÃ­o masivo seleccionado"
 
 # Branding global del admin
 from django.contrib import admin as _dj_admin
 _dj_admin.site.site_header = "Ramirezvi Email Platform"
 _dj_admin.site.site_title = "Ramirezvi Email Platform"
 _dj_admin.site.index_title = "Welcome to Ramirezvi Email Platform"
+
