@@ -45,12 +45,17 @@ class BulkSendSenderForm(BaseBulkSendForm):
 @admin.register(BulkSendUserConfigProxy)
 class BulkSendUserConfigAdmin(admin.ModelAdmin):
     form = BulkSendSenderForm
-    list_display = ("id", "template_id", "created_at", "status",)
+    list_display = ("id", "template_display", "subject", "created_at", "status",)
     readonly_fields = ("result", "log", "status", "created_at", "processing_started_at")
     search_fields = ("template_id", "subject")
     list_filter = ("status",)
     actions = ["procesar_envio_masivo"]
     filter_horizontal = ("attachments",)
+
+    # Mostrar nombre de plantilla si existe; si no, el ID
+    def template_display(self, obj: BulkSend):
+        return obj.template_name or obj.template_id
+    template_display.short_description = "Plantilla"
 
     def procesar_envio_masivo(self, request, queryset):
         if not (request.user.is_active and request.user.is_staff and request.user.has_perm("relay_super.change_bulksenduserconfigproxy")):
