@@ -7,9 +7,7 @@ from django.utils.translation import gettext_lazy as _
 
 from relay.models import BulkSend, UserEmailConfig
 from relay_super.models import BulkSendUserConfigProxy
-from relay.views import process_bulk_template_send
 from relay.services.bulk_processing import process_bulk_id
-from django.conf import settings
 from relay.admin import BulkSendForm as BaseBulkSendForm
 
 
