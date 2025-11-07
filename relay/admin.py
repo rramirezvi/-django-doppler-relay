@@ -18,6 +18,7 @@ from django.utils.html import format_html
 
 from .models import EmailMessage, BulkSend, Attachment, UserEmailConfig
 from .services.doppler_relay import DopplerRelayClient, DopplerRelayError
+from .services.bulk_processing import process_bulk_id
 
 
 logger = logging.getLogger(__name__)
@@ -530,6 +531,22 @@ class BulkSendAdmin(admin.ModelAdmin):
     actions = ["procesar_envio_masivo"]
 
     def procesar_envio_masivo(self, request, queryset):
+        # Ejecutar en background para no bloquear la request del admin
+        from django.utils import timezone
+        import threading
+        scheduled_any = False
+        for bulk in queryset:
+            if bulk.status != "pending":
+                messages.warning(request, f"BulkSend {bulk.id} ya procesado.")
+                continue
+            bulk.processing_started_at = timezone.now()
+            bulk.log = ((bulk.log or "") + "\n[BG] Envío iniciado desde admin").strip()
+            bulk.save(update_fields=["processing_started_at", "log"])
+            threading.Thread(target=process_bulk_id, args=(bulk.id,), daemon=True).start()
+            messages.info(request, f"BulkSend {bulk.id} en proceso (background). Revise el estado en la lista.")
+            scheduled_any = True
+        if scheduled_any:
+            return
         import csv
         import io
         import json

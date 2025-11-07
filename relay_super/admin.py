@@ -94,6 +94,21 @@ class BulkSendUserConfigAdmin(admin.ModelAdmin):
         return False
 
     def procesar_envio_masivo(self, request, queryset):
+        from django.utils import timezone
+        import threading
+        scheduled_any = False
+        for bulk in queryset:
+            if bulk.status != "pending":
+                messages.warning(request, f"BulkSend {bulk.id} ya procesado.")
+                continue
+            bulk.processing_started_at = timezone.now()
+            bulk.log = ((bulk.log or "") + "\n[BG] Envío iniciado desde admin (por remitente)").strip()
+            bulk.save(update_fields=["processing_started_at", "log"]) 
+            threading.Thread(target=process_bulk_id, args=(bulk.id,), daemon=True).start()
+            messages.info(request, f"BulkSend {bulk.id} en proceso (background). Revise el estado en la lista.")
+            scheduled_any = True
+        if scheduled_any:
+            return
         if not (request.user.is_active and request.user.is_staff and request.user.has_perm("relay_super.change_bulksenduserconfigproxy")):
             raise PermissionDenied("No tiene permiso para procesar envíos masivos.")
         # Basado en el flujo existente de BulkSendAdmin, pero forzando remitente explícito
