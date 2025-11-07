@@ -15,6 +15,7 @@ from django.template.response import TemplateResponse
 from django.urls import path, reverse
 from django.utils import timezone
 from django.utils.html import format_html
+from django.db import models
 
 from .models import EmailMessage, BulkSend, Attachment, UserEmailConfig
 from .services.doppler_relay import DopplerRelayClient, DopplerRelayError
@@ -507,8 +508,8 @@ class BulkSendForm(forms.ModelForm):
 @admin.register(BulkSend)
 class BulkSendAdmin(admin.ModelAdmin):
     form = BulkSendForm
-    list_display = ("id", "template_id", "created_at", "scheduled_at",
-                    "status", "attachment_count")
+    list_display = ("id", "template_display", "subject", "created_at", "scheduled_at",
+                    "status", "attachment_count", "report_link")
     readonly_fields = ("result", "log", "status", "created_at", "processing_started_at")
     search_fields = ("template_id", "subject")
     list_filter = ("status", "scheduled_at")
@@ -527,6 +528,35 @@ class BulkSendAdmin(admin.ModelAdmin):
     def attachment_count(self, obj):
         return obj.attachments.count()
     attachment_count.short_description = 'Adjuntos'
+
+    # Columnas extra
+    def template_display(self, obj: BulkSend):
+        return obj.template_name or obj.template_id
+    template_display.short_description = 'Plantilla'
+
+    def report_link(self, obj: BulkSend):
+        try:
+            url = reverse("admin:relay_bulksend_report", args=[obj.pk])
+            return format_html('<a class="button" href="{}">Ver reporte</a>', url)
+        except Exception:
+            return ""
+    report_link.short_description = 'Reporte'
+
+    def save_model(self, request, obj: BulkSend, form, change):
+        # Persistir template_name como caché para el listado
+        try:
+            if obj.template_id:
+                client = DopplerRelayClient()
+                account = getattr(settings, 'DOPPLER_RELAY', {}) or {}
+                account_id = account.get('ACCOUNT_ID')
+                if account_id:
+                    data = client.get_template(int(account_id), str(obj.template_id))
+                    name = (data.get('name') or '').strip()
+                    if name:
+                        obj.template_name = name
+        except Exception:
+            pass
+        super().save_model(request, obj, form, change)
 
     actions = ["procesar_envio_masivo"]
 

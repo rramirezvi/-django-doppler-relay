@@ -1,0 +1,18 @@
+{% extends "admin/base_site.html" %}
+{% block content %}
+  <div class="breadcrumbs">
+    <a href="{% url 'admin:index' %}">Home</a> ›
+    <a href="{% url 'admin:relay_bulksend_changelist' %}">Bulk sends</a> ›
+    Reporte del día {{ bulk.created_at|date:"Y-m-d" }}
+  </div>
+  <h1>Reporte local ({{ bulk.template_name|default:bulk.template_id }})</h1>
+  <table class="adminlist">
+    <thead><tr><th>Tipo</th><th>Filas</th></tr></thead>
+    <tbody>
+      {% for k, v in summary.items %}
+        <tr><td>{{ k }}</td><td>{{ v }}</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endblock %}
+

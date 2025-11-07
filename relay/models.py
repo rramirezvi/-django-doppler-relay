@@ -134,6 +134,7 @@ class Attachment(models.Model):
 class BulkSend(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     template_id = models.CharField(max_length=128)
+    template_name = models.CharField(max_length=255, blank=True, null=True)
     subject = models.CharField(max_length=255, blank=True, null=True)
     variables = models.JSONField(default=dict, blank=True)
     recipients_file = models.FileField(upload_to="bulk_recipients/")
@@ -148,6 +149,10 @@ class BulkSend(models.Model):
     )
     # Flag/ts de trabajo para evitar solapes (uso interno)
     processing_started_at = models.DateTimeField(null=True, blank=True, db_index=True)
+
+    # Trazabilidad de reportería post-envío (automatizada)
+    post_reports_status = models.CharField(max_length=16, blank=True, null=True)
+    post_reports_loaded_at = models.DateTimeField(null=True, blank=True)
 
     def __str__(self):
         return f"BulkSend {self.id} - {self.template_id} ({self.created_at:%Y-%m-%d %H:%M})"
