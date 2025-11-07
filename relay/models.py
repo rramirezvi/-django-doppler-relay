@@ -154,6 +154,29 @@ class BulkSend(models.Model):
     post_reports_status = models.CharField(max_length=16, blank=True, null=True)
     post_reports_loaded_at = models.DateTimeField(null=True, blank=True)
 
+    def save(self, *args, **kwargs):
+        # Completar template_name de forma centralizada (best‑effort)
+        try:
+            if self.template_id and not self.template_name:
+                from django.conf import settings
+                from .services.doppler_relay import DopplerRelayClient
+                account = getattr(settings, 'DOPPLER_RELAY', {}) or {}
+                account_id = account.get('ACCOUNT_ID')
+                if account_id:
+                    client = DopplerRelayClient()
+                    data = client.get_template(int(account_id), str(self.template_id))
+                    name = (data.get('name') or '').strip()
+                    if name:
+                        self.template_name = name
+                    else:
+                        # fallback mínimo legible
+                        self.template_name = str(self.template_id)
+        except Exception:
+            # No bloquear el guardado si la API falla
+            if self.template_id and not self.template_name:
+                self.template_name = str(self.template_id)
+        super().save(*args, **kwargs)
+
     def __str__(self):
         return f"BulkSend {self.id} - {self.template_id} ({self.created_at:%Y-%m-%d %H:%M})"
 
