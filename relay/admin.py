@@ -1,4 +1,4 @@
-﻿import logging
+import logging
 from types import SimpleNamespace
 from typing import Any
 import threading
@@ -269,8 +269,8 @@ class BulkSendForm(forms.ModelForm):
     scheduled_at = forms.DateTimeField(
         required=False,
         widget=forms.DateTimeInput(attrs={'type': 'datetime-local'}),
-        help_text="DÃ©jalo vacÃ­o para enviar ahora. Si especificas fecha/hora futura, se programarÃ¡ automÃ¡ticamente.",
-        label="Programar envÃ­o"
+        help_text="Déjalo vacío para enviar ahora. Si especificas fecha/hora futura, se programará automáticamente.",
+        label="Programar envío"
     )
     variables = forms.CharField(
         widget=forms.Textarea,
@@ -284,7 +284,7 @@ class BulkSendForm(forms.ModelForm):
             "monto": "valor_deuda"
         }
 
-        Si los nombres de las columnas en tu CSV coinciden con las variables de la plantilla, deja este campo vacÃ­o."""
+        Si los nombres de las columnas en tu CSV coinciden con las variables de la plantilla, deja este campo vacío."""
     )
 
     class Meta:
@@ -346,7 +346,7 @@ class BulkSendForm(forms.ModelForm):
             or ''
         )
 
-        select_choices = [('', 'â€” Selecciona una plantilla â€”')] + choices
+        select_choices = [('', '— Selecciona una plantilla —')] + choices
         if initial_value and not any(value == str(initial_value) for value, _ in select_choices):
             select_choices.append((str(initial_value), f"{initial_value} (actual)"))
 
@@ -510,10 +510,27 @@ class BulkSendAdmin(admin.ModelAdmin):
     form = BulkSendForm
     list_display = ("id", "template_display", "subject", "created_at", "scheduled_at",
                     "status", "attachment_count", "report_link")
-    readonly_fields = ("result", "log", "status", "created_at", "processing_started_at")
+    readonly_fields = ("result", "log", "status", "created_at", "processing_started_at", "template_name", "variables", "post_reports_status", "post_reports_loaded_at")
+
+    def get_exclude(self, request, obj=None):
+        base = list(super().get_exclude(request, obj) or [])
+        technical = [
+            "processing_started_at",
+            "post_reports_status",
+            "post_reports_loaded_at",
+            "template_name",
+            "variables",
+            "result",
+            "log",
+            "status",
+            "created_at",
+        ]
+        if obj is None:
+            return base + technical
+        return base
     search_fields = ("template_id", "subject")
     list_filter = ("status", "scheduled_at")
-    filter_horizontal = ('attachments',)  # Para selecciÃ³n mÃºltiple de adjuntos
+    filter_horizontal = ('attachments',)  # Para selección múltiple de adjuntos
 
     def get_form(self, request, obj=None, **kwargs):
         form = super().get_form(request, obj, **kwargs)
@@ -695,7 +712,7 @@ class BulkSendAdmin(admin.ModelAdmin):
                         })
             except Exception as e:
                 import traceback
-                print("EXCEPCIÃ“N:", str(e))
+                print("EXCEPCIÓN:", str(e))
                 print("ARGS:", getattr(e, 'args', None))
                 print("CAUSE:", getattr(e, '__cause__', None))
                 print("TRACEBACK:\n", traceback.format_exc())
@@ -730,7 +747,7 @@ class BulkSendAdmin(admin.ModelAdmin):
                 bulk.log = "EnvÃ­o realizado"
             except Exception as e:
                 import traceback
-                print("EXCEPCIÃ“N:", str(e))
+                print("EXCEPCIÓN:", str(e))
                 print("ARGS:", getattr(e, 'args', None))
                 print("CAUSE:", getattr(e, '__cause__', None))
                 print("TRACEBACK:\n", traceback.format_exc())
@@ -755,7 +772,7 @@ class BulkSendAdmin(admin.ModelAdmin):
                 bulk.log = f"Error en envÃ­o: {e}"
             bulk.save()
             messages.info(request, f"BulkSend {bulk.id} procesado.")
-    procesar_envio_masivo.short_description = "Procesar env��o masivo seleccionado"
+    procesar_envio_masivo.short_description = "Procesar envío masivo seleccionado"
 
     # Vista de reporte local (consulta BD)
     def get_urls(self):
@@ -777,6 +794,5 @@ class BulkSendAdmin(admin.ModelAdmin):
         context = {**self.admin_site.each_context(request), 'title': f"Reporte local del día {day}", 'bulk': bulk, 'summary': summary}
         return TemplateResponse(request, 'relay/bulksend_report.html', context)
 
-    procesar_envio_masivo.short_description = "Procesar envÃ­o masivo seleccionado"
-
+    procesar_envio_masivo.short_description = "Procesar envío masivo seleccionado"
 

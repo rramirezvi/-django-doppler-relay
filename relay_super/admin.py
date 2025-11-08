@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from django import forms
 from django.contrib import admin, messages
@@ -48,11 +48,28 @@ class BulkSendSenderForm(BaseBulkSendForm):
 class BulkSendUserConfigAdmin(admin.ModelAdmin):
     form = BulkSendSenderForm
     list_display = ("id", "template_display", "subject", "created_at", "status", "report_link")
-    readonly_fields = ("result", "log", "status", "created_at", "processing_started_at")
+    readonly_fields = ("result", "log", "status", "created_at", "processing_started_at", "template_name", "variables", "post_reports_status", "post_reports_loaded_at")
     search_fields = ("template_id", "subject")
     list_filter = ("status",)
     actions = ["procesar_envio_masivo"]
     filter_horizontal = ("attachments",)
+
+    def get_exclude(self, request, obj=None):
+        base = list(super().get_exclude(request, obj) or [])
+        technical = [
+            "processing_started_at",
+            "post_reports_status",
+            "post_reports_loaded_at",
+            "template_name",
+            "variables",
+            "result",
+            "log",
+            "status",
+            "created_at",
+        ]
+        if obj is None:
+            return base + technical
+        return base
 
     # Mostrar nombre de plantilla si existe; si no, el ID
     def template_display(self, obj: BulkSend):
