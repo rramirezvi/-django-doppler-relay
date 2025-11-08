@@ -812,9 +812,77 @@ class BulkSendAdmin(admin.ModelAdmin):
 
         tipos = ["deliveries", "bounces", "opens", "clicks", "spam", "unsubscribed", "sent"]
         summary = {}
-        for t in tipos:
-            total = reps.filter(report_type=t, loaded_to_db=True).aggregate(total=models.Sum('rows_inserted')).get('total') or 0
-            summary[t] = int(total)
+from datetime import timedelta
+from zoneinfo import ZoneInfo
+# Ventana por envío (America/Guayaquil)
+try:
+    start_tz = bulk.created_at.astimezone(ZoneInfo("America/Guayaquil"))
+except Exception:
+    start_tz = bulk.created_at
+end_tz = start_tz + timedelta(hours=24)
+start_str = start_tz.strftime("%Y-%m-%d %H:%M:%S")
+end_str = end_tz.strftime("%Y-%m-%d %H:%M:%S")
+
+def _table_exists2(name: str) -> bool:
+    try:
+        with connection.cursor() as cur:
+            tables = connection.introspection.table_names(cur)
+        return name in tables
+    except Exception:
+        return False
+
+def _cols2(table: str):
+    try:
+        with connection.cursor() as cur:
+            return [c.name for c in connection.introspection.get_table_description(cur, table)]
+    except Exception:
+        return []
+
+def _pick2(cols, candidates):
+    for c in candidates:
+        if c in cols:
+            return c
+    return None
+
+def _pick_date_col2(cols):
+    return _pick2(cols, ['event_time','event_datetime','date','timestamp','occurred_at','created_at'])
+
+def _count_in_window2(table: str) -> int:
+    if not _table_exists2(table):
+        return 0
+    cols = _cols2(table)
+    datecol = _pick_date_col2(cols)
+    if not datecol:
+        return 0
+    # Intento por rango [start,end)
+    sql = f'SELECT COUNT(*) FROM {table} WHERE "{datecol}" >= %s AND "{datecol}" < %s'
+    try:
+        with connection.cursor() as cur:
+            cur.execute(sql, [start_str, end_str])
+            v = cur.fetchone()[0]
+            return int(v or 0)
+    except Exception:
+        # Fallback a DATE(col) = día local del envío
+        sql2 = f'SELECT COUNT(*) FROM {table} WHERE DATE("{datecol}") = %s'
+        try:
+            with connection.cursor() as cur:
+                cur.execute(sql2, [str(day)])
+                v = cur.fetchone()[0]
+                return int(v or 0)
+        except Exception:
+            return 0
+
+table_map = {
+    'deliveries':'reports_deliveries',
+    'bounces':'reports_bounces',
+    'opens':'reports_opens',
+    'clicks':'reports_clicks',
+    'spam':'reports_spam',
+    'unsubscribed':'reports_unsubscribed',
+    'sent':'reports_sent',
+}
+for t in tipos:
+    summary[t] = _count_in_window2(table_map[t])
 
         ready = {r.report_type: r for r in reps.filter(state=GeneratedReport.STATE_READY)}
         ready_urls = {}
