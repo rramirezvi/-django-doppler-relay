@@ -833,20 +833,22 @@ class BulkSendAdmin(admin.ModelAdmin):
             request), 'title': f"Reporte local del día {day}", 'bulk': bulk, 'summary': summary}
         return TemplateResponse(request, 'relay/bulksend_report.html', context)
 
-        def view_report_v2(self, request, pk: int):
+    def view_report_v2(self, request, pk: int):
         from reports.models import GeneratedReport
         bulk = BulkSend.objects.get(pk=pk)
         day = bulk.created_at.date()
         reps = GeneratedReport.objects.filter(start_date=day, end_date=day)
 
-        tipos = ["deliveries", "bounces", "opens", "clicks", "spam", "unsubscribed", "sent"]
+        tipos = ["deliveries", "bounces", "opens",
+                 "clicks", "spam", "unsubscribed", "sent"]
         summary = {}
 
         # Ventana por envío (America/Guayaquil)
         from datetime import timedelta
         from zoneinfo import ZoneInfo
         try:
-            start_tz = bulk.created_at.astimezone(ZoneInfo("America/Guayaquil"))
+            start_tz = bulk.created_at.astimezone(
+                ZoneInfo("America/Guayaquil"))
         except Exception:
             start_tz = bulk.created_at
         end_tz = start_tz + timedelta(hours=24)
@@ -913,11 +915,13 @@ class BulkSendAdmin(admin.ModelAdmin):
             summary[t] = _count_in_window(table_map[t])
 
         # Enlaces a CSV originales listos
-        ready = {r.report_type: r for r in reps.filter(state=GeneratedReport.STATE_READY)}
+        ready = {r.report_type: r for r in reps.filter(
+            state=GeneratedReport.STATE_READY)}
         ready_urls = {}
         try:
             for t, r in ready.items():
-                ready_urls[t] = reverse('admin:reports_generatedreport_download', args=(r.pk,))
+                ready_urls[t] = reverse(
+                    'admin:reports_generatedreport_download', args=(r.pk,))
         except Exception:
             ready_urls = {}
 
@@ -945,9 +949,11 @@ class BulkSendAdmin(admin.ModelAdmin):
             reason = _pick(cb, ['bounce_reason', 'reason', 'classification'])
             daycol = _pick_date_col(cb)
             if reason:
-                vals = _select_singlecol('reports_bounces', daycol, reason, 20000)
+                vals = _select_singlecol(
+                    'reports_bounces', daycol, reason, 20000)
                 from collections import Counter
-                bounces_by_reason = sorted(Counter([v for v in vals if v]).items(), key=lambda x: x[1], reverse=True)[:20]
+                bounces_by_reason = sorted(
+                    Counter([v for v in vals if v]).items(), key=lambda x: x[1], reverse=True)[:20]
 
         # Clicks por URL (top 20)
         clicks_by_url = []
@@ -958,23 +964,28 @@ class BulkSendAdmin(admin.ModelAdmin):
             if urlc:
                 vals = _select_singlecol('reports_clicks', daycol, urlc, 50000)
                 from collections import Counter
-                clicks_by_url = sorted(Counter([v for v in vals if v]).items(), key=lambda x: x[1], reverse=True)[:20]
+                clicks_by_url = sorted(
+                    Counter([v for v in vals if v]).items(), key=lambda x: x[1], reverse=True)[:20]
 
         # Opens por dominio (top 20)
         opens_by_domain = []
         if _table_exists('reports_opens'):
             co = _cols('reports_opens')
-            emailc = _pick(co, ['email', 'address', 'recipient', 'email_address', 'to'])
+            emailc = _pick(
+                co, ['email', 'address', 'recipient', 'email_address', 'to'])
             daycol = _pick_date_col(co)
             if emailc:
-                vals = _select_singlecol('reports_opens', daycol, emailc, 50000)
+                vals = _select_singlecol(
+                    'reports_opens', daycol, emailc, 50000)
                 from collections import Counter
+
                 def _dom(x):
                     try:
                         return (x or '').split('@', 1)[1].lower()
                     except Exception:
                         return ''
-                opens_by_domain = sorted(Counter([_dom(v) for v in vals if v and '@' in v]).items(), key=lambda x: x[1], reverse=True)[:20]
+                opens_by_domain = sorted(Counter(
+                    [_dom(v) for v in vals if v and '@' in v]).items(), key=lambda x: x[1], reverse=True)[:20]
 
         context = {
             **self.admin_site.each_context(request),
