@@ -15,7 +15,7 @@ from django.template.response import TemplateResponse
 from django.urls import path, reverse
 from django.utils import timezone
 from django.utils.html import format_html
-from django.db import models
+from django.db import models, connection
 
 from .models import EmailMessage, BulkSend, Attachment, UserEmailConfig
 from .services.doppler_relay import DopplerRelayClient, DopplerRelayError
@@ -509,7 +509,7 @@ class BulkSendForm(forms.ModelForm):
 class BulkSendAdmin(admin.ModelAdmin):
     form = BulkSendForm
     list_display = ("id", "template_display", "subject", "created_at", "scheduled_at",
-                    "status", "attachment_count", "report_link")
+                    "status", "attachment_count", "report_link", "report_link_v2")
     readonly_fields = ("result", "log", "status", "created_at", "processing_started_at", "template_name", "variables", "post_reports_status", "post_reports_loaded_at")
 
     def get_exclude(self, request, obj=None):
@@ -561,6 +561,16 @@ class BulkSendAdmin(admin.ModelAdmin):
                 return ""
         return ""
     report_link.short_description = 'Reporte'
+
+    def report_link_v2(self, obj: BulkSend):
+        if getattr(obj, 'status', '') == 'done' and getattr(obj, 'post_reports_loaded_at', None):
+            try:
+                url = reverse('admin:relay_bulksend_report_v2', args=[obj.pk])
+                return format_html('<a class="button" href="{}">Ver reporte (nuevo)</a>', url)
+            except Exception:
+                return ''
+        return ''
+    report_link_v2.short_description = 'Reporte v2'
 
     def save_model(self, request, obj: BulkSend, form, change):
         # Persistir template_name como cachÃ© para el listado
@@ -779,6 +789,7 @@ class BulkSendAdmin(admin.ModelAdmin):
         urls = super().get_urls()
         my = [
             path('bulksend/<int:pk>/report/', self.admin_site.admin_view(self.view_report), name='relay_bulksend_report'),
+            path('bulksend/<int:pk>/report/v2/', self.admin_site.admin_view(self.view_report_v2), name='relay_bulksend_report_v2'),
         ]
         return my + urls
 
@@ -793,6 +804,116 @@ class BulkSendAdmin(admin.ModelAdmin):
             summary[t] = int(total)
         context = {**self.admin_site.each_context(request), 'title': f"Reporte local del día {day}", 'bulk': bulk, 'summary': summary}
         return TemplateResponse(request, 'relay/bulksend_report.html', context)
+    def view_report_v2(self, request, pk: int):
+        from reports.models import GeneratedReport
+        bulk = BulkSend.objects.get(pk=pk)
+        day = bulk.created_at.date()
+        reps = GeneratedReport.objects.filter(start_date=day, end_date=day)
+
+        tipos = ["deliveries", "bounces", "opens", "clicks", "spam", "unsubscribed", "sent"]
+        summary = {}
+        for t in tipos:
+            total = reps.filter(report_type=t, loaded_to_db=True).aggregate(total=models.Sum('rows_inserted')).get('total') or 0
+            summary[t] = int(total)
+
+        ready = {r.report_type: r for r in reps.filter(state=GeneratedReport.STATE_READY)}
+        ready_urls = {}
+        try:
+            for t, r in ready.items():
+                ready_urls[t] = reverse('admin:reports_generatedreport_download', args=(r.pk,))
+        except Exception:
+            ready_urls = {}
+
+        def _table_exists(name: str) -> bool:
+            try:
+                with connection.cursor() as cur:
+                    tables = connection.introspection.table_names(cur)
+                return name in tables
+            except Exception:
+                return False
+
+        def _cols(table: str):
+            try:
+                with connection.cursor() as cur:
+                    return [c.name for c in connection.introspection.get_table_description(cur, table)]
+            except Exception:
+                return []
+
+        def _pick(cols, candidates):
+            for c in candidates:
+                if c in cols:
+                    return c
+            return None
+
+        def _pick_date_col(cols):
+            return _pick(cols, ['event_time', 'event_datetime', 'date', 'timestamp', 'occurred_at', 'created_at'])
+
+        def _select_singlecol(table: str, daycol: str | None, col: str, limit: int):
+            if not _table_exists(table):
+                return []
+            sql = f'SELECT "{col}" FROM {table}'
+            params = []
+            if daycol:
+                sql += f' WHERE DATE("{daycol}") = %s'
+                params.append(str(day))
+            sql += f' LIMIT {int(limit)}'
+            try:
+                with connection.cursor() as cur:
+                    cur.execute(sql, params)
+                    return [row[0] for row in cur.fetchall()]
+            except Exception:
+                return []
+
+        # Bounces por razón (top 20)
+        bounces_by_reason = []
+        if _table_exists('reports_bounces'):
+            cb = _cols('reports_bounces')
+            reason = _pick(cb, ['bounce_reason', 'reason', 'classification'])
+            daycol = _pick_date_col(cb)
+            if reason:
+                vals = _select_singlecol('reports_bounces', daycol, reason, 20000)
+                from collections import Counter
+                bounces_by_reason = sorted(Counter([v for v in vals if v]).items(), key=lambda x: x[1], reverse=True)[:20]
+
+        # Clicks por URL (top 20)
+        clicks_by_url = []
+        if _table_exists('reports_clicks'):
+            cc = _cols('reports_clicks')
+            urlc = _pick(cc, ['url', 'target_url', 'click_url', 'link'])
+            daycol = _pick_date_col(cc)
+            if urlc:
+                vals = _select_singlecol('reports_clicks', daycol, urlc, 50000)
+                from collections import Counter
+                clicks_by_url = sorted(Counter([v for v in vals if v]).items(), key=lambda x: x[1], reverse=True)[:20]
+
+        # Opens por dominio (top 20)
+        opens_by_domain = []
+        if _table_exists('reports_opens'):
+            co = _cols('reports_opens')
+            emailc = _pick(co, ['email', 'address', 'recipient', 'email_address', 'to'])
+            daycol = _pick_date_col(co)
+            if emailc:
+                vals = _select_singlecol('reports_opens', daycol, emailc, 50000)
+                from collections import Counter
+                def _dom(x):
+                    try:
+                        return (x or '').split('@', 1)[1].lower()
+                    except Exception:
+                        return ''
+                opens_by_domain = sorted(Counter([_dom(v) for v in vals if v and '@' in v]).items(), key=lambda x: x[1], reverse=True)[:20]
+
+        context = {
+            **self.admin_site.each_context(request),
+            'title': f"Reporte (nuevo) del día {day}",
+            'bulk': bulk,
+            'summary': summary,
+            'chart_labels': list(summary.keys()),
+            'chart_values': list(summary.values()),
+            'bounces_by_reason': bounces_by_reason,
+            'clicks_by_url': clicks_by_url,
+            'opens_by_domain': opens_by_domain,
+            'ready_urls': ready_urls,
+        }
+        return TemplateResponse(request, 'relay/bulksend_report_v2.html', context)
 
     procesar_envio_masivo.short_description = "Procesar envío masivo seleccionado"
-

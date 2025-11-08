@@ -47,7 +47,7 @@ class BulkSendSenderForm(BaseBulkSendForm):
 @admin.register(BulkSendUserConfigProxy)
 class BulkSendUserConfigAdmin(admin.ModelAdmin):
     form = BulkSendSenderForm
-    list_display = ("id", "template_display", "subject", "created_at", "status", "report_link")
+    list_display = ("id", "template_display", "subject", "created_at", "status", "report_link", "report_link_v2")
     readonly_fields = ("result", "log", "status", "created_at", "processing_started_at", "template_name", "variables", "post_reports_status", "post_reports_loaded_at")
     search_fields = ("template_id", "subject")
     list_filter = ("status",)
@@ -86,6 +86,17 @@ class BulkSendUserConfigAdmin(admin.ModelAdmin):
                 return ""
         return ""
     report_link.short_description = "Reporte"
+
+    def report_link_v2(self, obj: BulkSend):
+        # Mismas condiciones de visibilidad que el botón actual
+        if getattr(obj, "status", "") == "done" and getattr(obj, "post_reports_loaded_at", None):
+            try:
+                url = reverse("admin:relay_bulksend_report_v2", args=[obj.pk])
+                return format_html('<a class="button" href="{}">Ver reporte (nuevo)</a>', url)
+            except Exception:
+                return ""
+        return ""
+    report_link_v2.short_description = "Reporte v2"
 
     def procesar_envio_masivo(self, request, queryset):
         if not (request.user.is_active and request.user.is_staff and request.user.has_perm("relay_super.change_bulksenduserconfigproxy")):

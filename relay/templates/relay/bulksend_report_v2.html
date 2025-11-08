@@ -1,0 +1,100 @@
+{% extends "admin/base_site.html" %}
+{% load static %}
+
+{% block content %}
+<div class="container">
+  <h1>{{ title }}</h1>
+  <p>
+    <strong>Plantilla:</strong> {{ bulk.template_name|default:bulk.template_id }}
+    &nbsp;|&nbsp;
+    <strong>Subject:</strong> {{ bulk.subject|default:"-" }}
+  </p>
+
+  <h2>Resumen</h2>
+  <canvas id="totalsChart" height="120"></canvas>
+
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <script>
+    (function() {
+      const labels = {{ chart_labels|safe }};
+      const data = {{ chart_values|safe }};
+      const ctx = document.getElementById('totalsChart').getContext('2d');
+      new Chart(ctx, {
+        type: 'bar',
+        data: {
+          labels: labels,
+          datasets: [{
+            label: 'Totales por tipo',
+            data: data,
+            backgroundColor: 'rgba(54, 162, 235, 0.5)',
+            borderColor: 'rgba(54, 162, 235, 1)',
+            borderWidth: 1
+          }]
+        },
+        options: { scales: { y: { beginAtZero: true } } }
+      });
+    })();
+  </script>
+
+  <h2 style="margin-top:24px;">Tablas de detalle (día)</h2>
+
+  <div style="display:flex;gap:24px;flex-wrap:wrap;">
+    <div style="flex:1;min-width:320px;">
+      <h3>Rebotes por razón (top 20)</h3>
+      <table class="table table-striped">
+        <thead><tr><th>Razón</th><th>Total</th></tr></thead>
+        <tbody>
+          {% for reason, total in bounces_by_reason %}
+          <tr><td>{{ reason }}</td><td>{{ total }}</td></tr>
+          {% empty %}
+          <tr><td colspan="2">Sin datos</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div style="flex:1;min-width:320px;">
+      <h3>Clicks por URL (top 20)</h3>
+      <table class="table table-striped">
+        <thead><tr><th>URL</th><th>Total</th></tr></thead>
+        <tbody>
+          {% for url, total in clicks_by_url %}
+          <tr><td style="max-width:420px;overflow-wrap:anywhere;">{{ url }}</td><td>{{ total }}</td></tr>
+          {% empty %}
+          <tr><td colspan="2">Sin datos</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <div style="flex:1;min-width:320px;">
+      <h3>Opens por dominio (top 20)</h3>
+      <table class="table table-striped">
+        <thead><tr><th>Dominio</th><th>Total</th></tr></thead>
+        <tbody>
+          {% for domain, total in opens_by_domain %}
+          <tr><td>{{ domain }}</td><td>{{ total }}</td></tr>
+          {% empty %}
+          <tr><td colspan="2">Sin datos</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <h2 style="margin-top:24px;">Descargas</h2>
+  <p>
+    {% for t, url in ready_urls.items %}
+      <a class="button" href="{{ url }}" style="margin-right:8px;">CSV {{ t }}</a>
+    {% empty %}
+      No hay CSV listos para descargar.
+    {% endfor %}
+  </p>
+
+  <p>
+    <a class="button" href="#" onclick="alert('Exportar consolidado del día (pendiente)'); return false;">Exportar consolidado del día</a>
+  </p>
+
+</div>
+{% endblock %}
+
