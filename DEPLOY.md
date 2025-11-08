@@ -460,3 +460,64 @@ Variables de entorno (documentativas, opcionales; el intervalo real lo define sy
 BULK_SCHEDULER_ENABLED=True
 BULK_SCHEDULER_INTERVAL_MIN=2
 ```
+
+15) Post‑envío automatizado (opcional)
+
+Objetivo
+- Cargar automáticamente la reportería del día del envío para los BulkSend `done` con más de 1 hora de antigüedad.
+- Este job ejecuta `manage.py process_post_send_reports`, que:
+  - Crea `GeneratedReport` por tipo (deliveries, bounces, opens, clicks, spam, unsubscribed, sent) para ese día si no existen.
+  - Procesa pendientes (`process_reports_pending`) y descarga CSVs.
+  - Carga tipado a BD local (`load_report_to_db(..., target_alias="default")`).
+  - Marca el BulkSend con `post_reports_status='done'` y `post_reports_loaded_at`.
+
+Servicio `/etc/systemd/system/post-send-reports.service`
+```
+[Unit]
+Description=Post-send reporting job (process_post_send_reports)
+After=network.target postgresql.service
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=app
+Group=www-data
+WorkingDirectory=/opt/app/django-doppler-relay
+Environment="PATH=/opt/app/django-doppler-relay/.venv/bin"
+ExecStart=/opt/app/django-doppler-relay/.venv/bin/python manage.py process_post_send_reports
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Timer `/etc/systemd/system/post-send-reports.timer`
+```
+[Unit]
+Description=Run post-send reporting periodically
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=60min
+Unit=post-send-reports.service
+AccuracySec=2min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+Comandos
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now post-send-reports.timer
+sudo systemctl list-timers | grep post-send-reports
+sudo journalctl -u post-send-reports -n 50 --no-pager
+```
+
+Notas
+- El botón “Ver reporte” del admin aparece cuando el BulkSend está en `done` y ya tiene `post_reports_loaded_at` (es decir, cuando este job cargó los datos del día en la BD local).
+- Si no habilitas este timer, puedes ejecutar manualmente:
+  - `python manage.py process_post_send_reports`
+  - `python manage.py process_reports_pending` (si quieres forzar el ciclo de PENDING/PROCESSING)
