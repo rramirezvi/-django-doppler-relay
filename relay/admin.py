@@ -1,3 +1,5 @@
+from datetime import timedelta
+from zoneinfo import ZoneInfo
 import logging
 from types import SimpleNamespace
 from typing import Any
@@ -329,7 +331,8 @@ class BulkSendForm(forms.ModelForm):
     def _configure_template_field(self) -> None:
         template_field = self.fields['template_id']
         template_field.required = True
-        template_field.widget.attrs.setdefault('placeholder', 'Ingresa el ID de la plantilla')
+        template_field.widget.attrs.setdefault(
+            'placeholder', 'Ingresa el ID de la plantilla')
 
         choices = self._fetch_template_choices()
         if not choices:
@@ -338,7 +341,8 @@ class BulkSendForm(forms.ModelForm):
         choices = sorted(choices, key=lambda item: item[1].lower())
         if len(choices) > self.TEMPLATE_MAX_CHOICES:
             choices = choices[:self.TEMPLATE_MAX_CHOICES]
-            self._warn("Se muestran solo 200 plantillas. Escribe el ID manual si no aparece.")
+            self._warn(
+                "Se muestran solo 200 plantillas. Escribe el ID manual si no aparece.")
 
         initial_value = (
             self.initial.get('template_id')
@@ -348,7 +352,8 @@ class BulkSendForm(forms.ModelForm):
 
         select_choices = [('', '— Selecciona una plantilla —')] + choices
         if initial_value and not any(value == str(initial_value) for value, _ in select_choices):
-            select_choices.append((str(initial_value), f"{initial_value} (actual)"))
+            select_choices.append(
+                (str(initial_value), f"{initial_value} (actual)"))
 
         field = forms.ChoiceField(
             label=template_field.label,
@@ -364,7 +369,8 @@ class BulkSendForm(forms.ModelForm):
     def _fetch_template_choices(self) -> list[tuple[str, str]]:
         account_id = self._resolve_account_id()
         if not account_id:
-            self._warn('No se pudo determinar la cuenta de Doppler Relay. Ingresa el ID manualmente.')
+            self._warn(
+                'No se pudo determinar la cuenta de Doppler Relay. Ingresa el ID manualmente.')
             return []
 
         cache_key = self._cache_key(account_id)
@@ -380,10 +386,12 @@ class BulkSendForm(forms.ModelForm):
             stale = age > self.TEMPLATE_CACHE_FRESH_SECONDS
             logger.info(
                 'template list cache hit',
-                extra={'account': account_id, 'age': round(age, 2), 'items': len(choices)},
+                extra={'account': account_id, 'age': round(
+                    age, 2), 'items': len(choices)},
             )
         else:
-            logger.info('template list cache miss', extra={'account': account_id})
+            logger.info('template list cache miss',
+                        extra={'account': account_id})
 
         if choices and stale:
             self._schedule_refresh(account_id, cache_key)
@@ -403,7 +411,8 @@ class BulkSendForm(forms.ModelForm):
 
         def worker():
             try:
-                self._refresh_templates_cache(account_id, cache_key, suppress_messages=True)
+                self._refresh_templates_cache(
+                    account_id, cache_key, suppress_messages=True)
             finally:
                 cache.delete(lock_key)
 
@@ -423,12 +432,15 @@ class BulkSendForm(forms.ModelForm):
                 extra={'account': account_id, 'error': str(exc)},
             )
             if not suppress_messages:
-                self._warn('No se pudieron cargar las plantillas de Doppler Relay. Ingresa el ID manualmente.')
+                self._warn(
+                    'No se pudieron cargar las plantillas de Doppler Relay. Ingresa el ID manualmente.')
             return []
         except Exception as exc:
-            logger.exception('Fallo inesperado cargando plantillas', extra={'account': account_id})
+            logger.exception('Fallo inesperado cargando plantillas', extra={
+                             'account': account_id})
             if not suppress_messages:
-                self._warn('No se pudieron cargar las plantillas de Doppler Relay. Ingresa el ID manualmente.')
+                self._warn(
+                    'No se pudieron cargar las plantillas de Doppler Relay. Ingresa el ID manualmente.')
             return []
 
         cache.set(
@@ -446,7 +458,8 @@ class BulkSendForm(forms.ModelForm):
         choices = self._normalize_template_items(data)
         logger.info(
             'template list fetch',
-            extra={'account': account_id, 'latency_ms': round(latency_ms, 2), 'items': len(choices)},
+            extra={'account': account_id, 'latency_ms': round(
+                latency_ms, 2), 'items': len(choices)},
         )
         return choices
 
@@ -461,7 +474,8 @@ class BulkSendForm(forms.ModelForm):
                     items = [item for item in value if isinstance(item, dict)]
                     break
                 if isinstance(value, dict) and isinstance(value.get('items'), list):
-                    items = [item for item in value['items'] if isinstance(item, dict)]
+                    items = [item for item in value['items']
+                             if isinstance(item, dict)]
                     break
             else:
                 if isinstance(payload.get('id'), (str, int)):
@@ -470,7 +484,8 @@ class BulkSendForm(forms.ModelForm):
         choices: list[tuple[str, str]] = []
         seen: set[str] = set()
         for item in items:
-            tpl_id = item.get('id') or item.get('templateId') or item.get('template_id')
+            tpl_id = item.get('id') or item.get(
+                'templateId') or item.get('template_id')
             name = item.get('name') or tpl_id
             if not tpl_id:
                 continue
@@ -478,14 +493,16 @@ class BulkSendForm(forms.ModelForm):
             if not tpl_id_str or tpl_id_str in seen:
                 continue
             seen.add(tpl_id_str)
-            display_name = str(name).strip() if isinstance(name, str) else tpl_id_str
+            display_name = str(name).strip() if isinstance(
+                name, str) else tpl_id_str
             label = f"{display_name} (id={tpl_id_str})"
             choices.append((tpl_id_str, label))
         return choices
 
     def _resolve_account_id(self):
         cfg = getattr(settings, 'DOPPLER_RELAY', {}) or {}
-        account_id = cfg.get('ACCOUNT_ID') or getattr(settings, 'DOPPLER_RELAY_ACCOUNT_ID', None)
+        account_id = cfg.get('ACCOUNT_ID') or getattr(
+            settings, 'DOPPLER_RELAY_ACCOUNT_ID', None)
         if not account_id:
             return None
         try:
@@ -510,7 +527,8 @@ class BulkSendAdmin(admin.ModelAdmin):
     form = BulkSendForm
     list_display = ("id", "template_display", "subject", "created_at", "scheduled_at",
                     "status", "attachment_count", "report_link", "report_link_v2")
-    readonly_fields = ("result", "log", "status", "created_at", "processing_started_at", "template_name", "variables", "post_reports_status", "post_reports_loaded_at")
+    readonly_fields = ("result", "log", "status", "created_at", "processing_started_at",
+                       "template_name", "variables", "post_reports_status", "post_reports_loaded_at")
 
     def get_exclude(self, request, obj=None):
         base = list(super().get_exclude(request, obj) or [])
@@ -580,7 +598,8 @@ class BulkSendAdmin(admin.ModelAdmin):
                 account = getattr(settings, 'DOPPLER_RELAY', {}) or {}
                 account_id = account.get('ACCOUNT_ID')
                 if account_id:
-                    data = client.get_template(int(account_id), str(obj.template_id))
+                    data = client.get_template(
+                        int(account_id), str(obj.template_id))
                     name = (data.get('name') or '').strip()
                     if name:
                         obj.template_name = name
@@ -600,10 +619,13 @@ class BulkSendAdmin(admin.ModelAdmin):
                 messages.warning(request, f"BulkSend {bulk.id} ya procesado.")
                 continue
             bulk.processing_started_at = timezone.now()
-            bulk.log = ((bulk.log or "") + "\n[BG] EnvÃ­o iniciado desde admin").strip()
+            bulk.log = ((bulk.log or "") +
+                        "\n[BG] EnvÃ­o iniciado desde admin").strip()
             bulk.save(update_fields=["processing_started_at", "log"])
-            threading.Thread(target=process_bulk_id, args=(bulk.id,), daemon=True).start()
-            messages.info(request, f"BulkSend {bulk.id} en proceso (background). Revise el estado en la lista.")
+            threading.Thread(target=process_bulk_id, args=(
+                bulk.id,), daemon=True).start()
+            messages.info(
+                request, f"BulkSend {bulk.id} en proceso (background). Revise el estado en la lista.")
             scheduled_any = True
         if scheduled_any:
             return
@@ -662,7 +684,8 @@ class BulkSendAdmin(admin.ModelAdmin):
 
                     # Obtener el mapeo de variables (si existe)
                     try:
-                        variables_mapping = (bulk.variables if isinstance(bulk.variables, dict) else (json.loads(bulk.variables) if bulk.variables else {}))
+                        variables_mapping = (bulk.variables if isinstance(bulk.variables, dict) else (
+                            json.loads(bulk.variables) if bulk.variables else {}))
                         # Filtrar claves reservadas y valores no-string
                         if isinstance(variables_mapping, dict):
                             variables_mapping = {
@@ -788,8 +811,10 @@ class BulkSendAdmin(admin.ModelAdmin):
     def get_urls(self):
         urls = super().get_urls()
         my = [
-            path('bulksend/<int:pk>/report/', self.admin_site.admin_view(self.view_report), name='relay_bulksend_report'),
-            path('bulksend/<int:pk>/report/v2/', self.admin_site.admin_view(self.view_report_v2), name='relay_bulksend_report_v2'),
+            path('bulksend/<int:pk>/report/',
+                 self.admin_site.admin_view(self.view_report), name='relay_bulksend_report'),
+            path('bulksend/<int:pk>/report/v2/', self.admin_site.admin_view(
+                self.view_report_v2), name='relay_bulksend_report_v2'),
         ]
         return my + urls
 
@@ -797,14 +822,18 @@ class BulkSendAdmin(admin.ModelAdmin):
         from reports.models import GeneratedReport
         bulk = BulkSend.objects.get(pk=pk)
         day = bulk.created_at.date()
-        reps = GeneratedReport.objects.filter(start_date=day, end_date=day, loaded_to_db=True)
+        reps = GeneratedReport.objects.filter(
+            start_date=day, end_date=day, loaded_to_db=True)
         summary = {}
         for t in ["deliveries", "bounces", "opens", "clicks", "spam", "unsubscribed", "sent"]:
-            total = reps.filter(report_type=t).aggregate(total=models.Sum('rows_inserted')).get('total') or 0
+            total = reps.filter(report_type=t).aggregate(
+                total=models.Sum('rows_inserted')).get('total') or 0
             summary[t] = int(total)
-        context = {**self.admin_site.each_context(request), 'title': f"Reporte local del día {day}", 'bulk': bulk, 'summary': summary}
+        context = {**self.admin_site.each_context(
+            request), 'title': f"Reporte local del día {day}", 'bulk': bulk, 'summary': summary}
         return TemplateResponse(request, 'relay/bulksend_report.html', context)
-    def view_report_v2(self, request, pk: int):
+
+        def view_report_v2(self, request, pk: int):
         from reports.models import GeneratedReport
         bulk = BulkSend.objects.get(pk=pk)
         day = bulk.created_at.date()
@@ -812,85 +841,17 @@ class BulkSendAdmin(admin.ModelAdmin):
 
         tipos = ["deliveries", "bounces", "opens", "clicks", "spam", "unsubscribed", "sent"]
         summary = {}
-from datetime import timedelta
-from zoneinfo import ZoneInfo
-# Ventana por envío (America/Guayaquil)
-try:
-    start_tz = bulk.created_at.astimezone(ZoneInfo("America/Guayaquil"))
-except Exception:
-    start_tz = bulk.created_at
-end_tz = start_tz + timedelta(hours=24)
-start_str = start_tz.strftime("%Y-%m-%d %H:%M:%S")
-end_str = end_tz.strftime("%Y-%m-%d %H:%M:%S")
 
-def _table_exists2(name: str) -> bool:
-    try:
-        with connection.cursor() as cur:
-            tables = connection.introspection.table_names(cur)
-        return name in tables
-    except Exception:
-        return False
-
-def _cols2(table: str):
-    try:
-        with connection.cursor() as cur:
-            return [c.name for c in connection.introspection.get_table_description(cur, table)]
-    except Exception:
-        return []
-
-def _pick2(cols, candidates):
-    for c in candidates:
-        if c in cols:
-            return c
-    return None
-
-def _pick_date_col2(cols):
-    return _pick2(cols, ['event_time','event_datetime','date','timestamp','occurred_at','created_at'])
-
-def _count_in_window2(table: str) -> int:
-    if not _table_exists2(table):
-        return 0
-    cols = _cols2(table)
-    datecol = _pick_date_col2(cols)
-    if not datecol:
-        return 0
-    # Intento por rango [start,end)
-    sql = f'SELECT COUNT(*) FROM {table} WHERE "{datecol}" >= %s AND "{datecol}" < %s'
-    try:
-        with connection.cursor() as cur:
-            cur.execute(sql, [start_str, end_str])
-            v = cur.fetchone()[0]
-            return int(v or 0)
-    except Exception:
-        # Fallback a DATE(col) = día local del envío
-        sql2 = f'SELECT COUNT(*) FROM {table} WHERE DATE("{datecol}") = %s'
+        # Ventana por envío (America/Guayaquil)
+        from datetime import timedelta
+        from zoneinfo import ZoneInfo
         try:
-            with connection.cursor() as cur:
-                cur.execute(sql2, [str(day)])
-                v = cur.fetchone()[0]
-                return int(v or 0)
+            start_tz = bulk.created_at.astimezone(ZoneInfo("America/Guayaquil"))
         except Exception:
-            return 0
-
-table_map = {
-    'deliveries':'reports_deliveries',
-    'bounces':'reports_bounces',
-    'opens':'reports_opens',
-    'clicks':'reports_clicks',
-    'spam':'reports_spam',
-    'unsubscribed':'reports_unsubscribed',
-    'sent':'reports_sent',
-}
-for t in tipos:
-    summary[t] = _count_in_window2(table_map[t])
-
-        ready = {r.report_type: r for r in reps.filter(state=GeneratedReport.STATE_READY)}
-        ready_urls = {}
-        try:
-            for t, r in ready.items():
-                ready_urls[t] = reverse('admin:reports_generatedreport_download', args=(r.pk,))
-        except Exception:
-            ready_urls = {}
+            start_tz = bulk.created_at
+        end_tz = start_tz + timedelta(hours=24)
+        start_str = start_tz.strftime("%Y-%m-%d %H:%M:%S")
+        end_str = end_tz.strftime("%Y-%m-%d %H:%M:%S")
 
         def _table_exists(name: str) -> bool:
             try:
@@ -916,6 +877,51 @@ for t in tipos:
         def _pick_date_col(cols):
             return _pick(cols, ['event_time', 'event_datetime', 'date', 'timestamp', 'occurred_at', 'created_at'])
 
+        def _count_in_window(table: str) -> int:
+            if not _table_exists(table):
+                return 0
+            cols = _cols(table)
+            datecol = _pick_date_col(cols)
+            if not datecol:
+                return 0
+            sql = f'SELECT COUNT(*) FROM {table} WHERE "{datecol}" >= %s AND "{datecol}" < %s'
+            try:
+                with connection.cursor() as cur:
+                    cur.execute(sql, [start_str, end_str])
+                    v = cur.fetchone()[0]
+                    return int(v or 0)
+            except Exception:
+                sql2 = f'SELECT COUNT(*) FROM {table} WHERE DATE("{datecol}") = %s'
+                try:
+                    with connection.cursor() as cur:
+                        cur.execute(sql2, [str(day)])
+                        v = cur.fetchone()[0]
+                        return int(v or 0)
+                except Exception:
+                    return 0
+
+        table_map = {
+            'deliveries': 'reports_deliveries',
+            'bounces': 'reports_bounces',
+            'opens': 'reports_opens',
+            'clicks': 'reports_clicks',
+            'spam': 'reports_spam',
+            'unsubscribed': 'reports_unsubscribed',
+            'sent': 'reports_sent',
+        }
+        for t in tipos:
+            summary[t] = _count_in_window(table_map[t])
+
+        # Enlaces a CSV originales listos
+        ready = {r.report_type: r for r in reps.filter(state=GeneratedReport.STATE_READY)}
+        ready_urls = {}
+        try:
+            for t, r in ready.items():
+                ready_urls[t] = reverse('admin:reports_generatedreport_download', args=(r.pk,))
+        except Exception:
+            ready_urls = {}
+
+        # Helpers para tablas de detalle (mismo día)
         def _select_singlecol(table: str, daycol: str | None, col: str, limit: int):
             if not _table_exists(table):
                 return []
