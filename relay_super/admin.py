@@ -30,6 +30,17 @@ class BulkSendSenderForm(BaseBulkSendForm):
         model = BulkSend  # mantener el mismo modelo
         fields = BaseBulkSendForm.Meta.fields
 
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Corregir ayuda del campo sender con acentos
+        try:
+            if 'sender' in self.fields:
+                self.fields['sender'].help_text = (
+                    'Seleccione el remitente (from_name / from_email) para este envío.'
+                )
+        except Exception:
+            pass
+
     def save(self, commit=True):
         instance: BulkSend = super().save(commit=False)
         sender_obj: UserEmailConfig | None = self.cleaned_data.get("sender")

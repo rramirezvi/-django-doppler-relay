@@ -118,26 +118,52 @@ def load_report_to_db(generated_report_id: int, target_alias: str = "default") -
     if not headers:
         raise ValueError("El CSV no tiene cabeceras")
 
-    # Intentar esquema tipado desde JSON si existe
-    schema_path = Path("attachments") / "reports" / "schemas" / f"schema_{rep.report_type}.json"
+    # Detección de "summary" (Subject, Sender, SenderName, Email, Status, Date, Opens, Clicks)
+    headers_lower = [str(h or "").strip().lower() for h in headers]
+    header_set = set(headers_lower)
+    summary_expected = {"subject", "sender", "sendername", "email", "status", "date", "opens", "clicks"}
+
     columns_types: List[Tuple[str, str]] = []
     cast_types: Dict[str, str] = {}
-    if schema_path.exists():
-        import json
-        schema = json.loads(schema_path.read_text(encoding="utf-8"))
-        cols = schema.get("columns", [])
-        inferred_map = {c.get("name"): (c.get("inferred_type") or "text") for c in cols}
-        for h in headers:
-            inferred = inferred_map.get(h, "text")
-            cast_types[h] = inferred
-            columns_types.append((_sanitize_identifier(h), _sql_type_for(connections[target_alias].vendor, inferred)))
-    else:
-        # Fallback: todo TEXT
-        for h in headers:
-            cast_types[h] = "text"
-            columns_types.append((_sanitize_identifier(h), _sql_type_for(connections[target_alias].vendor, "text")))
 
-    table = _table_name_for(rep.report_type)
+    is_summary = summary_expected.issubset(header_set)
+
+    if is_summary:
+        # Definir esquema tipado estable para summary
+        type_map = {
+            "subject": "text",
+            "sender": "text",
+            "sendername": "text",
+            "email": "email",
+            "status": "text",
+            "date": "timestamp",
+            "opens": "integer",
+            "clicks": "integer",
+        }
+        for orig, low in zip(headers, headers_lower):
+            t = type_map.get(low, "text")
+            cast_types[orig] = t
+            columns_types.append((_sanitize_identifier(orig), _sql_type_for(connections[target_alias].vendor, t)))
+        table = "reports_summary"
+    else:
+        # Intentar esquema tipado desde JSON si existe (modo por tipo)
+        schema_path = Path("attachments") / "reports" / "schemas" / f"schema_{rep.report_type}.json"
+        if schema_path.exists():
+            import json
+            schema = json.loads(schema_path.read_text(encoding="utf-8"))
+            cols = schema.get("columns", [])
+            inferred_map = {c.get("name"): (c.get("inferred_type") or "text") for c in cols}
+            for h in headers:
+                inferred = inferred_map.get(h, "text")
+                cast_types[h] = inferred
+                columns_types.append((_sanitize_identifier(h), _sql_type_for(connections[target_alias].vendor, inferred)))
+        else:
+            # Fallback: todo TEXT
+            for h in headers:
+                cast_types[h] = "text"
+                columns_types.append((_sanitize_identifier(h), _sql_type_for(connections[target_alias].vendor, "text")))
+
+        table = _table_name_for(rep.report_type)
     connection = connections[target_alias]
 
     # Asegurar tabla y columnas en destino (tipadas)

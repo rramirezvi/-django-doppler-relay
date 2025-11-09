@@ -298,6 +298,24 @@ class BulkSendForm(forms.ModelForm):
         super().__init__(*args, **kwargs)
         self._template_warnings: set[str] = set()
         self._configure_template_field()
+        # Normalizar textos con acentos y campos de solo lectura en el formulario
+        try:
+            if 'scheduled_at' in self.fields:
+                self.fields['scheduled_at'].label = 'Programar envío'
+                self.fields['scheduled_at'].help_text = (
+                    'Déjalo vacío para enviar ahora. Si especificas fecha/hora futura, '
+                    'se programará automáticamente.'
+                )
+            if 'variables' in self.fields:
+                self.fields['variables'].help_text = (
+                    'Mapeo de columnas CSV a variables de la plantilla (opcional).\n'
+                    'Solo es necesario si los nombres de las columnas en tu CSV no '
+                    'coinciden con las variables de la plantilla.\n\n'
+                    'Si los nombres de las columnas en tu CSV coinciden con las variables '
+                    'de la plantilla, deja este campo vacío.'
+                )
+        except Exception:
+            pass
         # Evitar ediciÃ³n manual de la marca tÃ©cnica del scheduler
         if 'processing_started_at' in self.fields:
             self.fields['processing_started_at'].disabled = True
@@ -914,6 +932,43 @@ class BulkSendAdmin(admin.ModelAdmin):
         for t in tipos:
             summary[t] = _count_in_window(table_map[t])
 
+        # Override con tabla resumen (reports_summary) si existe
+        try:
+            with connection.cursor() as cur:
+                tables = connection.introspection.table_names(cur)
+            use_summary = 'reports_summary' in tables
+        except Exception:
+            use_summary = False
+
+        if use_summary:
+            def _sum_int(col: str) -> int:
+                try:
+                    with connection.cursor() as cur:
+                        cur.execute('SELECT COALESCE(SUM("' + col + '"),0) FROM reports_summary WHERE DATE("date")=%s', [str(day)])
+                        v = cur.fetchone()[0]
+                    return int(v or 0)
+                except Exception:
+                    return 0
+
+            def _status_count(names) -> int:
+                names = [str(n).lower() for n in names]
+                try:
+                    with connection.cursor() as cur:
+                        cur.execute('SELECT LOWER("status"), COUNT(*) FROM reports_summary WHERE DATE("date")=%s GROUP BY LOWER("status")', [str(day)])
+                        rows = cur.fetchall()
+                    m = { (r[0] or '').strip().lower(): int(r[1]) for r in rows }
+                    return sum(m.get(n,0) for n in names)
+                except Exception:
+                    return 0
+
+            summary['opens'] = _sum_int('opens')
+            summary['clicks'] = _sum_int('clicks')
+            summary['deliveries'] = _status_count(['delivered','delivery','success'])
+            summary['bounces'] = _status_count(['bounced','bounce','rejected'])
+            summary['spam'] = _status_count(['spam','complaint'])
+            summary['unsubscribed'] = _status_count(['unsubscribed','unsubscribe'])
+            summary['sent'] = _status_count(['sent'])
+
         # Enlaces a CSV originales listos
         ready = {r.report_type: r for r in reps.filter(
             state=GeneratedReport.STATE_READY)}
@@ -942,50 +997,38 @@ class BulkSendAdmin(admin.ModelAdmin):
             except Exception:
                 return []
 
-        # Bounces por razón (top 20)
+        # Bounces por razón: no disponible con CSV summary (no hay motivo)
         bounces_by_reason = []
-        if _table_exists('reports_bounces'):
-            cb = _cols('reports_bounces')
-            reason = _pick(cb, ['bounce_reason', 'reason', 'classification'])
-            daycol = _pick_date_col(cb)
-            if reason:
-                vals = _select_singlecol(
-                    'reports_bounces', daycol, reason, 20000)
-                from collections import Counter
-                bounces_by_reason = sorted(
-                    Counter([v for v in vals if v]).items(), key=lambda x: x[1], reverse=True)[:20]
 
-        # Clicks por URL (top 20)
+        # Clicks por URL: no disponible con CSV summary (no hay URL)
         clicks_by_url = []
-        if _table_exists('reports_clicks'):
-            cc = _cols('reports_clicks')
-            urlc = _pick(cc, ['url', 'target_url', 'click_url', 'link'])
-            daycol = _pick_date_col(cc)
-            if urlc:
-                vals = _select_singlecol('reports_clicks', daycol, urlc, 50000)
-                from collections import Counter
-                clicks_by_url = sorted(
-                    Counter([v for v in vals if v]).items(), key=lambda x: x[1], reverse=True)[:20]
 
-        # Opens por dominio (top 20)
+        # Opens por dominio (top 20) tomando reports_summary
+        # Agrupa por dominio de email y suma la columna 'opens'
         opens_by_domain = []
-        if _table_exists('reports_opens'):
-            co = _cols('reports_opens')
-            emailc = _pick(
-                co, ['email', 'address', 'recipient', 'email_address', 'to'])
-            daycol = _pick_date_col(co)
-            if emailc:
-                vals = _select_singlecol(
-                    'reports_opens', daycol, emailc, 50000)
+        try:
+            if _table_exists('reports_summary'):
+                with connection.cursor() as cur:
+                    cur.execute('SELECT "email", COALESCE("opens",0) FROM reports_summary WHERE DATE("date")=%s', [str(day)])
+                    rows = cur.fetchall()
                 from collections import Counter
 
-                def _dom(x):
+                def _dom(x: str) -> str:
                     try:
-                        return (x or '').split('@', 1)[1].lower()
+                        return (x or '').split('@', 1)[1].strip().lower()
                     except Exception:
                         return ''
-                opens_by_domain = sorted(Counter(
-                    [_dom(v) for v in vals if v and '@' in v]).items(), key=lambda x: x[1], reverse=True)[:20]
+
+                counter = Counter()
+                for email, opens in rows:
+                    dom = _dom(email)
+                    try:
+                        counter[dom] += int(opens or 0)
+                    except Exception:
+                        continue
+                opens_by_domain = sorted(counter.items(), key=lambda x: x[1], reverse=True)[:20]
+        except Exception:
+            opens_by_domain = []
 
         context = {
             **self.admin_site.each_context(request),
