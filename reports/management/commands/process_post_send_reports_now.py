@@ -53,6 +53,21 @@ class Command(BaseCommand):
                         created_total += 1
                         self.stdout.write(f"  creado GeneratedReport {t} {day}")
 
+            # Si todos los GR del día están READY y ya cargados, crear uno nuevo para refrescar CSV
+            for day in list(days_to_request):
+                qs_day = GeneratedReport.objects.filter(report_type__in=REPORT_TYPES, start_date=day, end_date=day)
+                if qs_day.exists() and qs_day.filter(state=GeneratedReport.STATE_READY, loaded_to_db=True).count() == qs_day.count():
+                    for t in REPORT_TYPES:
+                        GeneratedReport.objects.create(
+                            report_type=t,
+                            start_date=day,
+                            end_date=day,
+                            state=GeneratedReport.STATE_PENDING,
+                            requested_by=None,
+                        )
+                        created_total += 1
+                        self.stdout.write(self.style.NOTICE(f"  refresco: nuevo GR {t} {day} (todos los previos cargados)"))
+
             # Resetear reportes en ERROR para reintento automático
             err_qs = GeneratedReport.objects.filter(
                 report_type__in=REPORT_TYPES,

@@ -287,6 +287,31 @@ def load_report_to_db(generated_report_id: int, target_alias: str = "default") -
         else:
             params_iter.append(tuple(values + [rep.pk, created_at]))
 
+    # Reemplazo por día (ventana local) cuando se trata de deliveries summary
+    try:
+        if table == 'reports_deliveries' and rep.start_date and rep.end_date and rep.start_date == rep.end_date:
+            from datetime import timedelta, datetime as _dt
+            start_local = f"{rep.start_date} 00:00:00"
+            end_local = f"{(rep.start_date + timedelta(days=1))} 00:00:00"
+            with connection.cursor() as cursor:
+                # Primero intentamos por date_local (si existe)
+                try:
+                    cursor.execute(
+                        f'DELETE FROM {qn(table)} WHERE {qn("date_local")} >= ' + ph + ' AND ' + qn('date_local') + ' < ' + ph,
+                        [start_local, end_local]
+                    )
+                except Exception:
+                    # Fallback: borrar por rango UTC sobre columna "date"
+                    tz_local = ZoneInfo(getattr(settings, "TIME_ZONE", "UTC"))
+                    sdt = _dt.strptime(start_local, "%Y-%m-%d %H:%M:%S").replace(tzinfo=tz_local).astimezone(ZoneInfo("UTC"))
+                    edt = _dt.strptime(end_local, "%Y-%m-%d %H:%M:%S").replace(tzinfo=tz_local).astimezone(ZoneInfo("UTC"))
+                    cursor.execute(
+                        f'DELETE FROM {qn(table)} WHERE {qn("date")} >= ' + ph + ' AND ' + qn('date') + ' < ' + ph,
+                        [sdt.isoformat(sep=' '), edt.isoformat(sep=' ')]
+                    )
+    except Exception:
+        pass
+
     # Idempotencia por generated_report_id: eliminar previamente lo cargado
     try:
         with connection.cursor() as cursor:
