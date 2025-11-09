@@ -29,6 +29,7 @@ class Command(BaseCommand):
         processed_ok = 0
 
         for bulk in qs.iterator():
+            self.stdout.write(self.style.NOTICE(f"Bulk {bulk.id}: preparando días local/UTC"))
             # Determinar días objetivo: día local del envío y día UTC (para cubrir TZ)
             local_day = bulk.created_at.date()
             try:
@@ -36,6 +37,7 @@ class Command(BaseCommand):
             except Exception:
                 utc_day = local_day
             days_to_request = {local_day, utc_day}
+            self.stdout.write(f"  días: local={local_day} utc={utc_day}")
 
             # Crear GeneratedReport por tipo si no existe para cada día
             for day in days_to_request:
@@ -49,6 +51,7 @@ class Command(BaseCommand):
                             requested_by=None,
                         )
                         created_total += 1
+                        self.stdout.write(f"  creado GeneratedReport {t} {day}")
 
             # Resetear reportes en ERROR para reintento automático
             err_qs = GeneratedReport.objects.filter(
@@ -57,6 +60,8 @@ class Command(BaseCommand):
                 end_date__in=list(days_to_request),
                 state=GeneratedReport.STATE_ERROR,
             )
+            if err_qs.exists():
+                self.stdout.write(self.style.WARNING(f"  reiniciando {err_qs.count()} reportes en ERROR -> PENDING"))
             for rep in err_qs.iterator():
                 rep.state = GeneratedReport.STATE_PENDING
                 rep.report_request_id = ""
@@ -71,14 +76,34 @@ class Command(BaseCommand):
                 end_date__in=list(days_to_request),
                 state=GeneratedReport.STATE_READY,
             )
+            total_gr = GeneratedReport.objects.filter(
+                report_type__in=REPORT_TYPES,
+                start_date__in=list(days_to_request),
+                end_date__in=list(days_to_request),
+            ).count()
+            self.stdout.write(f"  encontrados GR={total_gr}, READY={ready.count()}")
             # Cargar a BD solo los que aún no fueron cargados a alias default
             total_inserted = 0
             for rep in ready.iterator():
                 if not rep.loaded_to_db:
                     try:
-                        total_inserted += load_report_to_db(rep.pk, target_alias="default")
+                        # Log de tamaño del CSV antes de cargar
+                        from pathlib import Path
+                        size = 0
+                        try:
+                            if rep.file_path:
+                                p = Path(rep.file_path)
+                                if p.exists():
+                                    size = p.stat().st_size
+                        except Exception:
+                            size = -1
+                        self.stdout.write(f"    READY rep={rep.pk} csv_bytes={size}")
+                        inserted = load_report_to_db(rep.pk, target_alias="default")
+                        total_inserted += inserted
+                        self.stdout.write(self.style.SUCCESS(f"    loaded rep={rep.pk} rows={inserted}"))
                     except Exception:
                         # lo dejamos para un siguiente intento
+                        self.stdout.write(self.style.WARNING(f"    error cargando rep={rep.pk}, se reintentará"))
                         pass
 
             # Marcar trazabilidad en BulkSend para habilitar el botón de reporte
@@ -87,6 +112,9 @@ class Command(BaseCommand):
                 bulk.post_reports_loaded_at = timezone.now()
                 bulk.save(update_fields=["post_reports_status", "post_reports_loaded_at"])
                 processed_ok += 1
+                self.stdout.write(self.style.SUCCESS(f"  bulk {bulk.id}: insertadas {total_inserted} filas (marcado listo)"))
+            else:
+                self.stdout.write(self.style.WARNING(f"  bulk {bulk.id}: 0 filas insertadas (se reintentará en próxima pasada)"))
 
         self.stdout.write(self.style.SUCCESS(
             f"Post-send reports NOW: created={created_total}, bulks processed={processed_ok}"
