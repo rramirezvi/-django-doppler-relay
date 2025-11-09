@@ -1,9 +1,8 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from django import forms
 from django.contrib import admin, messages
 from django.core.exceptions import PermissionDenied
-from django.utils.translation import gettext_lazy as _
 from django.utils.html import format_html
 from django.urls import reverse
 
@@ -15,7 +14,7 @@ from relay.admin import BulkSendForm as BaseBulkSendForm
 
 class SenderChoiceField(forms.ModelChoiceField):
     def label_from_instance(self, obj: UserEmailConfig) -> str:  # type: ignore[override]
-        return f"{obj.user.username} — {obj.from_email}"
+        return f"{obj.user.username} - {obj.from_email}"
 
 
 class BulkSendSenderForm(BaseBulkSendForm):
@@ -32,7 +31,6 @@ class BulkSendSenderForm(BaseBulkSendForm):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Corregir ayuda del campo sender con acentos
         try:
             if 'sender' in self.fields:
                 self.fields['sender'].help_text = (
@@ -44,7 +42,6 @@ class BulkSendSenderForm(BaseBulkSendForm):
     def save(self, commit=True):
         instance: BulkSend = super().save(commit=False)
         sender_obj: UserEmailConfig | None = self.cleaned_data.get("sender")
-        # Persistir el remitente elegido dentro de variables con una clave reservada
         variables = instance.variables or {}
         if sender_obj:
             variables["__sender_user_config_id"] = sender_obj.pk
@@ -58,8 +55,27 @@ class BulkSendSenderForm(BaseBulkSendForm):
 @admin.register(BulkSendUserConfigProxy)
 class BulkSendUserConfigAdmin(admin.ModelAdmin):
     form = BulkSendSenderForm
-    list_display = ("id", "template_display", "subject", "created_at", "status", "report_link", "report_link_v2", "report_csv_window")
-    readonly_fields = ("result", "log", "status", "created_at", "processing_started_at", "template_name", "variables", "post_reports_status", "post_reports_loaded_at")
+    list_display = (
+        "id",
+        "template_display",
+        "subject",
+        "created_at",
+        "status",
+        "report_link",
+        "report_link_v2",
+        "report_csv_window",
+    )
+    readonly_fields = (
+        "result",
+        "log",
+        "status",
+        "created_at",
+        "processing_started_at",
+        "template_name",
+        "variables",
+        "post_reports_status",
+        "post_reports_loaded_at",
+    )
     search_fields = ("template_id", "subject")
     list_filter = ("status",)
     actions = ["procesar_envio_masivo"]
@@ -78,9 +94,7 @@ class BulkSendUserConfigAdmin(admin.ModelAdmin):
             "status",
             "created_at",
         ]
-        if obj is None:
-            return base + technical
-        return base
+        return base + technical if obj is None else base
 
     # Mostrar nombre de plantilla si existe; si no, el ID
     def template_display(self, obj: BulkSend):
@@ -109,8 +123,7 @@ class BulkSendUserConfigAdmin(admin.ModelAdmin):
         return ""
     report_link_v2.short_description = "Reporte v2"
 
-    
-        def report_csv_window(self, obj: BulkSend):
+    def report_csv_window(self, obj: BulkSend):
         # CSV del envío (ventana local)
         if getattr(obj, "status", "") == "done" and getattr(obj, "post_reports_loaded_at", None):
             try:
@@ -119,7 +132,9 @@ class BulkSendUserConfigAdmin(admin.ModelAdmin):
             except Exception:
                 return ""
         return ""
-    report_csv_window.short_description = "CSV envío"def procesar_envio_masivo(self, request, queryset):
+    report_csv_window.short_description = "CSV envío"
+
+    def procesar_envio_masivo(self, request, queryset):
         if not (request.user.is_active and request.user.is_staff and request.user.has_perm("relay_super.change_bulksenduserconfigproxy")):
             raise PermissionDenied("No tiene permiso para procesar envíos masivos.")
         # Ejecutar en background para no bloquear la request del admin
@@ -135,8 +150,4 @@ class BulkSendUserConfigAdmin(admin.ModelAdmin):
             threading.Thread(target=process_bulk_id, args=(bulk.id,), daemon=True).start()
             messages.info(request, f"BulkSend {bulk.id} en proceso (background). Revise el estado en la lista.")
         return
-
-
-
-
 
