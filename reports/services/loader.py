@@ -153,7 +153,8 @@ def load_report_to_db(generated_report_id: int, target_alias: str = "default") -
             t = type_map.get(low, "text")
             cast_types[orig] = t
             columns_types.append((_sanitize_identifier(orig), _sql_type_for(connections[target_alias].vendor, t)))
-        table = "reports_summary"
+        # Cargar SIEMPRE en la tabla única de resumen operativo
+        table = "reports_deliveries"
     else:
         # Intentar esquema tipado desde JSON si existe (modo por tipo)
         schema_path = Path("attachments") / "reports" / "schemas" / f"schema_{rep.report_type}.json"
@@ -228,6 +229,13 @@ def load_report_to_db(generated_report_id: int, target_alias: str = "default") -
     for row in data_rows:
         values = [cast_value(row.get(orig, ""), cast_types.get(orig, "text")) for orig in headers]
         params_iter.append(tuple(values + [rep.pk, created_at]))
+
+    # Idempotencia por generated_report_id: eliminar previamente lo cargado
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute(f'DELETE FROM {qn(table)} WHERE {qn("generated_report_id")} = ' + ph, [rep.pk])
+    except Exception:
+        pass
 
     rows_inserted = 0
     try:

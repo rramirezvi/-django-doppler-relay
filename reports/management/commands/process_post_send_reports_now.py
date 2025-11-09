@@ -58,19 +58,21 @@ class Command(BaseCommand):
                 state=GeneratedReport.STATE_READY,
             )
             # Cargar a BD solo los que aún no fueron cargados a alias default
+            total_inserted = 0
             for rep in ready.iterator():
                 if not rep.loaded_to_db:
                     try:
-                        load_report_to_db(rep.pk, target_alias="default")
+                        total_inserted += load_report_to_db(rep.pk, target_alias="default")
                     except Exception:
                         # lo dejamos para un siguiente intento
                         pass
 
             # Marcar trazabilidad en BulkSend para habilitar el botón de reporte
-            bulk.post_reports_status = "done"
-            bulk.post_reports_loaded_at = timezone.now()
-            bulk.save(update_fields=["post_reports_status", "post_reports_loaded_at"])
-            processed_ok += 1
+            if total_inserted > 0:
+                bulk.post_reports_status = "done"
+                bulk.post_reports_loaded_at = timezone.now()
+                bulk.save(update_fields=["post_reports_status", "post_reports_loaded_at"])
+                processed_ok += 1
 
         self.stdout.write(self.style.SUCCESS(
             f"Post-send reports NOW: created={created_total}, bulks processed={processed_ok}"

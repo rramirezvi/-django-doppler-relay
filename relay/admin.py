@@ -932,19 +932,19 @@ class BulkSendAdmin(admin.ModelAdmin):
         for t in tipos:
             summary[t] = _count_in_window(table_map[t])
 
-        # Override con tabla resumen (reports_summary) si existe
+        # Totales desde tabla única (reports_deliveries)
         try:
             with connection.cursor() as cur:
                 tables = connection.introspection.table_names(cur)
-            use_summary = 'reports_summary' in tables
+            use_deliveries = 'reports_deliveries' in tables
         except Exception:
-            use_summary = False
+            use_deliveries = False
 
-        if use_summary:
+        if use_deliveries:
             def _sum_int(col: str) -> int:
                 try:
                     with connection.cursor() as cur:
-                        cur.execute('SELECT COALESCE(SUM("' + col + '"),0) FROM reports_summary WHERE "date" >= %s AND "date" < %s', [start_str, end_str])
+                        cur.execute('SELECT COALESCE(SUM("' + col + '"),0) FROM reports_deliveries WHERE "date" >= %s AND "date" < %s', [start_str, end_str])
                         v = cur.fetchone()[0]
                     return int(v or 0)
                 except Exception:
@@ -954,7 +954,7 @@ class BulkSendAdmin(admin.ModelAdmin):
                 names = [str(n).lower() for n in names]
                 try:
                     with connection.cursor() as cur:
-                        cur.execute('SELECT LOWER("status"), COUNT(*) FROM reports_summary WHERE "date" >= %s AND "date" < %s GROUP BY LOWER("status")', [start_str, end_str])
+                        cur.execute('SELECT LOWER("status"), COUNT(*) FROM reports_deliveries WHERE "date" >= %s AND "date" < %s GROUP BY LOWER("status")', [start_str, end_str])
                         rows = cur.fetchall()
                     m = { (r[0] or '').strip().lower(): int(r[1]) for r in rows }
                     return sum(m.get(n,0) for n in names)
@@ -1004,13 +1004,13 @@ class BulkSendAdmin(admin.ModelAdmin):
         # Clicks por URL: no disponible con CSV summary (no hay URL)
         clicks_by_url = []
 
-        # Opens por dominio (top 20) tomando reports_summary
+        # Opens por dominio (top 20) tomando reports_deliveries
         # Agrupa por dominio de email y suma la columna 'opens'
         opens_by_domain = []
         try:
-            if _table_exists('reports_summary'):
+            if _table_exists('reports_deliveries'):
                 with connection.cursor() as cur:
-                    cur.execute('SELECT "email", COALESCE("opens",0) FROM reports_summary WHERE "date" >= %s AND "date" < %s', [start_str, end_str])
+                    cur.execute('SELECT "email", COALESCE("opens",0) FROM reports_deliveries WHERE "date" >= %s AND "date" < %s', [start_str, end_str])
                     rows = cur.fetchall()
                 from collections import Counter
 
