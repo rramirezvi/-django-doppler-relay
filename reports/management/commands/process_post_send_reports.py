@@ -51,6 +51,19 @@ class Command(BaseCommand):
                         created_total += 1
 
             # Procesar pendientes y cargar a BD
+                        # Resetear reportes en ERROR para reintento automático
+            err_qs = GeneratedReport.objects.filter(
+                report_type__in=REPORT_TYPES,
+                start_date__in=list(days_to_request),
+                end_date__in=list(days_to_request),
+                state=GeneratedReport.STATE_ERROR,
+            )
+            for rep in err_qs.iterator():
+                rep.state = GeneratedReport.STATE_PENDING
+                rep.report_request_id = ""
+                rep.file_path = ""
+                rep.error_details = ""
+                rep.save(update_fields=["state", "report_request_id", "file_path", "error_details", "updated_at"])
             process_pending_reports()
             ready = GeneratedReport.objects.filter(
                 start_date__in=list(days_to_request),
@@ -74,6 +87,7 @@ class Command(BaseCommand):
                 processed_ok += 1
 
         self.stdout.write(self.style.SUCCESS(f"Post-send reports: created={created_total}, bulks processed={processed_ok}"))
+
 
 
 

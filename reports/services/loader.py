@@ -3,6 +3,8 @@ from __future__ import annotations
 import csv
 import re
 from pathlib import Path
+from zoneinfo import ZoneInfo
+from django.conf import settings
 from typing import Dict, Iterable, List, Tuple
 
 from django.db import connections
@@ -215,14 +217,28 @@ def load_report_to_db(generated_report_id: int, target_alias: str = "default") -
         if t == "boolean":
             return s.lower() in {"true", "1", "yes"}
         if t == "timestamp":
-            for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ", "%Y-%m-%d"):
+            tz_local = ZoneInfo(getattr(settings, "TIME_ZONE", "UTC"))
+            # intentos de parseo comunes (naive y con 'Z')
+            fmts = (
+                ("%Y-%m-%d %H:%M:%S", None),
+                ("%Y-%m-%dT%H:%M:%S", None),
+                ("%Y-%m-%dT%H:%M:%SZ", "UTC"),
+                ("%Y-%m-%d", None),
+            )
+            for fmt, tzname in fmts:
                 try:
                     dt = datetime.strptime(s, fmt)
-                    # entregamos string ISO para compatibilidad universal
-                    return dt.isoformat(sep=" ")
+                    if tzname == "UTC":
+                        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+                    else:
+                        # si no trae zona, asumimos TZ local y convertimos a UTC
+                        dt = dt.replace(tzinfo=tz_local)
+                    dt_utc = dt.astimezone(ZoneInfo("UTC"))
+                    return dt_utc.isoformat(sep=" ")
                 except Exception:
                     continue
-            return s  # si no parsea, insertamos como texto compatible
+            # si no parsea, devolver como texto compatible
+            return s
         # email y text → string crudo
         return s
 
