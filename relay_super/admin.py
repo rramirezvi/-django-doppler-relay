@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from django import forms
 from django.contrib import admin, messages
@@ -58,7 +58,7 @@ class BulkSendSenderForm(BaseBulkSendForm):
 @admin.register(BulkSendUserConfigProxy)
 class BulkSendUserConfigAdmin(admin.ModelAdmin):
     form = BulkSendSenderForm
-    list_display = ("id", "template_display", "subject", "created_at", "status", "report_link", "report_link_v2")
+    list_display = ("id", "template_display", "subject", "created_at", "status", "report_link", "report_link_v2", "report_csv_window")
     readonly_fields = ("result", "log", "status", "created_at", "processing_started_at", "template_name", "variables", "post_reports_status", "post_reports_loaded_at")
     search_fields = ("template_id", "subject")
     list_filter = ("status",)
@@ -109,7 +109,17 @@ class BulkSendUserConfigAdmin(admin.ModelAdmin):
         return ""
     report_link_v2.short_description = "Reporte v2"
 
-    def procesar_envio_masivo(self, request, queryset):
+    
+    def report_csv_window(self, obj: BulkSend):
+        # CSV del envío (ventana local)
+        if getattr(obj, "status", "") == "done" and getattr(obj, "post_reports_loaded_at", None):
+            try:
+                url = reverse("admin:relay_bulksend_report_v2_csv_window", args=[obj.pk])
+                return format_html('<a class="button" href="{}">CSV de este envío</a>', url)
+            except Exception:
+                return ""
+        return ""
+    report_csv_window.short_description = "CSV envío"def procesar_envio_masivo(self, request, queryset):
         if not (request.user.is_active and request.user.is_staff and request.user.has_perm("relay_super.change_bulksenduserconfigproxy")):
             raise PermissionDenied("No tiene permiso para procesar envíos masivos.")
         # Ejecutar en background para no bloquear la request del admin
@@ -125,3 +135,5 @@ class BulkSendUserConfigAdmin(admin.ModelAdmin):
             threading.Thread(target=process_bulk_id, args=(bulk.id,), daemon=True).start()
             messages.info(request, f"BulkSend {bulk.id} en proceso (background). Revise el estado en la lista.")
         return
+
+
