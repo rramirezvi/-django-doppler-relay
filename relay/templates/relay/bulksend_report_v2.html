@@ -82,9 +82,18 @@
     </div>
   </div>
 
-  <h2 style="margin-top:24px;">Descargas</h2>\n  <p>\n    {% if window_csv_url %}\n      <a class="button" href="{{ window_csv_url }}" style="margin-right:8px;">CSV de este envío</a>\n    {% endif %}\n    {% if day_csv_url %}\n      <a class="button" href="{{ day_csv_url }}" style="margin-right:8px;">CSV consolidado del día</a>\n    {% else %}\n      <span style="opacity:0.7;">Consolidado aún no disponible</span>\n    {% endif %}\n  </p>
+    <h2 style="margin-top:24px;">Descargas</h2>
+  <p>
+    <a class="button" href="{% url 'admin:relay_bulksend_report_v2_csv_window' bulk.pk %}" style="margin-right:8px;">CSV de este envío</a>
+    {% if day_csv_url %}
+      <a class="button" href="{{ day_csv_url }}" style="margin-right:8px;">CSV consolidado del día</a>
+    {% else %}
+      <span style="opacity:0.7;">Consolidado aún no disponible</span>
+    {% endif %}
+  </p>
 
 </div>
 {% endblock %}
+
 
 
