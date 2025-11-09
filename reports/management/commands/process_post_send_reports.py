@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import timedelta
 
@@ -12,7 +12,7 @@ from reports.services.processor import process_pending_reports
 from reports.services.loader import load_report_to_db
 
 
-REPORT_TYPES = ["deliveries", "bounces", "opens", "clicks", "spam", "unsubscribed", "sent"]
+REPORT_TYPES = ["deliveries"]
 
 
 class Command(BaseCommand):
@@ -59,4 +59,5 @@ class Command(BaseCommand):
             processed_ok += 1
 
         self.stdout.write(self.style.SUCCESS(f"Post-send reports: created={created_total}, bulks processed={processed_ok}"))
+
 

@@ -971,12 +971,13 @@ class BulkSendAdmin(admin.ModelAdmin):
 
         # Enlaces a CSV originales listos
         ready = {r.report_type: r for r in reps.filter(
-            state=GeneratedReport.STATE_READY)}
+            state=GeneratedReport.STATE_READY) if r.report_type == 'deliveries'}
         ready_urls = {}
         try:
             for t, r in ready.items():
-                ready_urls[t] = reverse(
-                    'admin:reports_generatedreport_download', args=(r.pk,))
+                if t == 'deliveries':
+                    ready_urls[t] = reverse(
+                        'admin:reports_generatedreport_download', args=(r.pk,))
         except Exception:
             ready_urls = {}
 

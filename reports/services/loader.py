@@ -96,7 +96,8 @@ def _ensure_table(connection, table: str, columns_types: List[Tuple[str, str]]) 
 
 
 def _read_csv(path: Path) -> Tuple[List[str], List[Dict[str, str]]]:
-    with path.open("r", encoding="utf-8", newline="") as fh:
+    # utf-8-sig elimina BOM en la primera cabecera si existe
+    with path.open("r", encoding="utf-8-sig", newline="") as fh:
         reader = csv.DictReader(fh)
         headers = list(reader.fieldnames or [])
         rows = []
@@ -119,7 +120,15 @@ def load_report_to_db(generated_report_id: int, target_alias: str = "default") -
         raise ValueError("El CSV no tiene cabeceras")
 
     # Detección de "summary" (Subject, Sender, SenderName, Email, Status, Date, Opens, Clicks)
-    headers_lower = [str(h or "").strip().lower() for h in headers]
+    # Normalizar cabeceras y remover posibles BOM residuales
+    def _norm_header(h: str) -> str:
+        s = str(h or "").strip().lstrip("\ufeff").lower()
+        # limpiar artefactos visibles de BOM si quedaron en texto ya decodificado
+        if s.startswith("ï»¿".lower()):
+            s = s.replace("ï»¿".lower(), "").strip()
+        return s
+
+    headers_lower = [_norm_header(h) for h in headers]
     header_set = set(headers_lower)
     summary_expected = {"subject", "sender", "sendername", "email", "status", "date", "opens", "clicks"}
 

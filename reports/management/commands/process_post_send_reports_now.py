@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 from datetime import timedelta, timezone as dt_timezone
 
@@ -11,7 +11,7 @@ from reports.services.processor import process_pending_reports
 from reports.services.loader import load_report_to_db
 
 
-REPORT_TYPES = ["deliveries", "bounces", "opens", "clicks", "spam", "unsubscribed", "sent"]
+REPORT_TYPES = ["deliveries"]
 
 
 class Command(BaseCommand):
