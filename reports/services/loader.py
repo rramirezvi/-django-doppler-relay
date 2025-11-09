@@ -108,6 +108,34 @@ def _read_csv(path: Path) -> Tuple[List[str], List[Dict[str, str]]]:
         return headers, rows
 
 
+def to_local_naive(val: str | None) -> str | None:
+    """Convierte una fecha/hora en string a hora local sin zona (naive) usando settings.TIME_ZONE.
+    Retorna 'YYYY-MM-DD HH:MM:SS' o None si no puede parsear.
+    """
+    s = ("" if val is None else str(val)).strip()
+    if not s:
+        return None
+    from datetime import datetime
+    tz_local = ZoneInfo(getattr(settings, "TIME_ZONE", "UTC"))
+    fmts = (
+        ("%Y-%m-%d %H:%M:%S", None),
+        ("%Y-%m-%dT%H:%M:%S", None),
+        ("%Y-%m-%dT%H:%M:%SZ", "UTC"),
+        ("%Y-%m-%d", None),
+    )
+    for fmt, tzname in fmts:
+        try:
+            dt = datetime.strptime(s, fmt)
+            if tzname == "UTC":
+                dt = dt.replace(tzinfo=ZoneInfo("UTC")).astimezone(tz_local)
+            else:
+                dt = dt.replace(tzinfo=tz_local)
+            return dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            continue
+    return None
+
+
 def load_report_to_db(generated_report_id: int, target_alias: str = "default") -> int:
     rep = GeneratedReport.objects.get(pk=generated_report_id)
     if not rep.file_path:
