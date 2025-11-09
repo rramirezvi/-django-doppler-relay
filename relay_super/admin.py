@@ -63,7 +63,6 @@ class BulkSendUserConfigAdmin(admin.ModelAdmin):
         "status",
         "report_link",
         "report_link_v2",
-        "report_csv_window",
     )
     readonly_fields = (
         "result",
@@ -150,4 +149,3 @@ class BulkSendUserConfigAdmin(admin.ModelAdmin):
             threading.Thread(target=process_bulk_id, args=(bulk.id,), daemon=True).start()
             messages.info(request, f"BulkSend {bulk.id} en proceso (background). Revise el estado en la lista.")
         return
-
