@@ -1031,6 +1031,12 @@ class BulkSendAdmin(admin.ModelAdmin):
         except Exception:
             opens_by_domain = []
 
+        # URL consolidado del día (último READY de deliveries)
+        try:
+            ready_list = list(reps.filter(state=GeneratedReport.STATE_READY, report_type='deliveries').order_by('-id'))
+            day_csv_url = reverse('admin:reports_generatedreport_download', args=(ready_list[0].pk,)) if ready_list else ''
+        except Exception:
+            day_csv_url = ''
         context = {
             **self.admin_site.each_context(request),
             'title': f"Reporte (nuevo) del día {day}",
@@ -1042,8 +1048,52 @@ class BulkSendAdmin(admin.ModelAdmin):
             'clicks_by_url': clicks_by_url,
             'opens_by_domain': opens_by_domain,
             'ready_urls': ready_urls,
+            'day_csv_url': day_csv_url,
         }
         return TemplateResponse(request, 'relay/bulksend_report_v2.html', context)
+
+    def get_urls(self):
+        urls = super().get_urls()
+        my = [
+            path(
+                'bulksend/<int:pk>/report/v2/csv-window/',
+                self.admin_site.admin_view(self.view_report_v2_csv_window),
+                name='relay_bulksend_report_v2_csv_window',
+            ),
+        ]
+        return my + urls
+
+    def view_report_v2_csv_window(self, request, pk: int):
+        import csv
+        from django.http import HttpResponse
+        bulk = BulkSend.objects.get(pk=pk)
+        try:
+            start_tz = bulk.created_at.astimezone(ZoneInfo('America/Guayaquil'))
+        except Exception:
+            start_tz = bulk.created_at
+        end_tz = start_tz + timedelta(hours=24)
+        start_str = start_tz.strftime('%Y-%m-%d %H:%M:%S')
+        end_str = end_tz.strftime('%Y-%m-%d %H:%M:%S')
+
+        rows = []
+        try:
+            with connection.cursor() as cur:
+                cur.execute(
+                    'SELECT "subject","sender","sendername","email","status","date","opens","clicks","date_local" '
+                    'FROM reports_deliveries WHERE "date_local" >= %s AND "date_local" < %s',
+                    [start_str, end_str],
+                )
+                rows = cur.fetchall()
+        except Exception:
+            rows = []
+
+        response = HttpResponse(content_type='text/csv; charset=utf-8')
+        response['Content-Disposition'] = f'attachment; filename="bulk_{pk}_deliveries_window.csv"'
+        writer = csv.writer(response)
+        writer.writerow(['Subject', 'Sender', 'SenderName', 'Email', 'Status', 'Date', 'Opens', 'Clicks', 'Date_Local'])
+        for r in rows:
+            writer.writerow(list(r))
+        return response
 
     procesar_envio_masivo.short_description = "Procesar envío masivo seleccionado"
 
