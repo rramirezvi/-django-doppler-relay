@@ -49,6 +49,20 @@ class Command(BaseCommand):
                             requested_by=None,
                         )
                         created_total += 1
+            # Refresco: si todos los GR del día están READY y cargados, crear uno nuevo para re-generar CSV
+            for day in list(days_to_request):
+                qs_day = GeneratedReport.objects.filter(report_type__in=REPORT_TYPES, start_date=day, end_date=day)
+                if qs_day.exists() and qs_day.filter(state=GeneratedReport.STATE_READY, loaded_to_db=True).count() == qs_day.count():
+                    for t in REPORT_TYPES:
+                        GeneratedReport.objects.create(
+                            report_type=t,
+                            start_date=day,
+                            end_date=day,
+                            state=GeneratedReport.STATE_PENDING,
+                            requested_by=None,
+                        )
+                        created_total += 1
+
 
             # Procesar pendientes y cargar a BD
                         # Resetear reportes en ERROR para reintento automático
@@ -87,6 +101,8 @@ class Command(BaseCommand):
                 processed_ok += 1
 
         self.stdout.write(self.style.SUCCESS(f"Post-send reports: created={created_total}, bulks processed={processed_ok}"))
+
+
 
 
 
