@@ -61,7 +61,6 @@ class BulkSendUserConfigAdmin(admin.ModelAdmin):
         "subject",
         "created_at",
         "status",
-        "report_link",
         "report_link_v2",
     )
     readonly_fields = (

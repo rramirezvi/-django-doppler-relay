@@ -26,6 +26,41 @@ from .services.bulk_processing import process_bulk_id
 
 logger = logging.getLogger(__name__)
 
+# Ocultar módulo "Reports" del menú del admin sin romper URLs
+def _hide_reports_admin_menu_if_requested():
+    try:
+        visible = getattr(settings, 'REPORTS_ADMIN_VISIBLE', False)
+        if visible:
+            return
+        site = admin.site
+        if getattr(site, '_reports_menu_hidden', False):
+            return
+        original_each_context = site.each_context
+
+        def each_context(request):
+            ctx = original_each_context(request)
+            try:
+                apps = list(ctx.get('available_apps', []))
+                filtered = []
+                for app in apps:
+                    if app.get('app_label') == 'reports':
+                        continue
+                    models_list = app.get('models') or []
+                    if models_list:
+                        app['models'] = [m for m in models_list if m.get('app_label') != 'reports']
+                    filtered.append(app)
+                ctx['available_apps'] = filtered
+            except Exception:
+                pass
+            return ctx
+
+        site.each_context = each_context
+        site._reports_menu_hidden = True
+    except Exception:
+        pass
+
+_hide_reports_admin_menu_if_requested()
+
 
 # Formulario para la configuraciÃ³n de email del usuario
 
@@ -544,7 +579,7 @@ class BulkSendForm(forms.ModelForm):
 class BulkSendAdmin(admin.ModelAdmin):
     form = BulkSendForm
     list_display = ("id", "template_display", "subject", "created_at", "scheduled_at",
-                    "status", "attachment_count", "report_link", "report_link_v2")
+                    "status", "attachment_count", "report_link_v2")
     readonly_fields = ("result", "log", "status", "created_at", "processing_started_at",
                        "template_name", "variables", "post_reports_status", "post_reports_loaded_at")
 
@@ -826,15 +861,6 @@ class BulkSendAdmin(admin.ModelAdmin):
     procesar_envio_masivo.short_description = "Procesar envío masivo seleccionado"
 
     # Vista de reporte local (consulta BD)
-    def get_urls(self):
-        urls = super().get_urls()
-        my = [
-            path('bulksend/<int:pk>/report/',
-                 self.admin_site.admin_view(self.view_report), name='relay_bulksend_report'),
-            path('bulksend/<int:pk>/report/v2/', self.admin_site.admin_view(
-                self.view_report_v2), name='relay_bulksend_report_v2'),
-        ]
-        return my + urls
 
     def view_report(self, request, pk: int):
         from reports.models import GeneratedReport
@@ -1053,8 +1079,14 @@ class BulkSendAdmin(admin.ModelAdmin):
         return TemplateResponse(request, 'relay/bulksend_report_v2.html', context)
 
     def get_urls(self):
+        # Registrar solo rutas de reporte v2 y CSV de ventana local
         urls = super().get_urls()
         my = [
+            path(
+                'bulksend/<int:pk>/report/v2/',
+                self.admin_site.admin_view(self.view_report_v2),
+                name='relay_bulksend_report_v2',
+            ),
             path(
                 'bulksend/<int:pk>/report/v2/csv-window/',
                 self.admin_site.admin_view(self.view_report_v2_csv_window),
