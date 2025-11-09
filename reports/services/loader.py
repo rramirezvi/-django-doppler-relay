@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import csv
 import re
@@ -156,6 +156,7 @@ def load_report_to_db(generated_report_id: int, target_alias: str = "default") -
             cast_types[orig] = t
             columns_types.append((_sanitize_identifier(orig), _sql_type_for(connections[target_alias].vendor, t)))
         # Cargar SIEMPRE en la tabla única de resumen operativo
+        columns_types.append(("date_local", _sql_type_for(connections[target_alias].vendor, "timestamp_naive")))
         table = "reports_deliveries"
     else:
         # Intentar esquema tipado desde JSON si existe (modo por tipo)
@@ -187,7 +188,8 @@ def load_report_to_db(generated_report_id: int, target_alias: str = "default") -
     ph = _placeholder_for(vendor)
 
     mapped = [_sanitize_identifier(h) for h in headers]
-    cols_list = mapped + ["generated_report_id", "created_at"]
+    extra_cols = ["date_local"] if is_summary else []
+    cols_list = mapped + extra_cols + ["generated_report_id", "created_at"]
     cols_sql = ", ".join(qn(c) for c in cols_list)
     placeholders = ", ".join([ph] * len(cols_list))
     insert_sql = f"INSERT INTO {qn(table)} ({cols_sql}) VALUES ({placeholders})"
@@ -244,7 +246,18 @@ def load_report_to_db(generated_report_id: int, target_alias: str = "default") -
 
     for row in data_rows:
         values = [cast_value(row.get(orig, ""), cast_types.get(orig, "text")) for orig in headers]
-        params_iter.append(tuple(values + [rep.pk, created_at]))
+        # Añadir date_local cuando es summary (CSV Subject/Sender/...)
+        if is_summary:
+            try:
+                idx = headers_lower.index("date") if "date" in headers_lower else -1
+            except Exception:
+                idx = -1
+            date_local_val = None
+            if idx >= 0:
+                date_local_val = to_local_naive(row.get(headers[idx]))
+            params_iter.append(tuple(values + [date_local_val, rep.pk, created_at]))
+        else:
+            params_iter.append(tuple(values + [rep.pk, created_at]))
 
     # Idempotencia por generated_report_id: eliminar previamente lo cargado
     try:
@@ -285,3 +298,6 @@ def load_report_to_db(generated_report_id: int, target_alias: str = "default") -
     rep.last_loaded_alias = target_alias
     rep.save(update_fields=["loaded_to_db", "loaded_at", "rows_inserted", "last_loaded_alias", "updated_at"])
     return rows_inserted
+
+
+
