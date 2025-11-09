@@ -944,7 +944,7 @@ class BulkSendAdmin(admin.ModelAdmin):
             def _sum_int(col: str) -> int:
                 try:
                     with connection.cursor() as cur:
-                        cur.execute('SELECT COALESCE(SUM("' + col + '"),0) FROM reports_summary WHERE DATE("date")=%s', [str(day)])
+                        cur.execute('SELECT COALESCE(SUM("' + col + '"),0) FROM reports_summary WHERE "date" >= %s AND "date" < %s', [start_str, end_str])
                         v = cur.fetchone()[0]
                     return int(v or 0)
                 except Exception:
@@ -954,7 +954,7 @@ class BulkSendAdmin(admin.ModelAdmin):
                 names = [str(n).lower() for n in names]
                 try:
                     with connection.cursor() as cur:
-                        cur.execute('SELECT LOWER("status"), COUNT(*) FROM reports_summary WHERE DATE("date")=%s GROUP BY LOWER("status")', [str(day)])
+                        cur.execute('SELECT LOWER("status"), COUNT(*) FROM reports_summary WHERE "date" >= %s AND "date" < %s GROUP BY LOWER("status")', [start_str, end_str])
                         rows = cur.fetchall()
                     m = { (r[0] or '').strip().lower(): int(r[1]) for r in rows }
                     return sum(m.get(n,0) for n in names)
@@ -1009,7 +1009,7 @@ class BulkSendAdmin(admin.ModelAdmin):
         try:
             if _table_exists('reports_summary'):
                 with connection.cursor() as cur:
-                    cur.execute('SELECT "email", COALESCE("opens",0) FROM reports_summary WHERE DATE("date")=%s', [str(day)])
+                    cur.execute('SELECT "email", COALESCE("opens",0) FROM reports_summary WHERE "date" >= %s AND "date" < %s', [start_str, end_str])
                     rows = cur.fetchall()
                 from collections import Counter
 
