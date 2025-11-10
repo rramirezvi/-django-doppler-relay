@@ -21,17 +21,17 @@ class Command(BaseCommand):
     def handle(self, *args, **options):
         now = timezone.now()
         cutoff = now - timedelta(hours=1)
-        qs = BulkSend.objects.filter(status="done", created_at__lte=cutoff, post_reports_loaded_at__isnull=True)
+        qs = BulkSend.objects.filter(
+            status="done", created_at__lte=cutoff, post_reports_loaded_at__isnull=True)
 
         created_total = 0
-        processed_ok = 0
-                created_total = 0
         processed_ok = 0
         for bulk in qs.iterator():
             # Día local y UTC para cubrir desfases por zona horaria
             local_day = bulk.created_at.date()
             try:
-                utc_day = bulk.created_at.astimezone(__import__('datetime').timezone.utc).date()
+                utc_day = bulk.created_at.astimezone(
+                    __import__('datetime').timezone.utc).date()
             except Exception:
                 utc_day = local_day
             days_to_request = {local_day, utc_day}
@@ -39,7 +39,8 @@ class Command(BaseCommand):
             # Crear GeneratedReport deliveries para ambos días
             for day in days_to_request:
                 for t in REPORT_TYPES:
-                    exists = GeneratedReport.objects.filter(report_type=t, start_date=day, end_date=day).exists()
+                    exists = GeneratedReport.objects.filter(
+                        report_type=t, start_date=day, end_date=day).exists()
                     if not exists:
                         GeneratedReport.objects.create(
                             report_type=t,
@@ -51,7 +52,8 @@ class Command(BaseCommand):
                         created_total += 1
             # Refresco: si todos los GR del día están READY y cargados, crear uno nuevo para re-generar CSV
             for day in list(days_to_request):
-                qs_day = GeneratedReport.objects.filter(report_type__in=REPORT_TYPES, start_date=day, end_date=day)
+                qs_day = GeneratedReport.objects.filter(
+                    report_type__in=REPORT_TYPES, start_date=day, end_date=day)
                 if qs_day.exists() and qs_day.filter(state=GeneratedReport.STATE_READY, loaded_to_db=True).count() == qs_day.count():
                     for t in REPORT_TYPES:
                         GeneratedReport.objects.create(
@@ -63,9 +65,7 @@ class Command(BaseCommand):
                         )
                         created_total += 1
 
-
-            # Procesar pendientes y cargar a BD
-                        # Resetear reportes en ERROR para reintento automático
+            # Resetear reportes en ERROR para reintento automático
             err_qs = GeneratedReport.objects.filter(
                 report_type__in=REPORT_TYPES,
                 start_date__in=list(days_to_request),
@@ -77,7 +77,11 @@ class Command(BaseCommand):
                 rep.report_request_id = ""
                 rep.file_path = ""
                 rep.error_details = ""
-                rep.save(update_fields=["state", "report_request_id", "file_path", "error_details", "updated_at"])
+                rep.save(update_fields=[
+                    "state", "report_request_id", "file_path", "error_details", "updated_at"
+                ])
+
+            # Procesar pendientes y luego cargar a BD
             process_pending_reports()
             ready = GeneratedReport.objects.filter(
                 start_date__in=list(days_to_request),
@@ -89,7 +93,8 @@ class Command(BaseCommand):
             for rep in ready.iterator():
                 if not rep.loaded_to_db:
                     try:
-                        total_inserted += load_report_to_db(rep.pk, target_alias="default")
+                        total_inserted += load_report_to_db(
+                            rep.pk, target_alias="default")
                     except Exception:
                         pass
 
@@ -97,13 +102,9 @@ class Command(BaseCommand):
             if total_inserted > 0:
                 bulk.post_reports_status = "done"
                 bulk.post_reports_loaded_at = timezone.now()
-                bulk.save(update_fields=["post_reports_status", "post_reports_loaded_at"])
+                bulk.save(update_fields=[
+                          "post_reports_status", "post_reports_loaded_at"])
                 processed_ok += 1
 
-        self.stdout.write(self.style.SUCCESS(f"Post-send reports: created={created_total}, bulks processed={processed_ok}"))
-
-
-
-
-
-
+        self.stdout.write(self.style.SUCCESS(
+            f"Post-send reports: created={created_total}, bulks processed={processed_ok}"))
