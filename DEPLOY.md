@@ -543,3 +543,40 @@ sudo systemctl restart reports-process.timer
 Tips de configuración
 - Para ocultar el módulo “Reports” del menú del admin, deja `REPORTS_ADMIN_VISIBLE=0` (default). Si deseas verlo, define `REPORTS_ADMIN_VISIBLE=1` en `.env` y reinicia `django`.
 - El botón “Ver reporte (nuevo)” y las descargas siguen funcionando aunque el módulo Reports esté oculto, porque usan rutas internas del admin.
+
+17) Solo post‑envío (deshabilitar reports‑process.timer)
+
+Si ya no necesitas el flujo “solicitar/pendientes” y quieres quedarte únicamente con el job de 1 hora (post‑envío):
+
+Opción A — Deshabilitar y detener el timer de pendientes (recomendado)
+```bash
+sudo systemctl disable --now reports-process.timer
+sudo systemctl daemon-reload
+systemctl list-timers | grep reports-process   # no debería listar
+```
+
+Opción B — Dejar el servicio para uso manual (sin timer)
+```bash
+sudo systemctl disable --now reports-process.timer
+sudo systemctl daemon-reload
+# cuando necesites correrlo manualmente:
+sudo systemctl start reports-process.service
+sudo journalctl -u reports-process -n 50 --no-pager
+```
+
+Opción C — Reutilizar el mismo timer para post‑envío (si no quieres crear otro)
+1) Edita `/etc/systemd/system/reports-process.service` y cambia ExecStart:
+```
+ExecStart=/opt/app/django-doppler-relay/.venv/bin/python manage.py process_post_send_reports
+```
+2) Edita `/etc/systemd/system/reports-process.timer` y ajusta el intervalo:
+```
+OnUnitActiveSec=60min
+```
+3) Recarga y habilita:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now reports-process.timer
+```
+
+Recomendación: dejar activo solo `post-send-reports.timer` y mantener `reports-process.service` disponible para ejecuciones manuales si hiciera falta.
