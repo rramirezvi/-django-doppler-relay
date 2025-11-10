@@ -673,7 +673,7 @@ class BulkSendAdmin(admin.ModelAdmin):
                 continue
             bulk.processing_started_at = timezone.now()
             bulk.log = ((bulk.log or "") +
-                        "\n[BG] EnvÃ­o iniciado desde admin").strip()
+                        "\n[BG] Envío iniciado desde admin").strip()
             bulk.save(update_fields=["processing_started_at", "log"])
             threading.Thread(target=process_bulk_id, args=(
                 bulk.id,), daemon=True).start()
@@ -830,7 +830,7 @@ class BulkSendAdmin(admin.ModelAdmin):
                 bulk.result = response.content.decode(
                     "utf-8") if hasattr(response, 'content') else json.dumps(response)
                 bulk.status = "done"
-                bulk.log = "EnvÃ­o realizado"
+                bulk.log = "Envío realizado"
             except Exception as e:
                 import traceback
                 print("EXCEPCIÓN:", str(e))
