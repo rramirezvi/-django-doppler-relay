@@ -521,3 +521,25 @@ Notas
 - Si no habilitas este timer, puedes ejecutar manualmente:
   - `python manage.py process_post_send_reports`
   - `python manage.py process_reports_pending` (si quieres forzar el ciclo de PENDING/PROCESSING)
+
+16) Actualizaciones rápidas (pull y restart)
+
+```bash
+cd /opt/app/django-doppler-relay
+sudo -u app git pull
+source .venv/bin/activate
+.venv/bin/python -m pip install -r requirements.txt
+python manage.py migrate
+python manage.py collectstatic --noinput
+sudo systemctl restart django
+
+# Si cambió la reportería o timers
+sudo systemctl daemon-reload
+sudo systemctl restart post-send-reports.timer
+# (opcional) si usas el procesador de pendientes
+sudo systemctl restart reports-process.timer
+```
+
+Tips de configuración
+- Para ocultar el módulo “Reports” del menú del admin, deja `REPORTS_ADMIN_VISIBLE=0` (default). Si deseas verlo, define `REPORTS_ADMIN_VISIBLE=1` en `.env` y reinicia `django`.
+- El botón “Ver reporte (nuevo)” y las descargas siguen funcionando aunque el módulo Reports esté oculto, porque usan rutas internas del admin.
