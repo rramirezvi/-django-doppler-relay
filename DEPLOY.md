@@ -580,3 +580,45 @@ sudo systemctl enable --now reports-process.timer
 ```
 
 Recomendación: dejar activo solo `post-send-reports.timer` y mantener `reports-process.service` disponible para ejecuciones manuales si hiciera falta.
+
+18) Checkout de versión estable por cliente
+
+Para fijar la VPS del cliente a una versión estable y evitar que un `git pull` mueva la app sin revisión, crea una rama de producción desde el tag:
+
+```bash
+cd /opt/app/django-doppler-relay
+git fetch --tags
+git checkout -B prod-<cliente> v2025.11.10-stable+indent
+```
+
+Volver a master cuando quieras actualizar desde principal:
+
+```bash
+git checkout master
+git pull
+```
+
+19) Crear .env desde el ejemplo
+
+Partir de `.env.example` y editar:
+
+```bash
+cd /opt/app/django-doppler-relay
+cp .env.example .env
+# Edita .env y completa DEBUG/USE_SQLITE/DB_*/ALLOWED_HOSTS/DOPPLER_*
+```
+
+20) Zona horaria del servidor
+
+Configurar TZ local mejora la lectura de logs del sistema. La app sigue usando `TIME_ZONE` de Django para cálculos.
+
+```bash
+sudo timedatectl set-timezone America/Guayaquil
+
+# Reiniciar servicios para aplicar
+sudo systemctl restart django
+sudo systemctl reload nginx
+sudo systemctl restart post-send-reports.timer
+# (opcional) si usas el procesador de pendientes
+sudo systemctl restart reports-process.timer
+```
