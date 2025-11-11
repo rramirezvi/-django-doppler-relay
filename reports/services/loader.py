@@ -97,15 +97,31 @@ def _ensure_table(connection, table: str, columns_types: List[Tuple[str, str]]) 
                 pass  # tolerar si no soporta IF NOT EXISTS y ya existe
 
 
-def _read_csv(path: Path) -> Tuple[List[str], List[Dict[str, str]]]:
-    # utf-8-sig elimina BOM en la primera cabecera si existe
-    with path.open("r", encoding="utf-8-sig", newline="") as fh:
-        reader = csv.DictReader(fh)
-        headers = list(reader.fieldnames or [])
-        rows = []
-        for row in reader:
-            rows.append({k: ("" if v is None else str(v)) for k, v in row.items()})
-        return headers, rows
+def _read_csv(path: Path) -> Tuple[List[str], List[Dict[str, str]], str]:
+    """Lee un CSV probando múltiples codificaciones.
+    Devuelve (headers, rows, encoding_usada).
+    """
+    encodings = ["utf-8-sig", "utf-8", "cp1252", "latin-1"]
+    last_exc: Exception | None = None
+    for enc in encodings:
+        try:
+            with path.open("r", encoding=enc, newline="") as fh:
+                reader = csv.DictReader(fh)
+                headers = list(reader.fieldnames or [])
+                rows: List[Dict[str, str]] = []
+                for row in reader:
+                    rows.append({k: ("" if v is None else str(v)) for k, v in row.items()})
+                return headers, rows, enc
+        except UnicodeDecodeError as exc:
+            last_exc = exc
+            continue
+        except Exception as exc:  # tolerante ante archivos parcialmente corruptos
+            last_exc = exc
+            continue
+    # Si todas fallan, relanzar la última excepción para diagnóstico
+    if last_exc:
+        raise last_exc
+    return [], [], encodings[0]
 
 
 def to_local_naive(val: str | None) -> str | None:
@@ -145,7 +161,7 @@ def load_report_to_db(generated_report_id: int, target_alias: str = "default") -
     if not path.exists():
         raise FileNotFoundError(f"No existe el archivo: {path}")
 
-    headers, data_rows = _read_csv(path)
+    headers, data_rows, used_encoding = _read_csv(path)
     if not headers:
         raise ValueError("El CSV no tiene cabeceras")
 
@@ -338,7 +354,11 @@ def load_report_to_db(generated_report_id: int, target_alias: str = "default") -
     try:
         log_dir = Path("attachments") / "reports" / "schemas"
         log_dir.mkdir(parents=True, exist_ok=True)
-        lines = [f"Load report {rep.pk} type={rep.report_type} alias={target_alias}", f"Table {table}"]
+        lines = [
+            f"Load report {rep.pk} type={rep.report_type} alias={target_alias}",
+            f"Table {table}",
+            f"Encoding {used_encoding}",
+        ]
         for orig, mapped_name in zip(headers, mapped):
             lines.append(f"  {orig} -> {mapped_name} ({cast_types.get(orig,'text')})")
         (log_dir / f"load_{rep.pk}.log").write_text("\n".join(lines), encoding="utf-8")
