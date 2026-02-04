@@ -4,21 +4,14 @@ from django.core.management.base import BaseCommand
 from django.db import transaction
 from django.utils import timezone
 
- relay.services.bulk_processing import process_bulk_id
-from relay.views import process_bulk_template_send
-from relay.services.doppler_relay import DopplerRelayClient
-from django.conf import settings
-
-import csv
-import io
-import json
-
+from relay.models import BulkSend
+from relay.services.bulk_processing import process_bulk_id
 
 BATCH_SIZE = 50
 
 
 class Command(BaseCommand):
-    help = "Procesa envÃ­os masivos programados (scheduled_at <= now) sin Celery"
+    help = "Procesa envíos masivos programados (scheduled_at <= now) sin Celery"
 
     def handle(self, *args, **options):
         now = timezone.now()
@@ -42,7 +35,7 @@ class Command(BaseCommand):
                 bulk.log = (bulk.log or "") + f"\n[Scheduler] Error: {exc}"
                 bulk.save(update_fields=["status", "log"])
 
-        self.stdout.write(self.style.SUCCESS(f"Scheduler procesÃ³ {processed} envÃ­os"))
+        self.stdout.write(self.style.SUCCESS(f"Scheduler procesó {processed} envíos"))
 
     def _acquire(self, bulk_id: int) -> bool:
         try:
@@ -60,6 +53,6 @@ class Command(BaseCommand):
         except Exception:
             return False
 
-        def _process_bulk(self, bulk: BulkSend) -> None:
+    def _process_bulk(self, bulk: BulkSend) -> None:
         # Delegar el procesamiento completo al helper unificado
         process_bulk_id(bulk.id)
