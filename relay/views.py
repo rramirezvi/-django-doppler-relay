@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 from django.views.decorators.http import require_POST
 from django.http import JsonResponse, HttpRequest
 from django.views.decorators.csrf import csrf_exempt

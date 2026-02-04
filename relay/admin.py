@@ -1,4 +1,4 @@
-﻿from datetime import timedelta
+from datetime import timedelta
 from zoneinfo import ZoneInfo
 import logging
 from types import SimpleNamespace
@@ -62,7 +62,7 @@ def _hide_reports_admin_menu_if_requested():
 _hide_reports_admin_menu_if_requested()
 
 
-# Formulario para la configuraciÃ³n de email del usuario
+# Formulario para la configuración de email del usuario
 
 
 class UserEmailConfigForm(forms.ModelForm):
@@ -91,7 +91,7 @@ class EmailMessageForm(forms.ModelForm):
         # Usar el email del usuario logueado como remitente
         if not self.instance.pk and not self.fields['from_email'].initial:
             if self.request and self.request.user.is_authenticated:
-                # Prioridad 1: ConfiguraciÃ³n personalizada del usuario (si existe)
+                # Prioridad 1: Configuración personalizada del usuario (si existe)
                 user_config = UserEmailConfig.get_user_email_config(
                     self.request.user)
                 if user_config:
@@ -141,12 +141,12 @@ class EmailMessageAdmin(admin.ModelAdmin):
                     to_list = [(email.strip(), None)
                                for email in email.to_emails.split(',')]
 
-                    # Verificar configuraciÃ³n
+                    # Verificar configuración
                     if not hasattr(settings, 'DOPPLER_RELAY'):
                         raise ValueError(
-                            "DOPPLER_RELAY no estÃ¡ configurado en settings.py")
+                            "DOPPLER_RELAY no está configurado en settings.py")
 
-                    # Obtener account_id de la configuraciÃ³n o usar valor por defecto
+                    # Obtener account_id de la configuración o usar valor por defecto
                     account_id = getattr(
                         settings, 'DOPPLER_RELAY', {}).get('ACCOUNT_ID', 1)
 
@@ -196,7 +196,7 @@ class EmailMessageAdmin(admin.ModelAdmin):
             else:
                 errors += 1
                 self.message_user(
-                    request, f"El email {email.id} no estÃ¡ en estado 'created'", level='WARNING')
+                    request, f"El email {email.id} no está en estado 'created'", level='WARNING')
 
         if success:
             self.message_user(
@@ -226,7 +226,7 @@ class EmailMessageAdmin(admin.ModelAdmin):
         else:
             # Para correo existente, mostrar todos los campos
             return (
-                ('InformaciÃ³n bÃ¡sica', {
+                ('Información básica', {
                     'fields': ('subject', 'from_email', 'to_emails')
                 }),
                 ('Contenido', {
@@ -236,7 +236,7 @@ class EmailMessageAdmin(admin.ModelAdmin):
                 ('Estado y metadatos', {
                     'fields': ('status', 'relay_message_id', 'location', 'meta'),
                     'classes': ('collapse',),
-                    'description': 'InformaciÃ³n generada automÃ¡ticamente'
+                    'description': 'Información generada automáticamente'
                 }),
                 ('Fechas', {
                     'fields': ('created_at', 'updated_at'),
@@ -261,7 +261,7 @@ class UserEmailConfigAdmin(admin.ModelAdmin):
         return form
 
     def save_model(self, request, obj, form, change):
-        # Al activar una configuraciÃ³n, desactivar otras configuraciones del mismo usuario
+        # Al activar una configuración, desactivar otras configuraciones del mismo usuario
         if obj.is_active:
             UserEmailConfig.objects.filter(user=obj.user).exclude(
                 id=obj.id).update(is_active=False)
@@ -351,11 +351,11 @@ class BulkSendForm(forms.ModelForm):
                 )
         except Exception:
             pass
-        # Evitar ediciÃ³n manual de la marca tÃ©cnica del scheduler
+        # Evitar edición manual de la marca técnica del scheduler
         if 'processing_started_at' in self.fields:
             self.fields['processing_started_at'].disabled = True
             self.fields['processing_started_at'].help_text = (
-                "Se completa automÃ¡ticamente cuando el scheduler toma el envÃ­o (solo lectura)."
+                "Se completa automáticamente cuando el scheduler toma el envío (solo lectura)."
             )
 
     def clean_variables(self):
@@ -367,7 +367,7 @@ class BulkSendForm(forms.ModelForm):
             return json.loads(data)
         except Exception:
             raise forms.ValidationError(
-                "El campo variables debe ser JSON vÃ¡lido.")
+                "El campo variables debe ser JSON válido.")
 
     def clean_attachments(self):
         data = self.cleaned_data.get("attachments")
@@ -644,7 +644,7 @@ class BulkSendAdmin(admin.ModelAdmin):
     report_link_v2.short_description = 'Reporte v2'
 
     def save_model(self, request, obj: BulkSend, form, change):
-        # Persistir template_name como cachÃ© para el listado
+        # Persistir template_name como caché para el listado
         try:
             if obj.template_id:
                 client = DopplerRelayClient()
@@ -693,7 +693,7 @@ class BulkSendAdmin(admin.ModelAdmin):
                 continue
             recipients = []
             try:
-                # Obtener informaciÃ³n de la plantilla para validar variables
+                # Obtener información de la plantilla para validar variables
                 client = DopplerRelayClient()
                 ACCOUNT_ID = settings.DOPPLER_RELAY["ACCOUNT_ID"]
                 template_info = client.get_template_fields(
@@ -726,8 +726,8 @@ class BulkSendAdmin(admin.ModelAdmin):
 
                     if not email_column:
                         raise ValueError(
-                            f"El archivo CSV debe tener una columna para el correo electrÃ³nico. "
-                            f"Nombres vÃ¡lidos: {', '.join(email_column_variants)}. "
+                            f"El archivo CSV debe tener una columna para el correo electrónico. "
+                            f"Nombres válidos: {', '.join(email_column_variants)}. "
                             f"Columnas encontradas: {', '.join(headers)}")
 
                     # Mostrar las variables disponibles en el CSV
@@ -752,7 +752,7 @@ class BulkSendAdmin(admin.ModelAdmin):
                             bulk.log += "Usando nombres de columnas directamente como variables\n"
                     except json.JSONDecodeError:
                         raise ValueError(
-                            "El mapeo de variables no es un JSON vÃ¡lido")
+                            "El mapeo de variables no es un JSON válido")
                     if 'email' not in headers:
                         raise ValueError(
                             "El archivo CSV debe tener una columna 'email'")
@@ -765,7 +765,7 @@ class BulkSendAdmin(admin.ModelAdmin):
                         if not email_value:
                             continue
 
-                        # Construir variables segÃºn el mapeo o usar todas las columnas
+                        # Construir variables según el mapeo o usar todas las columnas
                         if variables_mapping:
                             # Usar el mapeo personalizado
                             variables = {
@@ -779,7 +779,7 @@ class BulkSendAdmin(admin.ModelAdmin):
                                 if k != 'email' and v
                             }
 
-                        # Registrar las variables que se usarÃ¡n para este destinatario
+                        # Registrar las variables que se usarán para este destinatario
                         # Solo para el primer destinatario
                         if email_value == clean_row.get('email'):
                             bulk.log += f"\nEjemplo de variables para {email_value}:\n"
@@ -825,7 +825,7 @@ class BulkSendAdmin(admin.ModelAdmin):
                     recipients=recipients,
                     subject=subject,
                     adj_list=adj_list,
-                    user=request.user  # Â¡ESTO FALTABA!
+                    user=request.user  # ¡ESTO FALTABA!
                 )
                 bulk.result = response.content.decode(
                     "utf-8") if hasattr(response, 'content') else json.dumps(response)
@@ -837,7 +837,7 @@ class BulkSendAdmin(admin.ModelAdmin):
                 print("ARGS:", getattr(e, 'args', None))
                 print("CAUSE:", getattr(e, '__cause__', None))
                 print("TRACEBACK:\n", traceback.format_exc())
-                # Si la funciÃ³n retornÃ³ un response, guÃ¡rdalo aunque sea error
+                # Si la función retornó un response, guárdalo aunque sea error
                 api_error = None
                 if hasattr(e, 'payload'):
                     api_error = getattr(e, 'payload', None)
@@ -855,7 +855,7 @@ class BulkSendAdmin(admin.ModelAdmin):
                         "api_error": api_error
                     })
                 bulk.status = "error"
-                bulk.log = f"Error en envÃ­o: {e}"
+                bulk.log = f"Error en envío: {e}"
             bulk.save()
             messages.info(request, f"BulkSend {bulk.id} procesado.")
     procesar_envio_masivo.short_description = "Procesar envío masivo seleccionado"
