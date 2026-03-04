@@ -4,3 +4,26 @@ db.sqlite3
 *.pyc
 .env
 staticfiles/
+
+# Claude Code interno
+.claude/
+
+# Archivos temporales
+tmp_*
+
+# Archivos subidos por usuarios (media runtime)
+attachments/2025/
+attachments/2026/
+attachments/2027/
+
+# CSVs de destinatarios (datos operativos, no van al repo)
+bulk_recipients/*.csv
+
+# Reportes descargados de Doppler (generados en runtime)
+attachments/reports/doppler_*.csv
+
+# Logs de carga de reportes (runtime)
+attachments/reports/schemas/*.log
+
+# Plantillas HTML descargadas de Doppler (runtime)
+attachments/templates/*.html
