@@ -171,16 +171,27 @@ def _job_payload(job: BackgroundJob) -> dict:
     }
 
 
+def _report_refresh_age_minutes(bulk: BulkSend) -> tuple[float | None, int | None, bool]:
+    reference_at = (
+        bulk.jobs
+        .filter(job_type=BackgroundJob.TYPE_BULK_SEND, state=BackgroundJob.STATE_DONE, finished_at__isnull=False)
+        .order_by("-finished_at")
+        .values_list("finished_at", flat=True)
+        .first()
+    ) or bulk.created_at
+    if not reference_at:
+        return None, None, False
+    age_minutes = (timezone.now() - reference_at).total_seconds() / 60
+    remaining = max(0, int(round(REPORT_MANUAL_MIN_AGE_MINUTES - age_minutes)))
+    return age_minutes, remaining, age_minutes >= REPORT_MANUAL_MIN_AGE_MINUTES
+
+
 def _bulk_payload(bulk: BulkSend, *, include_detail: bool = False) -> dict:
     age_hours = None
-    report_refresh_available = False
-    report_refresh_remaining_minutes = None
+    report_age_minutes, report_refresh_remaining_minutes, report_refresh_available = _report_refresh_age_minutes(bulk)
     if bulk.created_at:
         age_seconds = (timezone.now() - bulk.created_at).total_seconds()
         age_hours = round(age_seconds / 3600, 2)
-        age_minutes = age_seconds / 60
-        report_refresh_available = age_minutes >= REPORT_MANUAL_MIN_AGE_MINUTES
-        report_refresh_remaining_minutes = max(0, int(round(REPORT_MANUAL_MIN_AGE_MINUTES - age_minutes)))
     result = bulk.result
     if isinstance(result, str):
         try:
@@ -199,6 +210,7 @@ def _bulk_payload(bulk: BulkSend, *, include_detail: bool = False) -> dict:
         "post_reports_status": bulk.post_reports_status or "",
         "post_reports_loaded_at": bulk.post_reports_loaded_at.isoformat() if bulk.post_reports_loaded_at else None,
         "report": _report_summary_for_bulk(bulk),
+        "report_refresh_age_minutes": round(report_age_minutes, 2) if report_age_minutes is not None else None,
         "report_refresh_available": report_refresh_available,
         "report_refresh_remaining_minutes": report_refresh_remaining_minutes,
         "jobs": [
@@ -399,9 +411,9 @@ def bulk_send_process_report(request: HttpRequest, pk: int) -> JsonResponse:
         return _json_error("BulkSend no encontrado", status=404)
     if bulk.status != "done":
         return _json_error("El reporte se puede generar cuando el envío está en estado done.")
-    age_minutes = (timezone.now() - bulk.created_at).total_seconds() / 60
-    if age_minutes < REPORT_MANUAL_MIN_AGE_MINUTES:
-        remaining = max(1, int(round(REPORT_MANUAL_MIN_AGE_MINUTES - age_minutes)))
+    age_minutes, remaining_minutes, refresh_available = _report_refresh_age_minutes(bulk)
+    if not refresh_available:
+        remaining = max(1, int(remaining_minutes or REPORT_MANUAL_MIN_AGE_MINUTES))
         return _json_error(f"El reporte manual está disponible en {remaining} min.")
     report_state = _report_summary_for_bulk(bulk).get("state")
     if report_state in {"pending", "processing"}:

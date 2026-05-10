@@ -534,8 +534,9 @@
       const [loading, setLoading] = React.useState(true);
       const [toast, setToast] = React.useState("");
 
-      async function loadList() {
-        setLoading(true);
+      async function loadList(options = {}) {
+        const silent = Boolean(options.silent);
+        if (!silent) setLoading(true);
         try {
           const params = new URLSearchParams();
           if (q) params.set("q", q);
@@ -547,7 +548,7 @@
         } catch (err) {
           setToast(err.message);
         } finally {
-          setLoading(false);
+          if (!silent) setLoading(false);
         }
       }
 
@@ -596,9 +597,13 @@
         return () => clearTimeout(id);
       }, [q]);
       React.useEffect(() => {
-        const id = setInterval(loadList, 30000);
+        if (view !== "list") return undefined;
+        const id = setInterval(() => {
+          loadList({silent: true});
+          if (selected?.id) loadDetail(selected.id);
+        }, 30000);
         return () => clearInterval(id);
-      }, [q, status, period]);
+      }, [q, status, period, view, selected?.id]);
 
       const metrics = React.useMemo(() => {
         const m = {done: 0, pending: 0, error: 0, reportError: 0, jobsActive: 0};
