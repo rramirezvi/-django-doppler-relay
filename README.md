@@ -76,11 +76,13 @@ Comandos útiles (local):
   - `bulk-scheduler.timer` → `process_bulk_scheduled` (cada pocos minutos).
   - `reports-process.timer` → `process_reports_pending` (cada 15 minutos, opcional).
   - `post-send-reports.timer` → `process_post_send_reports` (cada 60 minutos, opcional).
+  - `doppler-background-jobs.service` → worker continuo de la UI `/app/` para envíos y actualización manual de reportes.
 
 ### Cola operativa interna
 - `python manage.py process_background_jobs --limit 20` procesa acciones encoladas desde `/app/` (envíos y reportes).
 - Para worker continuo: `python manage.py process_background_jobs --loop --sleep 3`.
 - Los estados quedan auditados en `BackgroundJob` y visibles en `/app/` y admin.
+- En producción debe existir `doppler-background-jobs.service`; si no existe, los envíos creados desde la UI quedan en `queued` hasta ejecutar el comando manual.
 
 ## Estructura de datos y logs
 - Reportes históricos CSV en `attachments/reports/...`.

@@ -540,6 +540,152 @@ sudo systemctl restart post-send-reports.timer
 sudo systemctl restart reports-process.timer
 ```
 
+21) Deploy de la UI operativa en produccion
+
+Esta seccion documenta el deploy probado para la rama `operator-ui-production-test` en DigitalOcean con:
+- Dominio: `https://app1.ramirezvi.com/`
+- Servicio web: `django.service`
+- Usuario de ejecucion: `app`
+- Worker de envios UI: `doppler-background-jobs.service`
+- Timer de reporteria automatica: `post-send-reports.timer`
+
+Antes de cambiar de rama, si Git marca `dubious ownership` al entrar como `root`, registra el directorio como seguro:
+```bash
+git config --global --add safe.directory /opt/app/django-doppler-relay
+```
+
+Si el checkout se bloquea por archivos runtime bajo `attachments/`, guardalos antes de cambiar de rama. No uses `git reset --hard` en produccion si no estas seguro de descartar esos archivos:
+```bash
+cd /opt/app/django-doppler-relay
+git status --short
+git stash push -m "backup archivos runtime antes de deploy" -- attachments/
+```
+
+Deploy de la rama:
+```bash
+cd /opt/app/django-doppler-relay
+git fetch origin
+git checkout operator-ui-production-test
+git pull origin operator-ui-production-test
+
+source .venv/bin/activate
+/opt/app/django-doppler-relay/.venv/bin/python manage.py migrate
+/opt/app/django-doppler-relay/.venv/bin/python manage.py setup_operator_group
+/opt/app/django-doppler-relay/.venv/bin/python manage.py collectstatic --noinput
+
+sudo systemctl restart django.service
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+Validacion web y static:
+```bash
+sudo systemctl status django.service --no-pager
+curl -I https://app1.ramirezvi.com/app/
+curl -I https://app1.ramirezvi.com/static/admin/css/base.css
+```
+
+Worker obligatorio para envios creados desde `/app/`:
+
+La UI no envia directamente dentro del request. Cuando el operador crea un envio con "Encolar envio inmediatamente", se crea un `BackgroundJob` en `queued`. El servicio `doppler-background-jobs.service` toma ese job y ejecuta el envio real.
+
+Crear el servicio:
+```bash
+sudo tee /etc/systemd/system/doppler-background-jobs.service > /dev/null <<'EOF'
+[Unit]
+Description=Doppler Relay background jobs worker
+After=network.target django.service
+Requires=django.service
+
+[Service]
+Type=simple
+User=app
+Group=www-data
+WorkingDirectory=/opt/app/django-doppler-relay
+EnvironmentFile=/opt/app/django-doppler-relay/.env
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/app/django-doppler-relay/.venv/bin/python manage.py process_background_jobs --loop --sleep 3
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+```
+
+Activar y verificar:
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable doppler-background-jobs.service
+sudo systemctl start doppler-background-jobs.service
+sudo systemctl status doppler-background-jobs.service --no-pager
+sudo journalctl -u doppler-background-jobs.service -n 100 --no-pager
+```
+
+Comandos para diagnosticar workers:
+```bash
+systemctl list-units --type=service --all | grep -Ei 'background|worker|jobs|doppler|relay|django'
+ps aux | grep -Ei 'process_background_jobs|manage.py' | grep -v grep
+systemctl cat django.service
+systemctl status post-send-reports.timer --no-pager
+systemctl list-timers --all | grep -Ei 'post-send|report'
+```
+
+Ver si hay jobs de la UI en cola:
+```bash
+/opt/app/django-doppler-relay/.venv/bin/python manage.py shell -c "from relay.models import BackgroundJob; [print(j.id, j.job_type, j.state, j.attempts, j.message, j.created_at, j.started_at, j.finished_at) for j in BackgroundJob.objects.order_by('-id')[:10]]"
+```
+
+Procesar manualmente si el worker aun no existe o esta detenido:
+```bash
+/opt/app/django-doppler-relay/.venv/bin/python manage.py process_background_jobs --limit 10
+```
+
+Verificar el ultimo BulkSend:
+```bash
+/opt/app/django-doppler-relay/.venv/bin/python manage.py shell -c "from relay.models import BulkSend; b=BulkSend.objects.order_by('-id').first(); print('id=', b.id); print('status=', b.status); print('result=', b.result); print('log_tail=', (b.log or '')[-1000:])"
+```
+
+Reporteria automatica:
+- `post-send-reports.timer` debe estar activo.
+- Ejecuta `process_post_send_reports` cada hora aproximadamente.
+- Solo carga reportes automaticos para BulkSend `done` con al menos 1 hora de antiguedad.
+- El boton manual de la UI "Actualizar reporte" crea un job `post_report` y lo procesa `doppler-background-jobs.service`.
+
+Ver logs:
+```bash
+sudo journalctl -u django.service -n 100 --no-pager
+sudo journalctl -u doppler-background-jobs.service -n 100 --no-pager
+sudo journalctl -u post-send-reports.service -n 100 --no-pager
+```
+
+Comandos de restart despues de cada deploy:
+```bash
+sudo systemctl restart django.service
+sudo systemctl restart doppler-background-jobs.service
+sudo systemctl restart post-send-reports.timer
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+Rollback rapido si falla:
+```bash
+cd /opt/app/django-doppler-relay
+git checkout master
+git pull origin master
+
+source .venv/bin/activate
+/opt/app/django-doppler-relay/.venv/bin/python manage.py collectstatic --noinput
+
+sudo systemctl restart django.service
+sudo systemctl restart doppler-background-jobs.service
+sudo systemctl restart post-send-reports.timer
+sudo nginx -t
+sudo systemctl reload nginx
+```
+
+Nota de rollback: la rama agrega una tabla auxiliar para `BackgroundJob`. Volver el codigo a `master` y reiniciar servicios recupera el comportamiento anterior; no es obligatorio borrar esa tabla para estabilizar el sistema.
+
 Tips de configuración
 - Para ocultar el módulo “Reports” del menú del admin, deja `REPORTS_ADMIN_VISIBLE=0` (default). Si deseas verlo, define `REPORTS_ADMIN_VISIBLE=1` en `.env` y reinicia `django`.
 - El botón “Ver reporte (nuevo)” y las descargas siguen funcionando aunque el módulo Reports esté oculto, porque usan rutas internas del admin.
