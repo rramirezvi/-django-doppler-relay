@@ -463,8 +463,10 @@ BULK_SCHEDULER_INTERVAL_MIN=2
 
 15) Post‑envío automatizado (opcional)
 
+Actualizacion operativa: el job automatico debe correr cada 15 minutos y procesar BulkSend `done` que ya cumplieron 15 minutos desde que termino el envio. El boton manual de la UI "Actualizar reporte" queda reservado para refrescar despues de 30 minutos.
+
 Objetivo
-- Cargar automáticamente la reportería del día del envío para los BulkSend `done` con más de 1 hora de antigüedad.
+- Cargar automaticamente la reporteria del dia del envio para los BulkSend `done` con mas de 15 minutos desde que termino el envio.
 - Este job ejecuta `manage.py process_post_send_reports`, que:
   - Crea `GeneratedReport` por tipo (deliveries, bounces, opens, clicks, spam, unsubscribed, sent) para ese día si no existen.
   - Procesa pendientes (`process_reports_pending`) y descarga CSVs.
@@ -499,7 +501,7 @@ Description=Run post-send reporting periodically
 
 [Timer]
 OnBootSec=10min
-OnUnitActiveSec=60min
+OnUnitActiveSec=15min
 Unit=post-send-reports.service
 AccuracySec=2min
 Persistent=true
@@ -648,8 +650,11 @@ Verificar el ultimo BulkSend:
 
 Reporteria automatica:
 - `post-send-reports.timer` debe estar activo.
-- Ejecuta `process_post_send_reports` cada hora aproximadamente.
-- Solo carga reportes automaticos para BulkSend `done` con al menos 1 hora de antiguedad.
+- Intervalo recomendado: 15 minutos.
+- Ventana minima automatica: 15 minutos desde que termino el envio.
+- Ventana minima manual desde la UI: 30 minutos desde que termino el envio.
+- Ejecuta `process_post_send_reports` cada 15 minutos aproximadamente.
+- Solo carga reportes automaticos para BulkSend `done` con al menos 15 minutos desde que termino el envio.
 - El boton manual de la UI "Actualizar reporte" crea un job `post_report` y lo procesa `doppler-background-jobs.service`.
 
 Ver logs:
@@ -692,7 +697,7 @@ Tips de configuración
 
 17) Solo post‑envío (deshabilitar reports‑process.timer)
 
-Si ya no necesitas el flujo “solicitar/pendientes” y quieres quedarte únicamente con el job de 1 hora (post‑envío):
+Si ya no necesitas el flujo “solicitar/pendientes” y quieres quedarte unicamente con el job post-envio:
 
 Opción A — Deshabilitar y detener el timer de pendientes (recomendado)
 ```bash
@@ -717,7 +722,7 @@ ExecStart=/opt/app/django-doppler-relay/.venv/bin/python manage.py process_post_
 ```
 2) Edita `/etc/systemd/system/reports-process.timer` y ajusta el intervalo:
 ```
-OnUnitActiveSec=60min
+OnUnitActiveSec=15min
 ```
 3) Recarga y habilita:
 ```bash

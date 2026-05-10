@@ -51,14 +51,14 @@ Condición del botón “Ver reporte”: `status == 'done'` y `post_reports_load
 
 Comandos útiles (local):
 - `python manage.py process_bulk_scheduled` → procesa envíos programados vencidos.
-- `python manage.py process_post_send_reports` → crea/carga reportería del día para envíos `done` (≥ 1h).
+- `python manage.py process_post_send_reports` → crea/carga reportería del día para envíos `done` (≥ 15 min desde que terminó el envío).
 - `python manage.py process_reports_pending` → procesa `GeneratedReport` en `PENDING/PROCESSING` (flujo general de reports).
 
 ## App `reports`
 - Modelo `GeneratedReport` con estados `PENDING`, `PROCESSING`, `READY`, `ERROR`, `report_request_id`, `file_path`, `rows_inserted`, `loaded_to_db`, `loaded_at`, `last_loaded_alias`.
 - Management commands:
   - `process_reports_pending`: genera/descarga CSVs y marca READY/ERROR.
-  - `process_post_send_reports`: job de +1h post‑envío que crea/carga reportería del día para envíos `done`.
+  - `process_post_send_reports`: job de +15 min post‑envío que crea/carga reportería del día para envíos `done`.
   - `inspect_reports_schema --days N`: infiere esquemas y tipos por `report_type` (guarda JSON en `attachments/reports/schemas/`).
 - Carga tipada a BD (`load_report_to_db(id, target_alias="default|analytics")`), con creación/ALTER incremental de tablas `reports_<tipo>`.
 - Previene doble carga por alias (no recarga al mismo alias dos veces).
@@ -75,7 +75,7 @@ Comandos útiles (local):
 - Guía operativa paso a paso en `DEPLOY.md` (Nginx + Gunicorn + PostgreSQL + systemd timers):
   - `bulk-scheduler.timer` → `process_bulk_scheduled` (cada pocos minutos).
   - `reports-process.timer` → `process_reports_pending` (cada 15 minutos, opcional).
-  - `post-send-reports.timer` → `process_post_send_reports` (cada 60 minutos, opcional).
+  - `post-send-reports.timer` → `process_post_send_reports` (cada 15 minutos, opcional).
   - `doppler-background-jobs.service` → worker continuo de la UI `/app/` para envíos y actualización manual de reportes.
 
 ### Cola operativa interna

@@ -42,8 +42,8 @@ python manage.py process_bulk_scheduled
 ## Reporteria Post-Envio Automatica
 
 - No se genera en vivo durante el envio.
-- El timer `post-send-reports.timer` ejecuta `process_post_send_reports` cada hora aproximadamente.
-- El comando procesa BulkSend en `done` con al menos 1 hora de antiguedad.
+- El timer `post-send-reports.timer` debe ejecutar `process_post_send_reports` cada 15 minutos aproximadamente.
+- El comando procesa BulkSend en `done` con al menos 15 minutos desde que termino el envio.
 - Crea o reutiliza `GeneratedReport` por dia/tipo, descarga CSV desde Doppler Relay, carga datos a BD local y marca:
   - `post_reports_status='done'`
   - `post_reports_loaded_at`
@@ -59,7 +59,7 @@ python manage.py process_post_send_reports
 - El boton "Actualizar reporte" no reenvia correos.
 - Crea un `BackgroundJob` tipo `post_report`.
 - Lo procesa `doppler-background-jobs.service`.
-- La UI bloquea la actualizacion temprana por seguridad: por defecto se habilita despues de 15 minutos.
+- La UI bloquea la actualizacion manual temprana por seguridad: por defecto se habilita despues de 30 minutos desde que termino el envio.
 - El flujo reutiliza el reporte del mismo dia/tipo cuando corresponde para evitar duplicar archivos y registros.
 
 ## Descargar Reporte

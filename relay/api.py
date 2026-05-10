@@ -24,7 +24,7 @@ from reports.models import GeneratedReport
 EMAIL_COLUMNS = {"email", "correo", "e-mail", "mail", "email_address", "correo_electronico", "\ufeffemail"}
 TEMPLATES_CACHE_KEY = "operator-app:templates"
 TEMPLATES_CACHE_SECONDS = 300
-REPORT_MANUAL_MIN_AGE_MINUTES = 15
+REPORT_MANUAL_MIN_AGE_MINUTES = 30
 
 
 def _can_operate(user) -> bool:

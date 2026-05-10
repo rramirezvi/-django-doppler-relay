@@ -6,13 +6,14 @@ from datetime import timedelta, timezone as dt_timezone
 from django.core.management.base import BaseCommand
 from django.utils import timezone
 
-from relay.models import BulkSend
+from relay.models import BackgroundJob, BulkSend
 from reports.models import GeneratedReport
 from reports.services.loader import load_report_to_db
 from reports.services.processor import process_pending_reports
 
 
 REPORT_TYPES = ["deliveries"]
+POST_SEND_REPORT_DELAY_MINUTES = 15
 logger = logging.getLogger(__name__)
 
 
@@ -21,11 +22,11 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument("--bulk-id", type=int, dest="bulk_id", help="Procesa solo un BulkSend.")
-        parser.add_argument("--force", action="store_true", help="No espera la regla de 1 hora.")
+        parser.add_argument("--force", action="store_true", help="No espera la regla de 15 minutos.")
         parser.add_argument("--verbose-report", action="store_true", help="Imprime detalle operativo por consola.")
 
     def handle(self, *args, **options):
-        cutoff = timezone.now() - timedelta(hours=1)
+        cutoff = timezone.now() - timedelta(minutes=POST_SEND_REPORT_DELAY_MINUTES)
         bulk_id = options.get("bulk_id")
         force = bool(options.get("force"))
         verbose_report = bool(options.get("verbose_report"))
@@ -35,11 +36,29 @@ class Command(BaseCommand):
             qs = qs.filter(pk=bulk_id)
         if not force:
             qs = qs.filter(post_reports_loaded_at__isnull=True)
-            qs = qs.filter(created_at__lte=cutoff)
 
         created_total = 0
         processed_ok = 0
         for bulk in qs.iterator():
+            report_reference_at = (
+                bulk.jobs
+                .filter(
+                    job_type=BackgroundJob.TYPE_BULK_SEND,
+                    state=BackgroundJob.STATE_DONE,
+                    finished_at__isnull=False,
+                )
+                .order_by("-finished_at")
+                .values_list("finished_at", flat=True)
+                .first()
+            ) or bulk.processing_started_at or bulk.created_at
+
+            if not force and report_reference_at and report_reference_at > cutoff:
+                if verbose_report:
+                    self.stdout.write(
+                        f"Bulk {bulk.pk}: reporteria pendiente; aun no cumple {POST_SEND_REPORT_DELAY_MINUTES} min desde done"
+                    )
+                continue
+
             if verbose_report:
                 self.stdout.write(f"Bulk {bulk.pk}: preparando reportería post-envío")
 

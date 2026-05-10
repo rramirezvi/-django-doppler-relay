@@ -5,7 +5,7 @@ from django.core.management.base import BaseCommand
 
 
 class Command(BaseCommand):
-    help = "Procesa reportería post-envío inmediatamente, sin esperar 1 hora."
+    help = "Procesa reporteria post-envio inmediatamente, sin esperar 15 minutos."
 
     def add_arguments(self, parser):
         parser.add_argument("--bulk-id", type=int, dest="bulk_id", help="Procesa solo un BulkSend.")
