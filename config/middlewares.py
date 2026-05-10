@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from django.conf import settings
 from django.contrib import admin
+from django.shortcuts import redirect
 
 
 class HideReportsAdminMiddleware:
@@ -15,7 +16,20 @@ class HideReportsAdminMiddleware:
         if not HideReportsAdminMiddleware._patched:
             self._maybe_patch_admin_menu()
             HideReportsAdminMiddleware._patched = True
+        if self._should_redirect_operator_from_admin(request):
+            return redirect("/app/")
         return self.get_response(request)
+
+    def _should_redirect_operator_from_admin(self, request) -> bool:
+        path = request.path_info or ""
+        if not path.startswith("/admin/"):
+            return False
+        if path.startswith("/admin/login/") or path.startswith("/admin/logout/"):
+            return False
+        user = getattr(request, "user", None)
+        if not user or not user.is_authenticated:
+            return False
+        return not bool(user.is_superuser)
 
     def _maybe_patch_admin_menu(self) -> None:
         try:
@@ -46,4 +60,3 @@ class HideReportsAdminMiddleware:
         except Exception:
             # No romper la request si el parche falla
             pass
-

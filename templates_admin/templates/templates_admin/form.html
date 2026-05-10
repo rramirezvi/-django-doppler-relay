@@ -1,67 +1,267 @@
 {% extends "admin/base_site.html" %}
+
 {% block content %}
   <style>
-    #content-main form { max-width: 100%; }
-    .module.aligned .form-row > div { width: 100%; }
-    .module.aligned label { min-width: 12rem; display: inline-block; vertical-align: top; }
-    .module.aligned .form-row input[type="text"],
-    .module.aligned .form-row input[type="email"],
-    .module.aligned .form-row textarea { width: 100% !important; }
-    #tpl-preview { width: 100%; min-height: 560px; border:1px solid #444; background:#fff; }
+    #content { padding-bottom: 0; }
+    #content-main { margin: 0; }
+    .template-page {
+      background: #f5f5f6;
+      color: #141414;
+      min-height: calc(100vh - 80px);
+      padding: 28px 0 40px;
+      overflow: hidden;
+    }
+    .template-wrap {
+      width: 100%;
+      max-width: 1390px;
+      margin: 0;
+    }
+    .template-title {
+      margin: 0 0 10px;
+      font-size: 34px;
+      font-weight: 760;
+      letter-spacing: 0;
+    }
+    .template-subtitle {
+      margin: 0 0 6px;
+      color: #525866;
+      font-size: 14px;
+    }
+    .template-card {
+      background: transparent;
+      border: 0;
+      box-shadow: none;
+    }
+    .template-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 50px 46px;
+      margin-bottom: 42px;
+      padding-top: 8px;
+    }
+    .template-field label {
+      display: block;
+      margin: 0 0 7px;
+      color: #161616;
+      font-size: 14px;
+      font-weight: 500;
+    }
+    .template-field input {
+      width: 100%;
+      height: 45px;
+      border: 1px solid #d1cdcd;
+      border-radius: 5px;
+      background: #ece9e9;
+      color: #141414;
+      padding: 9px 12px;
+      font-size: 14px;
+      outline: none;
+    }
+    .template-field input:focus,
+    .editor-area:focus {
+      border-color: #117a8b;
+      box-shadow: 0 0 0 3px rgba(17, 122, 139, .14);
+      background: #fff;
+    }
+    .field-errors {
+      margin: 6px 0 0;
+      color: #b42318;
+      font-size: 12px;
+    }
+    .editor-band {
+      background: #f0eeee;
+      margin: 0;
+      padding: 44px 0 38px;
+    }
+    .editor-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: end;
+      gap: 18px;
+      margin-bottom: 14px;
+    }
+    .editor-head h2 {
+      margin: 0 0 10px;
+      color: #171717;
+      font-size: 34px;
+      font-weight: 780;
+      letter-spacing: 0;
+    }
+    .editor-head p {
+      margin: 0;
+      color: #333842;
+      font-size: 14px;
+    }
+    .editor-tools {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+    }
+    .editor-tools button,
+    .submit-actions input,
+    .submit-actions a {
+      border: 1px solid #cfd6df;
+      border-radius: 7px;
+      background: #fff;
+      color: #111827;
+      padding: 9px 13px;
+      font: inherit;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    .submit-actions input.default {
+      background: #0f766e;
+      border-color: #0f766e;
+      color: #fff;
+      font-weight: 700;
+    }
+    .editor-area {
+      width: 100% !important;
+      min-height: 470px;
+      border: 1px solid #ff5262;
+      border-radius: 6px;
+      background: #fff0f0;
+      color: #111827;
+      padding: 14px;
+      font: 13px/1.45 Consolas, "Courier New", monospace;
+      resize: vertical;
+      outline: none;
+    }
+    .preview-panel {
+      margin-top: 24px;
+      background: #fff;
+      border: 1px solid #d8dde6;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .preview-panel header {
+      display: flex;
+      justify-content: space-between;
+      gap: 14px;
+      align-items: center;
+      padding: 12px 15px;
+      border-bottom: 1px solid #d8dde6;
+      color: #344054;
+      font-weight: 700;
+    }
+    #tpl-preview {
+      width: 100%;
+      min-height: 460px;
+      border: 0;
+      background: #fff;
+      display: block;
+    }
+    .submit-actions {
+      display: flex;
+      justify-content: flex-end;
+      gap: 10px;
+      margin-top: 18px;
+    }
+    .non-field-errors {
+      color: #b42318;
+      margin-bottom: 16px;
+    }
+    @media (max-width: 900px) {
+      .template-page { padding-top: 22px; }
+      .template-wrap { width: 100%; }
+      .template-grid { grid-template-columns: 1fr; gap: 18px; }
+      .editor-band { padding: 28px 0; }
+      .editor-head { display: block; }
+      .template-title, .editor-head h2 { font-size: 28px; }
+    }
   </style>
-  <div class="breadcrumbs">
-    <a href="{% url 'admin:index' %}">Home</a> ›
-    <a href="{% url 'admin:templates_admin_list' %}">Templates</a> ›
-    {{ title }}
-  </div>
 
-  <div id="content-main">
-    <form method="post" novalidate>
-      {% csrf_token %}
-      <div>
-        {{ form.non_field_errors }}
-        <fieldset class="module aligned">
-          {% for field in form %}
-            <div class="form-row">
-              {{ field.errors }}
+  <div class="template-page">
+    <div class="template-wrap">
+      <form method="post" novalidate>
+        {% csrf_token %}
+        <div class="template-card">
+          {{ form.non_field_errors }}
+
+          <div class="template-grid">
+            <div class="template-field">
+              {{ form.name.label_tag }}
+              {{ form.name }}
+              {% if form.name.errors %}<div class="field-errors">{{ form.name.errors }}</div>{% endif %}
+            </div>
+            <div class="template-field">
+              {{ form.from_email.label_tag }}
+              {{ form.from_email }}
+              {% if form.from_email.errors %}<div class="field-errors">{{ form.from_email.errors }}</div>{% endif %}
+            </div>
+            <div class="template-field">
+              {{ form.from_name.label_tag }}
+              {{ form.from_name }}
+              {% if form.from_name.errors %}<div class="field-errors">{{ form.from_name.errors }}</div>{% endif %}
+            </div>
+            <div class="template-field">
+              {{ form.subject.label_tag }}
+              {{ form.subject }}
+              {% if form.subject.errors %}<div class="field-errors">{{ form.subject.errors }}</div>{% endif %}
+            </div>
+          </div>
+
+          <section class="editor-band">
+            <div class="editor-head">
               <div>
-                <label>{{ field.label }}:</label>
-                {{ field }}
-                {% if field.help_text %}<p class="help">{{ field.help_text }}</p>{% endif %}
+                <h2>Editor de plantilla</h2>
+                <p>Edita el HTML de la plantilla. La vista previa se actualiza automaticamente.</p>
+              </div>
+              <div class="editor-tools">
+                <button type="button" id="toggle-preview">Ocultar vista previa</button>
               </div>
             </div>
-          {% endfor %}
-        </fieldset>
-      </div>
-      <div class="submit-row">
-        <input type="submit" value="Save" class="default" />
-        <a href="{% url 'admin:templates_admin_list' %}" class="deletelink">Cancel</a>
-      </div>
-    </form>
+            {{ form.body_html.errors }}
+            {{ form.body_html }}
 
-    <h2>Preview</h2>
-    <p class="help">Live preview of the HTML body. External assets must allow direct access from the server.</p>
-    <iframe id="tpl-preview"></iframe>
+            <div class="preview-panel" id="preview-panel">
+              <header>
+                <span>Vista previa</span>
+                <small>{{ template_id|default:"Nueva plantilla" }}</small>
+              </header>
+              <iframe id="tpl-preview"></iframe>
+            </div>
+
+            <div class="submit-actions">
+              <a href="{% url 'admin:templates_admin_list' %}">Cancelar</a>
+              <input type="submit" value="Guardar plantilla" class="default" />
+            </div>
+          </section>
+        </div>
+      </form>
+    </div>
   </div>
+
   <script>
     (function(){
       function updatePreview(){
         var ta = document.getElementById('id_body_html');
-        if(!ta) return;
         var ifr = document.getElementById('tpl-preview');
+        if(!ta || !ifr) return;
         var doc = ifr.contentDocument || ifr.contentWindow.document;
         doc.open();
-        doc.write(ta.value || '<!doctype html><html><body><p style="font:14px system-ui;color:#666">(Empty)</p></body></html>');
+        doc.write(ta.value || '<!doctype html><html><body><p style="font:14px system-ui;color:#667085">(Vacio)</p></body></html>');
         doc.close();
       }
+
       document.addEventListener('DOMContentLoaded', function(){
         var ta = document.getElementById('id_body_html');
         if(ta){
+          ta.classList.add('editor-area');
           updatePreview();
           ta.addEventListener('input', function(){
-            // debounce simple
             clearTimeout(window.__tplPrev);
             window.__tplPrev = setTimeout(updatePreview, 250);
+          });
+        }
+
+        var btn = document.getElementById('toggle-preview');
+        var panel = document.getElementById('preview-panel');
+        if(btn && panel){
+          btn.addEventListener('click', function(){
+            var hidden = panel.style.display === 'none';
+            panel.style.display = hidden ? '' : 'none';
+            btn.textContent = hidden ? 'Ocultar vista previa' : 'Mostrar vista previa';
           });
         }
       });

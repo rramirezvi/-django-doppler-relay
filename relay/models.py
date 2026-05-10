@@ -102,6 +102,10 @@ class Attachment(models.Model):
     def __str__(self):
         return self.name
 
+    class Meta:
+        verbose_name = "Adjunto"
+        verbose_name_plural = "Adjuntos"
+
     def to_doppler_format(self):
         """Convierte el archivo a formato base64 para Doppler"""
         content = base64.b64encode(self.file.read()).decode('utf-8')
@@ -180,6 +184,55 @@ class BulkSend(models.Model):
     def __str__(self):
         return f"BulkSend {self.id} - {self.template_id} ({self.created_at:%Y-%m-%d %H:%M})"
 
+    class Meta:
+        verbose_name = "Envio masivo"
+        verbose_name_plural = "Envios masivos"
+
+
+class BackgroundJob(models.Model):
+    TYPE_BULK_SEND = "bulk_send"
+    TYPE_POST_REPORT = "post_report"
+    TYPE_CHOICES = (
+        (TYPE_BULK_SEND, "Bulk send"),
+        (TYPE_POST_REPORT, "Post-send report"),
+    )
+
+    STATE_QUEUED = "queued"
+    STATE_RUNNING = "running"
+    STATE_DONE = "done"
+    STATE_ERROR = "error"
+    STATE_CHOICES = (
+        (STATE_QUEUED, "Queued"),
+        (STATE_RUNNING, "Running"),
+        (STATE_DONE, "Done"),
+        (STATE_ERROR, "Error"),
+    )
+
+    created_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    started_at = models.DateTimeField(null=True, blank=True)
+    finished_at = models.DateTimeField(null=True, blank=True)
+    job_type = models.CharField(max_length=32, choices=TYPE_CHOICES, db_index=True)
+    state = models.CharField(max_length=16, choices=STATE_CHOICES, default=STATE_QUEUED, db_index=True)
+    bulk = models.ForeignKey(BulkSend, null=True, blank=True, on_delete=models.CASCADE, related_name="jobs")
+    triggered_by = models.ForeignKey(User, null=True, blank=True, on_delete=models.SET_NULL, related_name="+")
+    attempts = models.PositiveIntegerField(default=0)
+    message = models.CharField(max_length=255, blank=True, default="")
+    error = models.TextField(blank=True, default="")
+    meta = models.JSONField(default=dict, blank=True)
+
+    class Meta:
+        verbose_name = "Trabajo en segundo plano"
+        verbose_name_plural = "Trabajos en segundo plano"
+        ordering = ("-created_at",)
+        indexes = [
+            models.Index(fields=["job_type", "state"]),
+            models.Index(fields=["bulk", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"{self.job_type} #{self.pk} [{self.state}]"
+
 
 class EmailMessage(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
@@ -222,6 +275,10 @@ class EmailMessage(models.Model):
 
     def __str__(self):
         return f"{self.id} - {self.subject}"
+
+    class Meta:
+        verbose_name = "Mensaje de correo"
+        verbose_name_plural = "Mensajes de correo"
 
 
 class Delivery(models.Model):

@@ -13,7 +13,7 @@ from .utils import read_cached_html, write_cached_html
 
 
 class TemplatesAdminViews:
-    title = "Templates"
+    title = "Plantillas"
 
     def __init__(self, admin_site: admin.AdminSite) -> None:
         self.admin_site = admin_site
@@ -46,7 +46,7 @@ class TemplatesAdminViews:
                 if not items and data.get("id"):
                     items = [data]
         except Exception as exc:
-            messages.error(request, f"Error loading templates: {exc}")
+            messages.error(request, f"Error cargando plantillas: {exc}")
 
         context = {
             **self.admin_site.each_context(request),
@@ -72,16 +72,16 @@ class TemplatesAdminViews:
                         from_name=form.cleaned_data.get("from_name") or None,
                         body_html=form.cleaned_data["body_html"],
                     )
-                    messages.success(request, "Template created")
+                    messages.success(request, "Plantilla creada")
                     return redirect("admin:templates_admin_list")
                 except DopplerRelayError as exc:
-                    messages.error(request, f"API error: {exc}")
+                    messages.error(request, f"Error API: {exc}")
         else:
             form = TemplateForm()
 
         context = {
             **self.admin_site.each_context(request),
-            "title": "Create template",
+            "title": "Crear plantilla",
             "form": form,
             "add": True,
             "change": False,
@@ -97,7 +97,7 @@ class TemplatesAdminViews:
         try:
             data = client.get_template(self._account_id(), template_id)
         except Exception as exc:
-            messages.error(request, f"Error loading template: {exc}")
+            messages.error(request, f"Error cargando plantilla: {exc}")
             return redirect("admin:templates_admin_list")
 
         def _extract_html(payload: dict) -> str:
@@ -173,16 +173,16 @@ class TemplatesAdminViews:
                         body_html=form.cleaned_data["body_html"],
                     )
                     write_cached_html(template_id, form.cleaned_data["body_html"])
-                    messages.success(request, "Template updated")
+                    messages.success(request, "Plantilla actualizada")
                     return redirect("admin:templates_admin_list")
                 except DopplerRelayError as exc:
-                    messages.error(request, f"API error: {exc}")
+                    messages.error(request, f"Error API: {exc}")
         else:
             form = TemplateForm(initial=initial)
 
         context = {
             **self.admin_site.each_context(request),
-            "title": f"Edit template {template_id}",
+            "title": f"Editar plantilla {template_id}",
             "form": form,
             "original": template_id,
             "opts": type("_opts", (), {"app_label": "templates_admin", "model_name": "template", "object_name": "Template"})(),
@@ -197,7 +197,7 @@ class TemplatesAdminViews:
             # small confirmation page
             context = {
                 **self.admin_site.each_context(request),
-                "title": "Confirm delete",
+                "title": "Confirmar eliminacion",
                 "template_id": template_id,
             }
             return TemplateResponse(request, "templates_admin/confirm_delete.html", context)
@@ -205,9 +205,9 @@ class TemplatesAdminViews:
         try:
             client = self._client()
             client.delete_template(self._account_id(), template_id)
-            messages.success(request, "Template deleted")
+            messages.success(request, "Plantilla eliminada")
         except DopplerRelayError as exc:
-            messages.error(request, f"API error: {exc}")
+            messages.error(request, f"Error API: {exc}")
         return redirect("admin:templates_admin_list")
 
     # ---- registration in admin ----
@@ -244,7 +244,7 @@ class TemplatesAdminViews:
                     "app_url": list_url,
                     "has_module_perms": True,
                     "models": [
-                        {"name": "Templates", "object_name": "Template", "admin_url": list_url, "view_only": True}
+                        {"name": "Plantillas", "object_name": "Template", "admin_url": list_url, "view_only": True}
                     ],
                 }
                 # Si ya existe, reemplazar nombre/URL
@@ -279,7 +279,7 @@ class TemplatesAdminViews:
                         "app_url": list_url,
                         "has_module_perms": True,
                         "models": [
-                            {"name": "Templates", "object_name": "Template", "admin_url": list_url, "view_only": True}
+                            {"name": "Plantillas", "object_name": "Template", "admin_url": list_url, "view_only": True}
                         ],
                     })
             return app_list

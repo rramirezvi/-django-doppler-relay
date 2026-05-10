@@ -1,0 +1,822 @@
+<!doctype html>
+<html lang="es">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Operación Doppler Relay</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f6f7f9;
+      --panel: #ffffff;
+      --panel-soft: #f0f3f7;
+      --line: #d9dee7;
+      --text: #17202a;
+      --muted: #667085;
+      --brand: #0f766e;
+      --brand-2: #155e75;
+      --danger: #b42318;
+      --warning: #b54708;
+      --ok: #067647;
+      --shadow: 0 10px 26px rgba(16, 24, 40, .08);
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 14px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    button, input, select { font: inherit; }
+    button {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 7px;
+      padding: 8px 11px;
+      cursor: pointer;
+      color: var(--text);
+    }
+    button.primary {
+      background: var(--brand);
+      border-color: var(--brand);
+      color: white;
+    }
+    button:disabled { opacity: .55; cursor: not-allowed; }
+    .shell { min-height: 100vh; display: grid; grid-template-columns: 240px minmax(0, 1fr); }
+    .side {
+      background: #101828;
+      color: white;
+      padding: 22px 18px;
+    }
+    .brand { font-weight: 700; font-size: 17px; margin-bottom: 26px; }
+    .nav a {
+      display: block;
+      color: #d0d5dd;
+      text-decoration: none;
+      padding: 10px 11px;
+      border-radius: 7px;
+      margin-bottom: 5px;
+    }
+    .nav a.active { background: #1d2939; color: white; }
+    .main { padding: 24px; min-width: 0; }
+    .topbar { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+    .top-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; justify-content: flex-end; }
+    .tabs { display: flex; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+    .tabs button.active { background: var(--brand-2); border-color: var(--brand-2); color: white; }
+    h1 { font-size: 24px; margin: 0; letter-spacing: 0; }
+    .muted { color: var(--muted); }
+    .cards { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }
+    .card, .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+    }
+    .card { padding: 14px; }
+    .metric { font-size: 26px; font-weight: 750; margin-top: 6px; }
+    .toolbar { display: flex; gap: 10px; align-items: center; padding: 13px; border-bottom: 1px solid var(--line); }
+    .toolbar input, .toolbar select {
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: white;
+      padding: 8px 10px;
+      min-width: 180px;
+    }
+    .layout { display: grid; grid-template-columns: minmax(0, 1fr) 420px; gap: 16px; align-items: start; }
+    table { width: 100%; border-collapse: collapse; }
+    th, td { text-align: left; padding: 11px 13px; border-bottom: 1px solid var(--line); vertical-align: middle; }
+    th { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; background: #fbfcfe; }
+    tr:hover td { background: #f8fafc; }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      min-height: 24px;
+      border-radius: 999px;
+      padding: 3px 9px;
+      font-size: 12px;
+      font-weight: 650;
+      background: var(--panel-soft);
+      color: #344054;
+    }
+    .badge.done, .badge.ready { background: #dcfae6; color: var(--ok); }
+    .badge.error { background: #fee4e2; color: var(--danger); }
+    .badge.pending, .badge.processing { background: #fef0c7; color: var(--warning); }
+    .detail { position: sticky; top: 18px; padding: 16px; }
+    .detail h2 { font-size: 18px; margin: 0 0 5px; }
+    .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 14px 0; }
+    .field { background: #f8fafc; border: 1px solid var(--line); border-radius: 7px; padding: 10px; min-width: 0; }
+    .field strong { display: block; font-size: 12px; color: var(--muted); margin-bottom: 3px; }
+    .actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 14px 0; }
+    .form-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; padding: 16px; }
+    .form-grid label { display: grid; gap: 6px; color: var(--muted); font-weight: 650; }
+    .form-grid input, .form-grid select, .form-grid textarea {
+      width: 100%;
+      border: 1px solid var(--line);
+      border-radius: 7px;
+      background: white;
+      padding: 9px 10px;
+      color: var(--text);
+    }
+    .form-grid textarea { min-height: 110px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
+    .full { grid-column: 1 / -1; }
+    .preview { margin: 0 16px 16px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
+    .preview table { min-width: 780px; }
+    .preview.compact { overflow: visible; }
+    .preview.compact table { min-width: 0; table-layout: fixed; }
+    .preview.compact th, .preview.compact td { padding: 10px; }
+    .switch-row { display: flex; align-items: center; gap: 8px; color: var(--text); font-weight: 500; }
+    .inline-control { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; align-items: end; }
+    .modal-backdrop {
+      position: fixed;
+      inset: 0;
+      background: rgba(16, 24, 40, .58);
+      z-index: 50;
+      display: grid;
+      place-items: center;
+      padding: 22px;
+    }
+    .modal {
+      width: min(1100px, 96vw);
+      height: min(760px, 90vh);
+      background: white;
+      border-radius: 8px;
+      border: 1px solid var(--line);
+      box-shadow: 0 22px 60px rgba(16, 24, 40, .24);
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+      overflow: hidden;
+    }
+    .modal-head { display: flex; justify-content: space-between; gap: 12px; align-items: center; padding: 13px 16px; border-bottom: 1px solid var(--line); }
+    .modal iframe { width: 100%; height: 100%; border: 0; background: white; }
+    pre {
+      margin: 0;
+      max-height: 220px;
+      overflow: auto;
+      white-space: pre-wrap;
+      background: #101828;
+      color: #e4e7ec;
+      border-radius: 8px;
+      padding: 12px;
+      font-size: 12px;
+    }
+    .empty { padding: 36px; text-align: center; color: var(--muted); }
+    .toast {
+      position: fixed;
+      right: 22px;
+      bottom: 22px;
+      max-width: 420px;
+      background: #101828;
+      color: white;
+      border-radius: 8px;
+      padding: 12px 14px;
+      box-shadow: var(--shadow);
+    }
+    @media (max-width: 1120px) {
+      .shell { grid-template-columns: 1fr; }
+      .side { position: static; }
+      .cards { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .layout { grid-template-columns: 1fr; }
+      .detail { position: static; }
+    }
+    @media (max-width: 640px) {
+      .main { padding: 14px; }
+      .cards { grid-template-columns: 1fr; }
+      .toolbar { flex-direction: column; align-items: stretch; }
+      .toolbar input, .toolbar select { min-width: 0; width: 100%; }
+      th:nth-child(3), td:nth-child(3) { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script crossorigin src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script>
+    const e = React.createElement;
+    const CURRENT_USER_IS_ADMIN = {{ request.user.is_superuser|yesno:"true,false" }};
+
+    function getCookie(name) {
+      const value = `; ${document.cookie}`;
+      const parts = value.split(`; ${name}=`);
+      if (parts.length === 2) return parts.pop().split(';').shift();
+      return "";
+    }
+
+    async function api(path, options = {}) {
+      const headers = Object.assign({"Accept": "application/json"}, options.headers || {});
+      if (options.method && options.method !== "GET") headers["X-CSRFToken"] = getCookie("csrftoken");
+      const res = await fetch(path, Object.assign({credentials: "same-origin", headers}, options));
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok || data.ok === false) throw new Error(data.error || `HTTP ${res.status}`);
+      return data;
+    }
+
+    function Badge({value}) {
+      const text = value || "-";
+      const cls = String(text).toLowerCase().replace("_", "-");
+      return e("span", {className: `badge ${cls}`}, text);
+    }
+
+    function NewBulkForm({onCreated, onCancel, setToast}) {
+      const [senders, setSenders] = React.useState([]);
+      const [defaultSender, setDefaultSender] = React.useState({label: "Usar correo predeterminado"});
+      const [templates, setTemplates] = React.useState([]);
+      const [templatesLoading, setTemplatesLoading] = React.useState(false);
+      const [templatesError, setTemplatesError] = React.useState("");
+      const [templatePreview, setTemplatePreview] = React.useState(null);
+      const [templatePreviewLoading, setTemplatePreviewLoading] = React.useState(false);
+      const [preview, setPreview] = React.useState(null);
+      const [submitting, setSubmitting] = React.useState(false);
+      const [form, setForm] = React.useState({template_id: "", subject: "", sender_id: "", variables: "{}", send_now: true, scheduled_at: ""});
+      const [file, setFile] = React.useState(null);
+
+      React.useEffect(() => {
+        api("/api/senders/").then(data => {
+          setSenders(data.results || []);
+          setDefaultSender(data.default_sender || {label: "Usar correo predeterminado"});
+        }).catch(err => setToast(err.message));
+        loadTemplates(false);
+      }, []);
+
+      async function loadTemplates(refresh) {
+        setTemplatesLoading(true);
+        setTemplatesError("");
+        try {
+          const data = await api(`/api/templates/${refresh ? "?refresh=1" : ""}`);
+          setTemplates(data.results || []);
+          if (!data.results || !data.results.length) {
+            setTemplatesError("No se encontraron plantillas.");
+          }
+        } catch (err) {
+          setTemplates([]);
+          setTemplatesError(err.message);
+          setToast(err.message);
+        } finally {
+          setTemplatesLoading(false);
+        }
+      }
+
+      function selectTemplate(templateId) {
+        const tpl = templates.find(item => item.id === templateId);
+        setForm({
+          ...form,
+          template_id: templateId,
+          subject: tpl?.subject || "",
+        });
+      }
+
+      async function openTemplatePreview() {
+        if (!form.template_id) {
+          setToast("Selecciona una plantilla primero.");
+          return;
+        }
+        setTemplatePreviewLoading(true);
+        try {
+          const data = await api(`/api/templates/${encodeURIComponent(form.template_id)}/preview/`);
+          setTemplatePreview(applyPreviewVariables(data));
+        } catch (err) {
+          setToast(err.message);
+        } finally {
+          setTemplatePreviewLoading(false);
+        }
+      }
+
+      function applyPreviewVariables(templateData) {
+        const firstRow = preview?.preview?.[0];
+        if (!firstRow || !templateData?.html) return templateData;
+
+        const normalized = {};
+        Object.entries(firstRow).forEach(([key, value]) => {
+          normalized[String(key).trim().toLowerCase()] = value == null ? "" : String(value);
+        });
+
+        const renderedHtml = String(templateData.html).replace(/\{\{\{?\s*([a-zA-Z0-9_.-]+)\s*\}?\}\}/g, (match, rawKey) => {
+          const key = String(rawKey).trim();
+          const direct = Object.prototype.hasOwnProperty.call(firstRow, key) ? firstRow[key] : undefined;
+          if (direct !== undefined && direct !== null) return String(direct);
+          const lower = key.toLowerCase();
+          if (Object.prototype.hasOwnProperty.call(normalized, lower)) return normalized[lower];
+          return match;
+        });
+
+        return Object.assign({}, templateData, {
+          html: renderedHtml,
+          rendered_with_sample: true,
+          sample_row: firstRow,
+        });
+      }
+
+      async function previewCsv(nextFile) {
+        setFile(nextFile || null);
+        setPreview(null);
+        if (!nextFile) return;
+        const fd = new FormData();
+        fd.append("file", nextFile);
+        try {
+          const data = await api("/api/csv/preview/", {method: "POST", body: fd});
+          setPreview(data);
+        } catch (err) {
+          setToast(err.message);
+        }
+      }
+
+      async function submit(ev) {
+        ev.preventDefault();
+        if (!file) {
+          setToast("Adjunta un CSV antes de crear el envío.");
+          return;
+        }
+        setSubmitting(true);
+        const fd = new FormData();
+        fd.append("template_id", form.template_id);
+        fd.append("subject", form.subject);
+        fd.append("sender_id", form.sender_id);
+        fd.append("variables", form.variables || "{}");
+        fd.append("scheduled_at", form.scheduled_at || "");
+        fd.append("send_now", form.scheduled_at ? "0" : (form.send_now ? "1" : "0"));
+        fd.append("recipients_file", file);
+        try {
+          const data = await api("/api/bulk-sends/", {method: "POST", body: fd});
+          setToast(data.message || "Envío creado");
+          onCreated(data.bulk);
+        } catch (err) {
+          setToast(err.message);
+        } finally {
+          setSubmitting(false);
+        }
+      }
+
+      return e("section", {className: "panel"},
+        e("form", {onSubmit: submit},
+          e("div", {className: "toolbar"},
+            e("strong", null, "Nuevo envío"),
+            e("span", {className: "muted"}, "Carga CSV, valida columnas y crea el BulkSend"),
+            e("button", {type: "button", onClick: onCancel}, "Volver a envíos")
+          ),
+          e("div", {className: "form-grid"},
+            e("label", null, "Plantilla",
+              e("select", {required: true, value: form.template_id, onChange: ev => selectTemplate(ev.target.value)},
+                e("option", {value: ""}, templatesLoading ? "Cargando plantillas..." : "Selecciona una plantilla"),
+                templates.map(tpl => e("option", {key: tpl.id, value: tpl.id}, tpl.label))
+              )
+            ),
+            e("label", null, "Remitente",
+              e("select", {value: form.sender_id, onChange: ev => setForm({...form, sender_id: ev.target.value})},
+                e("option", {value: ""}, defaultSender.label || "Usar correo predeterminado"),
+                senders.map(sender => e("option", {key: sender.id, value: sender.id}, sender.label))
+              )
+            ),
+            templatesError ? e("label", {className: "full"}, "ID de plantilla manual",
+              e("input", {value: form.template_id, onChange: ev => setForm({...form, template_id: ev.target.value}), placeholder: "Escribe el ID si no aparece en la lista"})
+            ) : null,
+            templatesError ? e("div", {className: "field full"}, e("strong", null, "Plantillas"), templatesError) : null,
+            e("label", {className: "full"}, "Asunto",
+              e("input", {value: form.subject, onChange: ev => setForm({...form, subject: ev.target.value}), placeholder: "Opcional; puede venir de la plantilla"})
+            ),
+            e("div", {className: "inline-control full"},
+              e("label", null, "CSV de destinatarios",
+                e("input", {required: true, type: "file", accept: ".csv,text/csv", onChange: ev => previewCsv(ev.target.files[0])})
+              ),
+              e("button", {type: "button", disabled: !form.template_id || !file || templatePreviewLoading, onClick: openTemplatePreview}, templatePreviewLoading ? "Cargando..." : "Vista previa")
+            ),
+            e("label", null, "Programar envío",
+              e("input", {type: "datetime-local", value: form.scheduled_at, onChange: ev => setForm({...form, scheduled_at: ev.target.value, send_now: ev.target.value ? false : form.send_now})})
+            ),
+            e("label", {className: "switch-row full"},
+              e("input", {type: "checkbox", disabled: !!form.scheduled_at, checked: form.send_now && !form.scheduled_at, onChange: ev => setForm({...form, send_now: ev.target.checked}), style: {width: "auto"}}),
+              "Encolar envío inmediatamente"
+            ),
+            null
+          ),
+          preview ? e("div", {className: "preview"},
+            e("table", null,
+              e("thead", null, e("tr", null,
+                e("th", null, "Encoding"),
+                e("th", null, "Delimitador"),
+                e("th", null, "Columna email"),
+                e("th", null, "Filas"),
+                e("th", null, "Emails válidos")
+              )),
+              e("tbody", null, e("tr", null,
+                e("td", null, preview.encoding),
+                e("td", null, preview.delimiter),
+                e("td", null, preview.email_column || "No detectada"),
+                e("td", null, preview.total_rows),
+                e("td", null, preview.valid_email_rows)
+              ))
+            ),
+            e("table", null,
+              e("thead", null, e("tr", null, (preview.headers || []).slice(0, 8).map(h => e("th", {key: h}, h)))),
+              e("tbody", null, (preview.preview || []).slice(0, 5).map((row, idx) =>
+                e("tr", {key: idx}, (preview.headers || []).slice(0, 8).map(h => e("td", {key: h}, row[h] || "")))
+              ))
+            )
+          ) : null,
+          e("div", {className: "toolbar"},
+            e("button", {className: "primary", disabled: submitting, type: "submit"}, submitting ? "Creando..." : "Crear envío"),
+            e("button", {type: "button", onClick: () => loadTemplates(true), disabled: templatesLoading}, templatesLoading ? "Cargando plantillas..." : "Recargar plantillas"),
+            preview && !preview.email_column ? e("span", {className: "badge error"}, "No se detectó columna email") : null
+          ),
+          templatePreview ? e("div", {className: "modal-backdrop", onClick: () => setTemplatePreview(null)},
+            e("div", {className: "modal", onClick: ev => ev.stopPropagation()},
+              e("div", {className: "modal-head"},
+                e("div", null,
+                  e("strong", null, templatePreview.name || "Vista previa"),
+                  e("div", {className: "muted"}, templatePreview.rendered_with_sample ? "Vista previa con primera fila del CSV" : (templatePreview.subject || templatePreview.id))
+                ),
+                e("button", {type: "button", onClick: () => setTemplatePreview(null)}, "Cerrar")
+              ),
+              e("iframe", {title: "Vista previa de plantilla", srcDoc: templatePreview.html || ""})
+            )
+          ) : null
+        )
+      );
+    }
+
+    function JobsView({setToast}) {
+      const [jobs, setJobs] = React.useState([]);
+      const [state, setState] = React.useState("");
+      const [jobType, setJobType] = React.useState("");
+      const [loading, setLoading] = React.useState(false);
+
+      async function loadJobs() {
+        setLoading(true);
+        const params = new URLSearchParams();
+        if (state) params.set("state", state);
+        if (jobType) params.set("job_type", jobType);
+        try {
+          const data = await api(`/api/jobs/?${params.toString()}`);
+          setJobs(data.results || []);
+        } catch (err) {
+          setToast(err.message);
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      async function retryJob(jobId) {
+        try {
+          const data = await api(`/api/jobs/${jobId}/retry/`, {method: "POST"});
+          setToast(data.message || "Job reencolado");
+          loadJobs();
+        } catch (err) {
+          setToast(err.message);
+        }
+      }
+
+      React.useEffect(() => { loadJobs(); }, [state, jobType]);
+
+      return e("section", {className: "panel"},
+        e("div", {className: "toolbar"},
+          e("strong", null, "Auditoría de trabajos"),
+          e("select", {value: state, onChange: ev => setState(ev.target.value)},
+            e("option", {value: ""}, "Todos los estados"),
+            e("option", {value: "queued"}, "Queued"),
+            e("option", {value: "running"}, "Running"),
+            e("option", {value: "done"}, "Done"),
+            e("option", {value: "error"}, "Error")
+          ),
+          e("select", {value: jobType, onChange: ev => setJobType(ev.target.value)},
+            e("option", {value: ""}, "Todos los tipos"),
+            e("option", {value: "bulk_send"}, "Envio masivo"),
+            e("option", {value: "post_report"}, "Reporte")
+          ),
+          e("button", {onClick: loadJobs}, "Actualizar")
+        ),
+        loading ? e("div", {className: "empty"}, "Cargando trabajos...") :
+        e("table", null,
+          e("thead", null, e("tr", null,
+            e("th", null, "ID"),
+            e("th", null, "Bulk"),
+            e("th", null, "Plantilla / asunto"),
+            e("th", null, "Tipo"),
+            e("th", null, "Estado"),
+            e("th", null, "Intentos"),
+            e("th", null, "Mensaje"),
+            e("th", null, "Creado"),
+            e("th", null, "")
+          )),
+          e("tbody", null, jobs.map(job =>
+            e("tr", {key: job.id},
+              e("td", null, job.id),
+              e("td", null, job.bulk_id || "-"),
+              e("td", null, job.bulk_template || job.bulk_subject
+                ? e("div", null,
+                  e("strong", null, job.bulk_template || "-"),
+                  e("div", {className: "muted"}, job.bulk_subject || "-")
+                )
+                : "-"
+              ),
+              e("td", null, job.job_type),
+              e("td", null, e(Badge, {value: job.state})),
+              e("td", null, job.attempts),
+              e("td", null, job.message || (job.error ? job.error.slice(0, 110) : "-")),
+              e("td", null, job.created_at ? new Date(job.created_at).toLocaleString() : "-"),
+              e("td", null, job.state === "error"
+                ? e("button", {onClick: () => retryJob(job.id)}, "Reintentar")
+                : null
+              )
+            )
+          ))
+        )
+      );
+    }
+
+    function App() {
+      const [items, setItems] = React.useState([]);
+      const [count, setCount] = React.useState(0);
+      const [selected, setSelected] = React.useState(null);
+      const [view, setView] = React.useState("list");
+      const [q, setQ] = React.useState("");
+      const [status, setStatus] = React.useState("");
+      const [period, setPeriod] = React.useState("current_month");
+      const [loading, setLoading] = React.useState(true);
+      const [toast, setToast] = React.useState("");
+
+      async function loadList() {
+        setLoading(true);
+        try {
+          const params = new URLSearchParams();
+          if (q) params.set("q", q);
+          if (status) params.set("status", status);
+          if (period) params.set("period", period);
+          const data = await api(`/api/bulk-sends/?${params.toString()}`);
+          setItems(data.results || []);
+          setCount(data.count || 0);
+        } catch (err) {
+          setToast(err.message);
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      async function loadDetail(id) {
+        try {
+          const data = await api(`/api/bulk-sends/${id}/`);
+          setSelected(data.bulk);
+        } catch (err) {
+          setToast(err.message);
+        }
+      }
+
+      async function runAction(path, message) {
+        try {
+          const data = await api(path, {method: "POST"});
+          setToast(data.message || message);
+          await loadList();
+          if (selected) setTimeout(() => loadDetail(selected.id), 900);
+        } catch (err) {
+          setToast(err.message);
+        }
+      }
+
+      function logout() {
+        const form = document.createElement("form");
+        form.method = "POST";
+        form.action = "/admin/logout/";
+        const csrf = document.createElement("input");
+        csrf.type = "hidden";
+        csrf.name = "csrfmiddlewaretoken";
+        csrf.value = getCookie("csrftoken");
+        form.appendChild(csrf);
+        document.body.appendChild(form);
+        form.submit();
+      }
+
+      async function handleCreated(bulk) {
+        setView("list");
+        await loadList();
+        if (bulk?.id) loadDetail(bulk.id);
+      }
+
+      React.useEffect(() => { loadList(); }, [status, period]);
+      React.useEffect(() => {
+        const id = setTimeout(loadList, 350);
+        return () => clearTimeout(id);
+      }, [q]);
+      React.useEffect(() => {
+        const id = setInterval(loadList, 30000);
+        return () => clearInterval(id);
+      }, [q, status, period]);
+
+      const metrics = React.useMemo(() => {
+        const m = {done: 0, pending: 0, error: 0, reportError: 0, jobsActive: 0};
+        for (const item of items) {
+          if (item.status === "done") m.done += 1;
+          if (item.status === "pending") m.pending += 1;
+          if (item.status === "error") m.error += 1;
+          if (item.report?.state === "error") m.reportError += 1;
+          if ((item.jobs || []).some(job => ["queued", "running"].includes(job.state))) m.jobsActive += 1;
+        }
+        return m;
+      }, [items]);
+
+      function canUpdateReport() {
+        if (!selected || selected.status !== "done") return false;
+        const reportState = selected.report?.state || "";
+        const hasActiveReportJob = (selected.jobs || []).some(job =>
+          job.job_type === "post_report" && ["queued", "running"].includes(job.state)
+        );
+        return selected.report_refresh_available && !["pending", "processing"].includes(reportState) && !hasActiveReportJob;
+      }
+
+      function reportActionLabel() {
+        if (!selected || selected.status !== "done") return "Actualizar reporte";
+        if (!selected.report_refresh_available) {
+          return `Disponible en ${selected.report_refresh_remaining_minutes || 1} min`;
+        }
+        const reportState = selected.report?.state || "";
+        if (["pending", "processing"].includes(reportState)) return "Reporte en proceso";
+        const hasActiveReportJob = (selected.jobs || []).some(job =>
+          job.job_type === "post_report" && ["queued", "running"].includes(job.state)
+        );
+        if (hasActiveReportJob) return "Reporte en cola";
+        return "Actualizar reporte";
+      }
+
+      function downloadableReports() {
+        return (selected?.report?.reports || []).filter(report =>
+          report.state === "READY" && report.file_path
+        );
+      }
+
+      function formatAge(hours) {
+        if (hours === null || hours === undefined || Number.isNaN(Number(hours))) return "-";
+        const minutes = Math.max(0, Math.round(Number(hours) * 60));
+        if (minutes < 1) return "menos de 1 min";
+        if (minutes < 60) return `${minutes} min`;
+        if (minutes < 48 * 60) {
+          const wholeHours = Math.floor(minutes / 60);
+          const rest = minutes % 60;
+          return rest ? `${wholeHours} h ${rest} min` : `${wholeHours} h`;
+        }
+        const days = Math.floor(minutes / 1440);
+        const restHours = Math.floor((minutes % 1440) / 60);
+        return restHours ? `${days} d ${restHours} h` : `${days} d`;
+      }
+
+      return e("div", {className: "shell"},
+        e("aside", {className: "side"},
+          e("div", {className: "brand"}, "Doppler Relay"),
+          e("nav", {className: "nav"},
+            e("a", {className: view === "list" ? "active" : "", href: "#", onClick: ev => { ev.preventDefault(); setView("list"); }}, "Envíos"),
+            e("a", {className: view === "new" ? "active" : "", href: "#", onClick: ev => { ev.preventDefault(); setView("new"); }}, "Nuevo envío"),
+            e("a", {className: view === "jobs" ? "active" : "", href: "#", onClick: ev => { ev.preventDefault(); setView("jobs"); }}, "Auditoría"),
+            CURRENT_USER_IS_ADMIN ? e("a", {href: "/admin/"}, "Email Platform Ramirezvi") : null,
+            CURRENT_USER_IS_ADMIN ? e("a", {href: "/admin/reports/generatedreport/"}, "Reportes técnicos") : null
+          )
+          )
+        ),
+        e("main", {className: "main"},
+          e("div", {className: "topbar"},
+            e("div", null,
+              e("h1", null, "Operación de envíos"),
+              e("div", {className: "muted"}, "Seguimiento, reportería y acciones rápidas")
+            ),
+            e("div", {className: "top-actions"},
+              e("button", {onClick: logout}, "Cerrar sesión")
+            )
+          ),
+          e("div", {className: "tabs"},
+            e("button", {className: view === "list" ? "active" : "", onClick: () => setView("list")}, "Envíos"),
+            e("button", {className: view === "new" ? "active" : "", onClick: () => setView("new")}, "Nuevo envío"),
+            e("button", {className: view === "jobs" ? "active" : "", onClick: () => setView("jobs")}, "Auditoría"),
+            e("button", {onClick: loadList}, "Actualizar"),
+            CURRENT_USER_IS_ADMIN ? e("button", {onClick: () => window.location.href = "/admin/"}, "Email Platform Ramirezvi") : null
+          ),
+          view === "new" ? e(NewBulkForm, {onCreated: handleCreated, onCancel: () => setView("list"), setToast}) :
+          view === "jobs" ? e(JobsView, {setToast}) :
+          e(React.Fragment, null,
+          e("section", {className: "cards"},
+            e("div", {className: "card"}, e("div", {className: "muted"}, "Total listado"), e("div", {className: "metric"}, count)),
+            e("div", {className: "card"}, e("div", {className: "muted"}, "Pendientes"), e("div", {className: "metric"}, metrics.pending)),
+            e("div", {className: "card"}, e("div", {className: "muted"}, "Enviados"), e("div", {className: "metric"}, metrics.done)),
+            e("div", {className: "card"}, e("div", {className: "muted"}, "Jobs activos"), e("div", {className: "metric"}, metrics.jobsActive))
+          ),
+          e("div", {className: "layout"},
+            e("section", {className: "panel"},
+              e("div", {className: "toolbar"},
+                e("input", {value: q, placeholder: "Buscar ID, plantilla, asunto, estado o fecha", onChange: ev => setQ(ev.target.value), onKeyDown: ev => { if (ev.key === "Enter") loadList(); }}),
+                e("select", {value: status, onChange: ev => setStatus(ev.target.value)},
+                  e("option", {value: ""}, "Todos"),
+                  e("option", {value: "pending"}, "Pending"),
+                  e("option", {value: "done"}, "Done"),
+                  e("option", {value: "error"}, "Error")
+                ),
+                e("select", {value: period, onChange: ev => setPeriod(ev.target.value)},
+                  e("option", {value: "current_month"}, "Mes vigente"),
+                  e("option", {value: "all"}, "Todo el histórico")
+                ),
+                e("button", {onClick: loadList}, "Buscar")
+              ),
+              loading
+                ? e("div", {className: "empty"}, "Cargando envíos...")
+                : e("table", null,
+                  e("thead", null, e("tr", null,
+                    e("th", null, "ID"),
+                    e("th", null, "Plantilla"),
+                    e("th", null, "Asunto"),
+                    e("th", null, "Estado"),
+                    e("th", null, "Reporte"),
+                    e("th", null, "Creado")
+                  )),
+                  e("tbody", null, items.map(item =>
+                    e("tr", {key: item.id, onClick: () => loadDetail(item.id)},
+                      e("td", null, item.id),
+                      e("td", null, item.template_name || item.template_id),
+                      e("td", null, item.subject || "-"),
+                      e("td", null, e(Badge, {value: item.status})),
+                      e("td", null, e(Badge, {value: item.report?.state})),
+                      e("td", null, item.created_at ? new Date(item.created_at).toLocaleString() : "-")
+                    )
+                  ))
+                )
+            ),
+            e("aside", {className: "panel detail"},
+              selected
+                ? e(React.Fragment, null,
+                  e("h2", null, `BulkSend ${selected.id}`),
+                  e("div", {className: "muted"}, selected.template_name || selected.template_id),
+                  e("div", {className: "grid2"},
+                    e("div", {className: "field"}, e("strong", null, "Estado"), e(Badge, {value: selected.status})),
+                    e("div", {className: "field"}, e("strong", null, "Reporte"), e(Badge, {value: selected.report?.state})),
+                    e("div", {className: "field"}, e("strong", null, "Creado hace"), formatAge(selected.age_hours)),
+                    e("div", {className: "field"}, e("strong", null, "Filas reporte"), selected.report?.rows_inserted || 0)
+                  ),
+                  e("div", {className: "actions"},
+                    e("button", {className: "primary", disabled: selected.status !== "pending", onClick: () => runAction(`/api/bulk-sends/${selected.id}/process/`, "Envío encolado")}, "Encolar envío"),
+                    e("button", {disabled: !canUpdateReport(), onClick: () => runAction(`/api/bulk-sends/${selected.id}/process-report/`, "Reporte en actualización")}, reportActionLabel()),
+                    e("button", {onClick: () => loadDetail(selected.id)}, "Refrescar detalle")
+                  ),
+                  selected.report?.latest_error
+                    ? e("div", {className: "field"}, e("strong", null, "Error reporte"), selected.report.latest_error)
+                    : null,
+                  e("div", {style: {height: 10}}),
+                  downloadableReports().length
+                    ? e(React.Fragment, null,
+                      e("strong", null, "Reportes disponibles"),
+                      e("div", {className: "preview compact", style: {margin: "8px 0 14px"}},
+                        e("table", null,
+                          e("thead", null, e("tr", null,
+                            e("th", null, "Tipo"),
+                            e("th", null, "Filas"),
+                            e("th", null, "")
+                          )),
+                          e("tbody", null, downloadableReports().map(report =>
+                            e("tr", {key: report.id},
+                              e("td", null, report.type),
+                              e("td", null, report.rows_inserted || 0),
+                              e("td", null, e("button", {onClick: () => window.location.href = `/api/reports/${report.id}/download/`}, "Descargar"))
+                            )
+                          ))
+                        )
+                      )
+                    )
+                    : null,
+                  e("div", {style: {height: 10}}),
+                  e("strong", null, "Trabajos recientes"),
+                  selected.jobs && selected.jobs.length
+                    ? e("div", {className: "preview", style: {margin: "8px 0 14px"}},
+                      e("table", null,
+                        e("thead", null, e("tr", null,
+                          e("th", null, "Tipo"),
+                          e("th", null, "Estado"),
+                          e("th", null, "Intentos"),
+                          e("th", null, "Mensaje"),
+                          e("th", null, "Fin"),
+                          e("th", null, "")
+                        )),
+                        e("tbody", null, selected.jobs.map(job =>
+                          e("tr", {key: job.id},
+                            e("td", null, job.job_type),
+                            e("td", null, e(Badge, {value: job.state})),
+                            e("td", null, job.attempts),
+                            e("td", null, job.message || (job.error ? job.error.slice(0, 90) : "-")),
+                            e("td", null, job.finished_at ? new Date(job.finished_at).toLocaleString() : "-"),
+                            e("td", null, job.state === "error"
+                              ? e("button", {onClick: () => runAction(`/api/jobs/${job.id}/retry/`, "Job reencolado")}, "Reintentar")
+                              : null
+                            )
+                          )
+                        ))
+                      )
+                    )
+                    : e("div", {className: "field"}, "Sin trabajos registrados para este envío."),
+                  e("div", {className: "field"}, e("strong", null, "Creado"), selected.created_at ? new Date(selected.created_at).toLocaleString() : "-"),
+                  e("div", {style: {height: 10}}),
+                  e("strong", null, "Log"),
+                  e("pre", null, selected.log || "Sin log")
+                )
+                : e("div", {className: "empty"}, "Selecciona un envío para ver acciones y diagnóstico.")
+            )
+          )
+        ),
+        toast ? e("div", {className: "toast", onClick: () => setToast("")}, toast) : null
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(e(App));
+  </script>
+</body>
+</html>

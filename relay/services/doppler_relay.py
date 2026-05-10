@@ -477,25 +477,76 @@ class DopplerRelayClient:
             "DELETE", f"/accounts/{account_id}/templates/{template_id}")
         return None
 
-    # Helper to obtain HTML body using only the main GET endpoint
+    # Helper to obtain HTML body from the template metadata, body link, or nested payloads.
     def get_template_html(self, account_id: int, template_id: str) -> str:
-        def _extract_html(payload: dict) -> str:
+        def _extract_html(payload: Any) -> str:
+            if isinstance(payload, str):
+                return payload if payload.strip() else ""
+            if isinstance(payload, list):
+                for item in payload:
+                    html = _extract_html(item)
+                    if html:
+                        return html
+                return ""
+            if not isinstance(payload, dict):
+                return ""
+
             for key in ("html", "htmlContent", "body", "content", "textContent"):
                 val = payload.get(key)
                 if isinstance(val, str) and val.strip():
                     return val
-            for k in ("template", "data", "attributes"):
+                if isinstance(val, (dict, list)):
+                    nested = _extract_html(val)
+                    if nested:
+                        return nested
+            for k in ("template", "data", "attributes", "message", "resource"):
                 sub = payload.get(k)
-                if isinstance(sub, dict):
-                    v = _extract_html(sub)
-                    if v:
-                        return v
+                nested = _extract_html(sub)
+                if nested:
+                    return nested
             return ""
+
+        def _body_links(payload: Any) -> list[str]:
+            if not isinstance(payload, dict):
+                return []
+            links = payload.get("_links") or payload.get("links") or []
+            if isinstance(links, dict):
+                links = list(links.values())
+            if not isinstance(links, list):
+                return []
+            hrefs = []
+            for link in links:
+                if not isinstance(link, dict):
+                    continue
+                rel = str(link.get("rel") or link.get("name") or "").strip()
+                href = str(link.get("href") or link.get("url") or "").strip()
+                if href and (rel == "/docs/rels/get-template-body" or rel.endswith("get-template-body") or href.rstrip("/").endswith("/body")):
+                    hrefs.append(href)
+            return hrefs
 
         try:
             data = self.get_template(account_id, template_id)
-            if isinstance(data, dict):
-                return _extract_html(data) or ""
+            html = _extract_html(data)
+            if html:
+                return html
+
+            for body_href in _body_links(data):
+                resp = self._request("GET", body_href)
+                content_type = (resp.headers.get("Content-Type") or "").lower()
+                body_text = resp.text or ""
+                if "text/html" in content_type or "text/plain" in content_type:
+                    return body_text
+                if body_text.lstrip().startswith("<"):
+                    return body_text
+                try:
+                    body_payload = resp.json()
+                except Exception:
+                    body_payload = None
+                html = _extract_html(body_payload)
+                if html:
+                    return html
+                if body_text.strip():
+                    return body_text
         except Exception:
             return ""
         return ""

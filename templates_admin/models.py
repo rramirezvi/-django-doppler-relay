@@ -12,9 +12,8 @@ class TemplatesPermissionAnchor(models.Model):
         db_table = "templates_admin_permission_anchor"
         default_permissions = ()  # no add/change/delete/view por defecto
         permissions = (
-            ("manage_templates", "Puede administrar plantillas de Doppler (Templates)"),
+            ("manage_templates", "Puede administrar plantillas de Doppler"),
         )
 
     def __str__(self) -> str:
-        return "Templates admin permissions"
-
+        return "Permisos de administracion de plantillas"

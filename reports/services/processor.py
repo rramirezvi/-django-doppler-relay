@@ -11,7 +11,6 @@ from .doppler_reports import (
     create_report_request,
     wait_until_processed,
     download_report_csv,
-    build_report_filename,
     ATTACHMENTS_ROOT,
     ReportError,
 )
@@ -21,6 +20,13 @@ logger = logging.getLogger(__name__)
 
 def ensure_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
+
+
+def report_filename_for(rep: GeneratedReport) -> str:
+    safe_type = str(rep.report_type or "report").strip() or "report"
+    if rep.start_date == rep.end_date:
+        return f"doppler_{safe_type}_{rep.start_date.isoformat()}.csv"
+    return f"doppler_{safe_type}_{rep.start_date.isoformat()}_{rep.end_date.isoformat()}.csv"
 
 
 def process_pending_reports() -> None:
@@ -54,7 +60,7 @@ def process_pending_reports() -> None:
             csv_bytes = download_report_csv(rep.report_request_id)
 
             ensure_dir(ATTACHMENTS_ROOT)
-            filename = build_report_filename(rep.report_type)
+            filename = report_filename_for(rep)
             target = ATTACHMENTS_ROOT / filename
             with open(target, "wb") as fh:
                 fh.write(csv_bytes)
@@ -74,4 +80,3 @@ def process_pending_reports() -> None:
             rep.error_details = str(exc)
             rep.save(update_fields=["state", "error_details", "updated_at"])
             logger.exception("Error inesperado procesando reporte (id=%s): %s", rep.pk, exc)
-

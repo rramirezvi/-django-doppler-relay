@@ -77,6 +77,11 @@ Comandos útiles (local):
   - `reports-process.timer` → `process_reports_pending` (cada 15 minutos, opcional).
   - `post-send-reports.timer` → `process_post_send_reports` (cada 60 minutos, opcional).
 
+### Cola operativa interna
+- `python manage.py process_background_jobs --limit 20` procesa acciones encoladas desde `/app/` (envíos y reportes).
+- Para worker continuo: `python manage.py process_background_jobs --loop --sleep 3`.
+- Los estados quedan auditados en `BackgroundJob` y visibles en `/app/` y admin.
+
 ## Estructura de datos y logs
 - Reportes históricos CSV en `attachments/reports/...`.
 - Esquemas y logs de carga en `attachments/reports/schemas/`.

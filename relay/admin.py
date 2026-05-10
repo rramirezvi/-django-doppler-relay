@@ -1,4 +1,4 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import logging
 from types import SimpleNamespace
@@ -19,7 +19,7 @@ from django.utils import timezone
 from django.utils.html import format_html
 from django.db import models, connection
 
-from .models import EmailMessage, BulkSend, Attachment, UserEmailConfig
+from .models import BackgroundJob, EmailMessage, BulkSend, Attachment, UserEmailConfig
 from .services.doppler_relay import DopplerRelayClient, DopplerRelayError
 from .services.bulk_processing import process_bulk_id
 
@@ -60,6 +60,40 @@ def _hide_reports_admin_menu_if_requested():
         pass
 
 _hide_reports_admin_menu_if_requested()
+
+
+@admin.register(BackgroundJob)
+class BackgroundJobAdmin(admin.ModelAdmin):
+    list_display = (
+        "id",
+        "job_type",
+        "state",
+        "bulk",
+        "triggered_by",
+        "attempts",
+        "created_at",
+        "started_at",
+        "finished_at",
+    )
+    list_filter = ("job_type", "state", "created_at")
+    search_fields = ("message", "error", "bulk__template_id", "bulk__subject")
+    readonly_fields = (
+        "created_at",
+        "updated_at",
+        "started_at",
+        "finished_at",
+        "job_type",
+        "state",
+        "bulk",
+        "triggered_by",
+        "attempts",
+        "message",
+        "error",
+        "meta",
+    )
+
+    def has_add_permission(self, request):
+        return False
 
 
 # Formulario para la configuración de email del usuario
@@ -109,14 +143,56 @@ class EmailMessageForm(forms.ModelForm):
                     'DEFAULT_FROM_EMAIL', '')
 
 
+class CurrentMonthEmailMessageFilter(admin.SimpleListFilter):
+    title = "Periodo"
+    parameter_name = "period"
+
+    def lookups(self, request, model_admin):
+        return (
+            ("current_month", "Mes vigente"),
+            ("all", "Todo el historico"),
+        )
+
+    def value(self):
+        return super().value() or "current_month"
+
+    def queryset(self, request, queryset):
+        if self.value() == "all":
+            return queryset
+        today = timezone.localdate()
+        month_start = today.replace(day=1)
+        if month_start.month == 12:
+            next_month = month_start.replace(year=month_start.year + 1, month=1)
+        else:
+            next_month = month_start.replace(month=month_start.month + 1)
+        current_tz = timezone.get_current_timezone()
+        start_dt = timezone.make_aware(datetime.combine(month_start, datetime.min.time()), current_tz)
+        end_dt = timezone.make_aware(datetime.combine(next_month, datetime.min.time()), current_tz)
+        return queryset.filter(created_at__gte=start_dt, created_at__lt=end_dt)
+
+
 @admin.register(EmailMessage)
 class EmailMessageAdmin(admin.ModelAdmin):
     form = EmailMessageForm
     list_display = ("id", "subject", "from_email",
                     "to_emails", "status", "created_at")
     search_fields = ("subject", "from_email", "to_emails", "relay_message_id")
-    list_filter = ("status",)
+    list_filter = (CurrentMonthEmailMessageFilter, "status", ("created_at", admin.DateFieldListFilter))
+    date_hierarchy = "created_at"
+    list_per_page = 50
     actions = ['send_email']
+
+    def get_search_results(self, request, queryset, search_term):
+        queryset, may_have_duplicates = super().get_search_results(request, queryset, search_term)
+        term = (search_term or "").strip()
+        for fmt in ("%Y-%m-%d", "%d/%m/%Y"):
+            try:
+                day = datetime.strptime(term, fmt).date()
+                queryset |= self.model.objects.filter(created_at__date=day)
+                break
+            except ValueError:
+                pass
+        return queryset, may_have_duplicates
 
     def get_form(self, request, obj=None, **kwargs):
         form = super().get_form(request, obj, **kwargs)
@@ -1128,4 +1204,3 @@ class BulkSendAdmin(admin.ModelAdmin):
         return response
 
     procesar_envio_masivo.short_description = "Procesar envío masivo seleccionado"
-

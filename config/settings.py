@@ -4,7 +4,7 @@ import os
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 env = environ.Env(DEBUG=(bool, False))
-environ.Env.read_env(os.path.join(BASE_DIR, '.env'))
+environ.Env.read_env(os.path.join(BASE_DIR, '.env'), overwrite=True)
 
 DEBUG = env('DEBUG', default=False)
 SECRET_KEY = env('SECRET_KEY', default='unsafe-secret-key')
@@ -19,7 +19,7 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
-    'relay',
+    'relay.apps.RelayConfig',
     'reports',
     'templates_admin',
 ]
@@ -54,8 +54,8 @@ TEMPLATES = [{
 WSGI_APPLICATION = 'config.wsgi.application'
 
 # Configuración de archivos de media
-MEDIA_URL = '/'  # La URL base para archivos media
-MEDIA_ROOT = BASE_DIR  # La raíz será el directorio base del proyecto
+MEDIA_URL = '/media/'
+MEDIA_ROOT = BASE_DIR
 ASGI_APPLICATION = 'config.asgi.application'
 
 # Base de datos default
@@ -125,5 +125,3 @@ DOPPLER_REPORTS = {
     "POLL_MAX_DELAY": int(env("DOPPLER_REPORTS_POLL_MAX_DELAY", default=15)),
     "POLL_TOTAL_TIMEOUT": int(env("DOPPLER_REPORTS_POLL_TOTAL_TIMEOUT", default=15 * 60)),
 }
-
-

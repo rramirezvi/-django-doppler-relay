@@ -2,42 +2,373 @@
 {% load static %}
 
 {% block content %}
-  <div class="app-templates">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
-      <h1>Templates</h1>
-      <a class="button" href="{% url 'admin:templates_admin_new' %}">Create template</a>
-    </div>
+  <style>
+    #content-main { margin: 0; }
+    .templates-page {
+      background: var(--body-bg, #f8f8f8);
+      min-height: calc(100vh - 86px);
+      padding: 24px 0 42px;
+      color: var(--body-fg, #333);
+    }
+    .templates-wrap {
+      width: 100%;
+      max-width: 1430px;
+      margin: 0;
+    }
+    .templates-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: start;
+      gap: 22px;
+      margin-bottom: 30px;
+    }
+    .templates-head h1 {
+      margin: 0 0 12px;
+      font-size: 34px;
+      line-height: 1.1;
+      font-weight: 780;
+      letter-spacing: 0;
+    }
+    .templates-head p {
+      margin: 0;
+      color: var(--body-quiet-color, #666);
+      font-size: 14px;
+    }
+    .create-template {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 170px;
+      height: 46px;
+      border-radius: 3px;
+      background: var(--button-bg, #417690);
+      color: #fff !important;
+      text-decoration: none;
+      font-weight: 700;
+      text-transform: uppercase;
+      border: 0;
+      padding: 0 20px;
+    }
+    .template-grid {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(250px, 1fr));
+      gap: 42px;
+    }
+    .template-card {
+      background: var(--body-bg, #fff);
+      border: 1px solid var(--border-color, #ddd);
+      border-radius: 4px;
+      box-shadow: 0 1px 2px rgba(16, 24, 40, .08);
+      overflow: hidden;
+      position: relative;
+    }
+    .thumb {
+      height: 162px;
+      background: var(--body-bg, #fff);
+      border-bottom: 1px solid var(--border-color, #ddd);
+      display: flex;
+      align-items: stretch;
+      justify-content: center;
+      overflow: hidden;
+      position: relative;
+    }
+    .thumb iframe {
+      width: 980px;
+      height: 720px;
+      border: 0;
+      background: #fff;
+      transform: scale(.22);
+      transform-origin: top center;
+      pointer-events: none;
+      flex: 0 0 auto;
+    }
+    .thumb-empty {
+      display: grid;
+      place-items: center;
+      width: 100%;
+      color: var(--body-quiet-color, #666);
+      font-size: 13px;
+      background: var(--darkened-bg, #f8f8f8);
+    }
+    .template-info {
+      min-height: 102px;
+      text-align: center;
+      padding: 18px 16px 16px;
+    }
+    .template-name {
+      margin: 0 0 7px;
+      font-size: 17px;
+      line-height: 1.2;
+      font-weight: 800;
+      text-transform: uppercase;
+      color: var(--body-fg, #333);
+    }
+    .template-id {
+      margin: 0 0 8px;
+      color: var(--body-quiet-color, #666);
+      font-size: 13px;
+      overflow-wrap: anywhere;
+    }
+    .published {
+      color: var(--link-fg, #417690);
+      font-size: 11px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+    .card-overlay {
+      position: absolute;
+      inset: 0 0 auto 0;
+      height: 162px;
+      background: rgba(38, 75, 93, .86);
+      opacity: 0;
+      transition: opacity .16s ease;
+      display: grid;
+      place-items: center;
+      z-index: 2;
+    }
+    .template-card:hover .card-overlay,
+    .template-card:focus-within .card-overlay {
+      opacity: 1;
+    }
+    .overlay-icon {
+      position: absolute;
+      top: 16px;
+      color: #fff !important;
+      background: transparent;
+      border: 0;
+      font-size: 27px;
+      line-height: 1;
+      text-decoration: none;
+      cursor: pointer;
+    }
+    .overlay-icon.preview { left: 18px; }
+    .overlay-icon.delete { right: 18px; }
+    .edit-link {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 190px;
+      height: 52px;
+      border: 2px solid var(--accent, #f5dd5d);
+      border-radius: 4px;
+      background: var(--body-bg, #fff);
+      color: var(--link-fg, #417690) !important;
+      text-decoration: none;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0;
+    }
+    .delete-form { margin: 0; }
+    .empty-templates {
+      background: var(--body-bg, #fff);
+      border: 1px solid var(--border-color, #ddd);
+      border-radius: 6px;
+      padding: 36px;
+      color: var(--body-quiet-color, #666);
+    }
+    .preview-modal {
+      position: fixed;
+      inset: 0;
+      z-index: 9999;
+      background: rgba(38, 75, 93, .62);
+      display: none;
+      place-items: center;
+      padding: 22px;
+    }
+    .preview-modal.open { display: grid; }
+    .preview-dialog {
+      width: min(1040px, 94vw);
+      height: min(760px, 90vh);
+      background: var(--body-bg, #fff);
+      border-radius: 7px;
+      overflow: hidden;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr);
+    }
+    .preview-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      padding: 13px 16px;
+      border-bottom: 1px solid #d8dde6;
+      font-weight: 700;
+    }
+    .preview-head button {
+      border: 1px solid #cfd6df;
+      background: var(--body-bg, #fff);
+      border-radius: 6px;
+      padding: 7px 11px;
+      cursor: pointer;
+    }
+    #preview-frame {
+      width: 100%;
+      height: 100%;
+      border: 0;
+      background: #fff;
+    }
+    @media (max-width: 1180px) {
+      .template-grid { grid-template-columns: repeat(2, minmax(250px, 1fr)); gap: 26px; }
+    }
+    @media (max-width: 740px) {
+      .templates-head { display: block; }
+      .create-template { margin-top: 16px; width: 100%; }
+      .template-grid { grid-template-columns: 1fr; gap: 20px; }
+      .templates-head h1 { font-size: 29px; }
+    }
+  </style>
 
-    {% if templates_items %}
-      <table class="adminlist" style="width:100%;">
-        <thead>
-          <tr>
-            <th style="width:28%;">Name</th>
-            <th>Subject</th>
-            <th style="width:28%;">ID</th>
-            <th style="width:160px;">Actions</th>
-          </tr>
-        </thead>
-        <tbody>
+  <div class="templates-page">
+    <div class="templates-wrap">
+      <div class="templates-head">
+        <div>
+          <h1>Plantillas personalizadas</h1>
+          <p>Crea nuevas plantillas o selecciona una para editarla.</p>
+        </div>
+        <a class="create-template" href="{% url 'admin:templates_admin_new' %}">Crear plantilla</a>
+      </div>
+
+      {% if templates_items %}
+        <div class="template-grid">
           {% for it in templates_items %}
-            <tr>
-              <td>{{ it.name|default:it.id }}</td>
-              <td>{{ it.subject|default:"" }}</td>
-              <td><code>{{ it.id }}</code></td>
-              <td>
-                <a class="button" href="{% url 'admin:templates_admin_edit' it.id %}">Edit</a>
-                <form method="post" action="{% url 'admin:templates_admin_delete' it.id %}" style="display:inline;">
+            <article class="template-card" data-template-id="{{ it.id }}" data-template-name="{{ it.name|default:it.id }}">
+              <div class="thumb" aria-hidden="true">
+                <div class="thumb-empty">Cargando vista previa...</div>
+              </div>
+              <div class="card-overlay">
+                <button type="button" class="overlay-icon preview" title="Vista previa" aria-label="Vista previa">◎</button>
+                <form class="delete-form" method="post" action="{% url 'admin:templates_admin_delete' it.id %}">
                   {% csrf_token %}
-                  <button class="button" onclick="return confirm('Delete template {{ it.name|default:it.id }}?')">Delete</button>
+                  <button type="submit" class="overlay-icon delete" title="Eliminar" aria-label="Eliminar" onclick="return confirm('Eliminar plantilla {{ it.name|default:it.id }}?')">⌫</button>
                 </form>
-              </td>
-            </tr>
+                <a class="edit-link" href="{% url 'admin:templates_admin_edit' it.id %}">Editar</a>
+              </div>
+              <div class="template-info">
+                <h2 class="template-name">{{ it.name|default:it.id }}</h2>
+                <p class="template-id">ID: {{ it.id }}</p>
+                <div class="published">Publicado</div>
+              </div>
+            </article>
           {% endfor %}
-        </tbody>
-      </table>
-    {% else %}
-      <p>No templates found.</p>
-    {% endif %}
+        </div>
+      {% else %}
+        <div class="empty-templates">No se encontraron plantillas.</div>
+      {% endif %}
+    </div>
   </div>
-{% endblock %}
 
+  <div class="preview-modal" id="preview-modal" aria-hidden="true">
+    <div class="preview-dialog">
+      <div class="preview-head">
+        <span id="preview-title">Vista previa</span>
+        <button type="button" id="preview-close">Cerrar</button>
+      </div>
+      <iframe id="preview-frame" title="Vista previa de plantilla"></iframe>
+    </div>
+  </div>
+
+  <script>
+    (function(){
+      var cache = {};
+
+      function setThumb(card, html) {
+        var thumb = card.querySelector('.thumb');
+        if (!thumb) return;
+        thumb.innerHTML = '';
+        var frame = document.createElement('iframe');
+        frame.setAttribute('title', 'Vista previa');
+        frame.setAttribute('sandbox', '');
+        frame.setAttribute('scrolling', 'no');
+        thumb.appendChild(frame);
+        frame.srcdoc = thumbnailHtml(html);
+      }
+
+      function thumbnailHtml(html) {
+        var fallback = '<!doctype html><html><body><p style="font:14px system-ui;color:#667085;text-align:center;margin-top:60px">Sin vista previa</p></body></html>';
+        var source = html || fallback;
+        var style = '<style id="thumbnail-style">html,body{overflow:hidden!important;scrollbar-width:none!important;}body::-webkit-scrollbar,*::-webkit-scrollbar{display:none!important;}</style>';
+        if (/<\/head>/i.test(source)) {
+          return source.replace(/<\/head>/i, style + '</head>');
+        }
+        if (/<html[^>]*>/i.test(source)) {
+          return source.replace(/<html([^>]*)>/i, '<html$1><head>' + style + '</head>');
+        }
+        return '<!doctype html><html><head>' + style + '</head><body>' + source + '</body></html>';
+      }
+
+      function loadPreview(card) {
+        var id = card.getAttribute('data-template-id');
+        if (!id) return Promise.resolve('');
+        if (cache[id]) {
+          setThumb(card, cache[id].html);
+          return Promise.resolve(cache[id].html);
+        }
+        return fetch('/api/templates/' + encodeURIComponent(id) + '/preview/', {credentials: 'same-origin'})
+          .then(function(resp){ return resp.ok ? resp.json() : null; })
+          .then(function(data){
+            var html = data && data.html ? data.html : '';
+            cache[id] = {html: html, name: data && data.name ? data.name : card.getAttribute('data-template-name')};
+            setThumb(card, html);
+            return html;
+          })
+          .catch(function(){
+            setThumb(card, '');
+            return '';
+          });
+      }
+
+      function openModal(card) {
+        var modal = document.getElementById('preview-modal');
+        var frame = document.getElementById('preview-frame');
+        var title = document.getElementById('preview-title');
+        var id = card.getAttribute('data-template-id');
+        title.textContent = card.getAttribute('data-template-name') || 'Vista previa';
+        modal.classList.add('open');
+        modal.setAttribute('aria-hidden', 'false');
+        Promise.resolve(cache[id] ? cache[id].html : loadPreview(card)).then(function(html){
+          frame.srcdoc = html || '<!doctype html><html><body><p style="font:14px system-ui;color:#667085;padding:30px">Sin vista previa disponible.</p></body></html>';
+        });
+      }
+
+      function closeModal() {
+        var modal = document.getElementById('preview-modal');
+        var frame = document.getElementById('preview-frame');
+        modal.classList.remove('open');
+        modal.setAttribute('aria-hidden', 'true');
+        frame.srcdoc = '';
+      }
+
+      document.addEventListener('DOMContentLoaded', function(){
+        var cards = Array.prototype.slice.call(document.querySelectorAll('.template-card'));
+        if ('IntersectionObserver' in window) {
+          var observer = new IntersectionObserver(function(entries){
+            entries.forEach(function(entry){
+              if (entry.isIntersecting) {
+                loadPreview(entry.target);
+                observer.unobserve(entry.target);
+              }
+            });
+          }, {rootMargin: '160px'});
+          cards.forEach(function(card){ observer.observe(card); });
+        } else {
+          cards.forEach(loadPreview);
+        }
+
+        cards.forEach(function(card){
+          var preview = card.querySelector('.overlay-icon.preview');
+          if (preview) preview.addEventListener('click', function(){ openModal(card); });
+        });
+
+        var close = document.getElementById('preview-close');
+        var modal = document.getElementById('preview-modal');
+        if (close) close.addEventListener('click', closeModal);
+        if (modal) modal.addEventListener('click', function(ev){
+          if (ev.target === modal) closeModal();
+        });
+        document.addEventListener('keydown', function(ev){
+          if (ev.key === 'Escape') closeModal();
+        });
+      });
+    })();
+  </script>
+{% endblock %}
