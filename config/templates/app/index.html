@@ -101,7 +101,7 @@
     }
     .badge.done, .badge.ready { background: #dcfae6; color: var(--ok); }
     .badge.error { background: #fee4e2; color: var(--danger); }
-    .badge.pending, .badge.processing, .badge.queued, .badge.procesando { background: #fef0c7; color: var(--warning); }
+    .badge.pending, .badge.processing, .badge.queued, .badge.procesando, .badge.programado { background: #fef0c7; color: var(--warning); }
     .badge.running { background: #dbeafe; color: #175cd3; }
     .detail { position: sticky; top: 18px; padding: 16px; }
     .detail h2 { font-size: 18px; margin: 0 0 5px; }
@@ -655,7 +655,21 @@
         if (activeBulkJob) {
           return activeBulkJob.state === "running" ? "enviando" : "en cola";
         }
+        if (bulk.status === "pending" && bulk.scheduled_at && new Date(bulk.scheduled_at) > new Date()) {
+          return "programado";
+        }
         return bulk.status;
+      }
+
+      function formatUntil(value) {
+        if (!value) return "-";
+        const target = new Date(value);
+        const diffMinutes = Math.max(0, Math.round((target.getTime() - Date.now()) / 60000));
+        if (diffMinutes < 1) return "en menos de 1 min";
+        if (diffMinutes < 60) return `en ${diffMinutes} min`;
+        const hours = Math.floor(diffMinutes / 60);
+        const minutes = diffMinutes % 60;
+        return minutes ? `en ${hours} h ${minutes} min` : `en ${hours} h`;
       }
 
       function formatAge(hours) {
@@ -759,7 +773,10 @@
                     e("div", {className: "field"}, e("strong", null, "Estado"), e(Badge, {value: sendDisplayStatus(selected)})),
                     e("div", {className: "field"}, e("strong", null, "Reporte"), e(Badge, {value: selected.report?.state})),
                     e("div", {className: "field"}, e("strong", null, "Creado hace"), formatAge(selected.age_hours)),
-                    e("div", {className: "field"}, e("strong", null, "Filas reporte"), selected.report?.rows_inserted || 0)
+                    e("div", {className: "field"}, e("strong", null, "Filas reporte"), selected.report?.rows_inserted || 0),
+                    selected.scheduled_at
+                      ? e("div", {className: "field"}, e("strong", null, "Programado"), `${formatUntil(selected.scheduled_at)} (${new Date(selected.scheduled_at).toLocaleString()})`)
+                      : null
                   ),
                   e("div", {className: "actions"},
                     e("button", {className: "primary", disabled: selected.status !== "pending", onClick: () => runAction(`/api/bulk-sends/${selected.id}/process/`, "Envío encolado")}, "Encolar envío"),
