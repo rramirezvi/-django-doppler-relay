@@ -101,7 +101,8 @@
     }
     .badge.done, .badge.ready { background: #dcfae6; color: var(--ok); }
     .badge.error { background: #fee4e2; color: var(--danger); }
-    .badge.pending, .badge.processing { background: #fef0c7; color: var(--warning); }
+    .badge.pending, .badge.processing, .badge.queued, .badge.procesando { background: #fef0c7; color: var(--warning); }
+    .badge.running { background: #dbeafe; color: #175cd3; }
     .detail { position: sticky; top: 18px; padding: 16px; }
     .detail h2 { font-size: 18px; margin: 0 0 5px; }
     .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 14px 0; }
@@ -646,6 +647,17 @@
         );
       }
 
+      function sendDisplayStatus(bulk) {
+        if (!bulk) return "-";
+        const activeBulkJob = (bulk.jobs || []).find(job =>
+          job.job_type === "bulk_send" && ["queued", "running"].includes(job.state)
+        );
+        if (activeBulkJob) {
+          return activeBulkJob.state === "running" ? "enviando" : "en cola";
+        }
+        return bulk.status;
+      }
+
       function formatAge(hours) {
         if (hours === null || hours === undefined || Number.isNaN(Number(hours))) return "-";
         const minutes = Math.max(0, Math.round(Number(hours) * 60));
@@ -731,7 +743,7 @@
                       e("td", null, item.id),
                       e("td", null, item.template_name || item.template_id),
                       e("td", null, item.subject || "-"),
-                      e("td", null, e(Badge, {value: item.status})),
+                      e("td", null, e(Badge, {value: sendDisplayStatus(item)})),
                       e("td", null, e(Badge, {value: item.report?.state})),
                       e("td", null, item.created_at ? new Date(item.created_at).toLocaleString() : "-")
                     )
@@ -744,7 +756,7 @@
                   e("h2", null, `BulkSend ${selected.id}`),
                   e("div", {className: "muted"}, selected.template_name || selected.template_id),
                   e("div", {className: "grid2"},
-                    e("div", {className: "field"}, e("strong", null, "Estado"), e(Badge, {value: selected.status})),
+                    e("div", {className: "field"}, e("strong", null, "Estado"), e(Badge, {value: sendDisplayStatus(selected)})),
                     e("div", {className: "field"}, e("strong", null, "Reporte"), e(Badge, {value: selected.report?.state})),
                     e("div", {className: "field"}, e("strong", null, "Creado hace"), formatAge(selected.age_hours)),
                     e("div", {className: "field"}, e("strong", null, "Filas reporte"), selected.report?.rows_inserted || 0)
