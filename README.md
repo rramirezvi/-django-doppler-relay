@@ -44,13 +44,14 @@ En Bulk Send (normal y por remitente) el guardado NO dispara el envío. El regis
 
 - Envío programado (scheduled_at):
   1) Completa `scheduled_at` con fecha/hora futura y guarda.
-  2) El scheduler toma envíos vencidos y llama internamente `process_bulk_id(...)` (timer opcional o `python manage.py process_bulk_scheduled`).
-  3) La reportería post‑envío se carga con `python manage.py process_post_send_reports` (o su timer horario).
+  2) El scheduler toma envíos vencidos y crea un `BackgroundJob` tipo `bulk_send`.
+  3) El worker `doppler-background-jobs.service` ejecuta el envío.
+  4) La reportería post‑envío se carga con `python manage.py process_post_send_reports` (o su timer horario).
 
 Condición del botón “Ver reporte”: `status == 'done'` y `post_reports_loaded_at` no nulo.
 
 Comandos útiles (local):
-- `python manage.py process_bulk_scheduled` → procesa envíos programados vencidos.
+- `python manage.py process_bulk_scheduled` → encola envíos programados vencidos.
 - `python manage.py process_post_send_reports` → crea/carga reportería del día para envíos `done` (≥ 15 min desde que terminó el envío).
 - `python manage.py process_reports_pending` → procesa `GeneratedReport` en `PENDING/PROCESSING` (flujo general de reports).
 

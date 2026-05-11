@@ -32,7 +32,9 @@ python manage.py process_background_jobs --limit 10
 ## Envio Programado
 
 - Completa `scheduled_at` con fecha/hora futura y guarda.
-- El scheduler opcional toma los envios vencidos y llama internamente `process_bulk_id(...)`.
+- El scheduler opcional toma los envios vencidos y crea un `BackgroundJob` tipo `bulk_send`.
+- El worker `doppler-background-jobs.service` toma ese job y ejecuta el envio real.
+- En la UI el estado visual pasa de `programado` a `en cola`, luego `enviando`, y finalmente `done` o `error`.
 - Comando manual de prueba:
 
 ```bash

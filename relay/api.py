@@ -388,6 +388,13 @@ def bulk_send_process(request: HttpRequest, pk: int) -> JsonResponse:
     if bulk.status != "pending":
         return _json_error(f"El envío está en estado {bulk.status}; solo se procesa pending.")
 
+    if BackgroundJob.objects.filter(
+        bulk=bulk,
+        job_type=BackgroundJob.TYPE_BULK_SEND,
+        state__in=[BackgroundJob.STATE_QUEUED, BackgroundJob.STATE_RUNNING],
+    ).exists():
+        return _json_error("Ya existe un envio en cola o en ejecucion para este BulkSend.")
+
     bulk.processing_started_at = timezone.now()
     bulk.log = ((bulk.log or "") + f"\n[API] Envío encolado por {request.user.username}").strip()
     bulk.save(update_fields=["processing_started_at", "log"])

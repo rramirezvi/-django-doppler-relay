@@ -409,7 +409,7 @@ Nota previa
 Servicio `/etc/systemd/system/bulk-scheduler.service`
 ```
 [Unit]
-Description=Process scheduled bulk sends (process_bulk_scheduled)
+Description=Queue scheduled bulk sends (process_bulk_scheduled)
 After=network.target postgresql.service
 Requires=postgresql.service
 
@@ -452,6 +452,8 @@ journalctl -u bulk-scheduler -n 50 --no-pager
 ```
 
 Concurrencia y seguridad
+- El scheduler no envia directamente: crea un `BackgroundJob` tipo `bulk_send`.
+- El envio real lo ejecuta `doppler-background-jobs.service`.
 - El scheduler usa `select_for_update(skip_locked=True)` y `processing_started_at` para evitar solapes/doble ejecución.
 - Si un operador dispara manualmente antes de la hora, el envío se hace inmediato; el scheduler ya lo encontrará como `done`/`error`.
 

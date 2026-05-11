@@ -647,13 +647,17 @@
         );
       }
 
-      function sendDisplayStatus(bulk) {
-        if (!bulk) return "-";
-        const activeBulkJob = (bulk.jobs || []).find(job =>
+      function activeBulkJob(bulk) {
+        return (bulk?.jobs || []).find(job =>
           job.job_type === "bulk_send" && ["queued", "running"].includes(job.state)
         );
-        if (activeBulkJob) {
-          return activeBulkJob.state === "running" ? "enviando" : "en cola";
+      }
+
+      function sendDisplayStatus(bulk) {
+        if (!bulk) return "-";
+        const job = activeBulkJob(bulk);
+        if (job) {
+          return job.state === "running" ? "enviando" : "en cola";
         }
         if (bulk.status === "pending" && bulk.scheduled_at && new Date(bulk.scheduled_at) > new Date()) {
           return "programado";
