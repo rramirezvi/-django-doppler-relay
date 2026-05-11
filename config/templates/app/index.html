@@ -229,6 +229,7 @@
       const [templatePreviewLoading, setTemplatePreviewLoading] = React.useState(false);
       const [preview, setPreview] = React.useState(null);
       const [submitting, setSubmitting] = React.useState(false);
+      const submitLock = React.useRef(false);
       const [form, setForm] = React.useState({template_id: "", subject: "", sender_id: "", variables: "{}", send_now: true, scheduled_at: ""});
       const [file, setFile] = React.useState(null);
 
@@ -324,10 +325,12 @@
 
       async function submit(ev) {
         ev.preventDefault();
+        if (submitLock.current) return;
         if (!file) {
           setToast("Adjunta un CSV antes de crear el envío.");
           return;
         }
+        submitLock.current = true;
         setSubmitting(true);
         const fd = new FormData();
         fd.append("template_id", form.template_id);
@@ -344,6 +347,7 @@
         } catch (err) {
           setToast(err.message);
         } finally {
+          submitLock.current = false;
           setSubmitting(false);
         }
       }
@@ -783,7 +787,7 @@
                       : null
                   ),
                   e("div", {className: "actions"},
-                    e("button", {className: "primary", disabled: selected.status !== "pending", onClick: () => runAction(`/api/bulk-sends/${selected.id}/process/`, "Envío encolado")}, "Encolar envío"),
+                    e("button", {className: "primary", disabled: selected.status !== "pending" || !!activeBulkJob(selected), onClick: () => runAction(`/api/bulk-sends/${selected.id}/process/`, "Envío encolado")}, "Encolar envío"),
                     e("button", {disabled: !canUpdateReport(), onClick: () => runAction(`/api/bulk-sends/${selected.id}/process-report/`, "Reporte en actualización")}, reportActionLabel()),
                     e("button", {onClick: () => loadDetail(selected.id)}, "Refrescar detalle")
                   ),
