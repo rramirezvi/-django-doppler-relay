@@ -95,6 +95,16 @@ def _bulk_days(bulk: BulkSend) -> set:
 
 
 def _report_summary_for_bulk(bulk: BulkSend) -> dict:
+    if bulk.status != "done":
+        return {
+            "state": "not_started",
+            "loaded_at": None,
+            "status": bulk.post_reports_status or "",
+            "rows_inserted": 0,
+            "latest_error": "",
+            "reports": [],
+        }
+
     days = _bulk_days(bulk)
     reports_qs = GeneratedReport.objects.filter(
         report_type="deliveries",
@@ -113,27 +123,33 @@ def _report_summary_for_bulk(bulk: BulkSend) -> dict:
     latest_error = ""
     ready_loaded = False
     rows_inserted = 0
+    show_report_artifacts = bool(
+        bulk.post_reports_loaded_at or bulk.post_reports_status in {"pending", "processing", "error"}
+    )
     for rep in reports:
-        if rep.error_details and not latest_error:
+        if bulk.post_reports_status == "error" and rep.error_details and not latest_error:
             latest_error = rep.error_details
-        if rep.state == GeneratedReport.STATE_READY and rep.loaded_to_db:
+        if bulk.post_reports_loaded_at and rep.state == GeneratedReport.STATE_READY and rep.loaded_to_db:
             ready_loaded = True
             rows_inserted += int(rep.rows_inserted or 0)
-        items.append({
-            "id": rep.pk,
-            "type": rep.report_type,
-            "start_date": rep.start_date.isoformat(),
-            "end_date": rep.end_date.isoformat(),
-            "state": rep.state,
-            "loaded_to_db": rep.loaded_to_db,
-            "rows_inserted": rep.rows_inserted,
-            "file_path": rep.file_path,
-            "error_details": rep.error_details,
-            "created_at": rep.created_at.isoformat() if rep.created_at else None,
-            "updated_at": rep.updated_at.isoformat() if rep.updated_at else None,
-        })
+        if show_report_artifacts:
+            items.append({
+                "id": rep.pk,
+                "type": rep.report_type,
+                "start_date": rep.start_date.isoformat(),
+                "end_date": rep.end_date.isoformat(),
+                "state": rep.state,
+                "loaded_to_db": rep.loaded_to_db,
+                "rows_inserted": rep.rows_inserted,
+                "file_path": rep.file_path,
+                "error_details": rep.error_details,
+                "created_at": rep.created_at.isoformat() if rep.created_at else None,
+                "updated_at": rep.updated_at.isoformat() if rep.updated_at else None,
+            })
 
-    if any(rep.state == GeneratedReport.STATE_PROCESSING for rep in reports):
+    if not show_report_artifacts:
+        state = "not_started"
+    elif any(rep.state == GeneratedReport.STATE_PROCESSING for rep in reports):
         state = "processing"
     elif any(rep.state == GeneratedReport.STATE_PENDING for rep in reports):
         state = "pending"
