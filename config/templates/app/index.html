@@ -121,6 +121,35 @@
     }
     .form-grid textarea { min-height: 110px; resize: vertical; font-family: ui-monospace, SFMono-Regular, Consolas, monospace; font-size: 12px; }
     .full { grid-column: 1 / -1; }
+    .combo { position: relative; display: grid; gap: 6px; }
+    .combo-input { cursor: text; }
+    .combo-list {
+      position: absolute;
+      z-index: 20;
+      top: calc(100% + 4px);
+      left: 0;
+      right: 0;
+      max-height: 320px;
+      overflow: auto;
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      box-shadow: var(--shadow);
+      padding: 5px;
+    }
+    .combo-option {
+      width: 100%;
+      display: block;
+      text-align: left;
+      border: 0;
+      border-radius: 6px;
+      padding: 8px 9px;
+      background: transparent;
+    }
+    .combo-option:hover, .combo-option.active { background: #eef6ff; }
+    .combo-option strong { display: block; font-size: 13px; color: var(--text); }
+    .combo-option span { display: block; color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+    .combo-empty { padding: 10px; color: var(--muted); }
     .preview { margin: 0 16px 16px; overflow: auto; border: 1px solid var(--line); border-radius: 8px; }
     .preview table { min-width: 780px; }
     .preview.compact { overflow: visible; }
@@ -232,6 +261,8 @@
       const submitLock = React.useRef(false);
       const [form, setForm] = React.useState({template_id: "", subject: "", sender_id: "", variables: "{}", send_now: true, scheduled_at: ""});
       const [file, setFile] = React.useState(null);
+      const [templateSearch, setTemplateSearch] = React.useState("");
+      const [templateOpen, setTemplateOpen] = React.useState(false);
 
       React.useEffect(() => {
         api("/api/senders/").then(data => {
@@ -266,6 +297,17 @@
           template_id: templateId,
           subject: tpl?.subject || "",
         });
+        setTemplateSearch(tpl?.name || tpl?.label || templateId || "");
+        setTemplateOpen(false);
+      }
+
+      function filteredTemplates() {
+        const q = templateSearch.trim().toLowerCase();
+        if (!q) return templates.slice(0, 80);
+        return templates.filter(tpl => {
+          const haystack = `${tpl.name || ""} ${tpl.id || ""} ${tpl.subject || ""} ${tpl.label || ""}`.toLowerCase();
+          return haystack.includes(q);
+        }).slice(0, 80);
       }
 
       async function openTemplatePreview() {
@@ -360,11 +402,41 @@
             e("button", {type: "button", onClick: onCancel}, "Volver a envíos")
           ),
           e("div", {className: "form-grid"},
-            e("label", null, "Plantilla",
-              e("select", {required: true, value: form.template_id, onChange: ev => selectTemplate(ev.target.value)},
-                e("option", {value: ""}, templatesLoading ? "Cargando plantillas..." : "Selecciona una plantilla"),
-                templates.map(tpl => e("option", {key: tpl.id, value: tpl.id}, tpl.label))
-              )
+            e("label", {className: "combo"}, "Plantilla",
+              e("input", {
+                className: "combo-input",
+                required: true,
+                value: templateSearch,
+                placeholder: templatesLoading ? "Cargando plantillas..." : "Buscar plantilla por nombre, asunto o ID",
+                onFocus: () => setTemplateOpen(true),
+                onBlur: () => setTimeout(() => setTemplateOpen(false), 120),
+                onChange: ev => {
+                  setTemplateSearch(ev.target.value);
+                  setTemplateOpen(true);
+                  if (form.template_id) setForm({...form, template_id: "", subject: ""});
+                },
+                onKeyDown: ev => {
+                  if (ev.key === "Escape") setTemplateOpen(false);
+                }
+              }),
+              templateOpen ? e("div", {className: "combo-list"},
+                templatesLoading
+                  ? e("div", {className: "combo-empty"}, "Cargando plantillas...")
+                  : filteredTemplates().length
+                    ? filteredTemplates().map(tpl =>
+                      e("button", {
+                        key: tpl.id,
+                        type: "button",
+                        className: `combo-option ${tpl.id === form.template_id ? "active" : ""}`,
+                        onMouseDown: ev => ev.preventDefault(),
+                        onClick: () => selectTemplate(tpl.id)
+                      },
+                        e("strong", null, tpl.name || tpl.id),
+                        e("span", null, `${tpl.subject || "Sin asunto"} · ${tpl.id}`)
+                      )
+                    )
+                    : e("div", {className: "combo-empty"}, "No hay coincidencias")
+              ) : null
             ),
             e("label", null, "Remitente",
               e("select", {value: form.sender_id, onChange: ev => setForm({...form, sender_id: ev.target.value})},
