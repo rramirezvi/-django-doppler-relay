@@ -297,17 +297,17 @@
           template_id: templateId,
           subject: tpl?.subject || "",
         });
-        setTemplateSearch(tpl?.name || tpl?.label || templateId || "");
+        setTemplateSearch(tpl?.label || tpl?.name || templateId || "");
         setTemplateOpen(false);
       }
 
       function filteredTemplates() {
         const q = templateSearch.trim().toLowerCase();
-        if (!q) return templates.slice(0, 80);
+        if (!q) return templates;
         return templates.filter(tpl => {
           const haystack = `${tpl.name || ""} ${tpl.id || ""} ${tpl.subject || ""} ${tpl.label || ""}`.toLowerCase();
           return haystack.includes(q);
-        }).slice(0, 80);
+        });
       }
 
       async function openTemplatePreview() {
