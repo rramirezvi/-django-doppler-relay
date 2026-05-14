@@ -25,6 +25,11 @@ _TEMPLATE_FAILURE_WINDOW = 60
 _TEMPLATE_CIRCUIT_BLOCK = 60
 
 
+def _debug_api_logs_enabled() -> bool:
+    relay_settings = getattr(settings, "DOPPLER_RELAY", {}) or {}
+    return bool(getattr(settings, "DOPPLER_RELAY_DEBUG", False) or relay_settings.get("DEBUG_LOGS"))
+
+
 def _template_circuit_state(account_key: str) -> Dict[str, Any]:
     state = _TEMPLATE_CIRCUIT_STATE.setdefault(
         account_key,
@@ -116,9 +121,13 @@ class DopplerRelayClient:
         Returns:
             Diccionario con la respuesta de la API
         """
-        print(f"\n=== ENVIANDO BULK EMAIL ===")
-        print(f"Template ID: {template_id}")
-        print(f"Recipients Model: {json.dumps(recipients_model, indent=2)}")
+        logger.info(
+            "Enviando bulk email con template %s a %s destinatarios",
+            template_id,
+            len(recipients_model.get("recipients") or []),
+        )
+        if _debug_api_logs_enabled():
+            logger.debug("Recipients model: %s", recipients_model)
 
         # Validación de datos básicos
         if not recipients_model.get("recipients"):
@@ -145,26 +154,23 @@ class DopplerRelayClient:
             "api_key": f"{api_key[:4]}...{api_key[-4:]}" if api_key else None,
             "timeout": self.timeout,
         }
-        print("DopplerRelayClient configuración:", debug_info)
+        logger.debug("DopplerRelayClient configuracion: %s", debug_info)
 
     def _url(self, path: str) -> str:
         return urljoin(self.base_url, path.lstrip("/"))
 
     def _raise_for_api(self, resp: requests.Response):
-        # Primero, loguear la respuesta completa para depuración
-        print(f"\nRequest URL: {resp.request.url}")
-        print(f"Request Method: {resp.request.method}")
-        print(f"Request Headers: {dict(resp.request.headers)}")
-        try:
-            print(f"Request Body: {resp.request.body.decode()}")
-        except:
-            print(f"Request Body: {resp.request.body}")
-        print(f"\nResponse Status: {resp.status_code}")
-        print(f"Response Headers: {dict(resp.headers)}")
-        try:
-            print(f"Response Body: {resp.text}")
-        except:
-            print("No se pudo leer el cuerpo de la respuesta")
+        # Primero, loguear la respuesta completa para depuración cuando se active debug.
+        if _debug_api_logs_enabled():
+            logger.debug(
+                "Doppler request failed: %s %s status=%s request_headers=%s response_headers=%s body=%s",
+                resp.request.method,
+                resp.request.url,
+                resp.status_code,
+                dict(resp.request.headers),
+                dict(resp.headers),
+                resp.text,
+            )
 
         if 200 <= resp.status_code < 300:
             return
@@ -224,15 +230,15 @@ class DopplerRelayClient:
 
         while retry_count < max_retries:
             try:
-                # Log de la petición
-                print(
-                    f"\n=== REQUEST (intento {retry_count + 1}/{max_retries}) ===")
-                print(f"URL: {url}")
-                print(f"Method: {method}")
-                print(f"Headers: {dict(self.session.headers)}")
-                if 'json' in kwargs:
-                    print(
-                        f"JSON Payload: {json.dumps(kwargs['json'], indent=2)}")
+                if _debug_api_logs_enabled():
+                    logger.debug(
+                        "Doppler request attempt %s/%s: %s %s payload=%s",
+                        retry_count + 1,
+                        max_retries,
+                        method,
+                        url,
+                        kwargs.get("json"),
+                    )
 
                 # Asegurarnos de no duplicar el timeout
                 if 'timeout' not in kwargs:
@@ -241,15 +247,13 @@ class DopplerRelayClient:
                 # Hacer la petición
                 resp = self.session.request(method, url, **kwargs)
 
-                # Log de la respuesta
-                print(f"\n=== RESPONSE ===")
-                print(f"Status: {resp.status_code}")
-                print(f"Headers: {dict(resp.headers)}")
-                try:
-                    # Primeros 1000 caracteres
-                    print(f"Body: {resp.text[:1000]}...")
-                except:
-                    print("No se pudo leer el cuerpo de la respuesta")
+                if _debug_api_logs_enabled():
+                    logger.debug(
+                        "Doppler response: status=%s headers=%s body=%s",
+                        resp.status_code,
+                        dict(resp.headers),
+                        resp.text[:1000],
+                    )
 
                 if resp.status_code >= 400:
                     self._raise_for_api(resp)
@@ -258,22 +262,21 @@ class DopplerRelayClient:
             except (requests.RequestException, DopplerRelayError) as e:
                 retry_count += 1
                 last_error = e
-                print(f"\n=== ERROR (intento {retry_count}/{max_retries}) ===")
-                print(f"Type: {type(e).__name__}")
-                print(f"Message: {str(e)}")
-
-                if hasattr(e, 'response') and hasattr(e.response, 'text'):
-                    print(f"Response Text: {e.response.text}")
+                logger.warning(
+                    "Doppler request error on attempt %s/%s: %s: %s",
+                    retry_count,
+                    max_retries,
+                    type(e).__name__,
+                    str(e),
+                )
 
                 if retry_count < max_retries:
                     # Calcular tiempo de espera exponencial
                     wait_time = min(0.8 * (2 ** retry_count), 8)
-                    print(
-                        f"Esperando {wait_time:.2f} segundos antes de reintentar...")
                     import time
                     time.sleep(wait_time)
                 else:
-                    print("Se agotaron los reintentos")
+                    logger.error("Se agotaron los reintentos contra Doppler")
                     break
 
         # Si llegamos aquí, todos los intentos fallaron
@@ -309,9 +312,7 @@ class DopplerRelayClient:
         if not template_id:
             raise ValueError("template_id es requerido")
 
-        print(f"\n=== OBTENIENDO CAMPOS DE LA PLANTILLA MUSTACHE ===")
-        print(f"Account ID: {account_id}")
-        print(f"Template ID: {template_id}")
+        logger.debug("Obteniendo campos Mustache de plantilla %s para cuenta %s", template_id, account_id)
 
         try:
             response = self._request(
@@ -319,15 +320,15 @@ class DopplerRelayClient:
                 f"/accounts/{account_id}/templates/{template_id}"
             )
             template_data = response.json()
-        except Exception as e:
-            print(f"Error al obtener la plantilla: {str(e)}")
+        except Exception:
+            logger.exception("Error al obtener la plantilla %s", template_id)
             raise
 
         # Extraer las variables de la plantilla
         content = template_data.get(
             "htmlContent", "") or template_data.get("textContent", "")
         if not content:
-            print("Advertencia: La plantilla no tiene contenido HTML ni texto")
+            logger.warning("La plantilla %s no tiene contenido HTML ni texto", template_id)
             return {
                 "id": template_data.get("id"),
                 "name": template_data.get("name"),
@@ -347,12 +348,9 @@ class DopplerRelayClient:
                 if var_name not in variables:
                     variables.append(var_name)
             else:
-                print(
-                    f"Advertencia: Variable Mustache inválida encontrada: {var_name}")
+                logger.debug("Variable Mustache invalida encontrada: %s", var_name)
 
-        print(f"\nVariables Mustache encontradas ({len(variables)}):")
-        for var in sorted(variables):
-            print(f"- {var}")
+        logger.debug("Variables Mustache encontradas para %s: %s", template_id, sorted(variables))
 
         result = {
             "id": template_data.get("id"),
@@ -361,10 +359,7 @@ class DopplerRelayClient:
             "variables": sorted(variables)
         }
 
-        print(f"\nInformación de la plantilla:")
-        print(f"- ID: {result['id']}")
-        print(f"- Nombre: {result['name']}")
-        print(f"- Asunto: {result['subject']}")
+        logger.debug("Informacion de plantilla: %s", result)
 
         return result
 
@@ -379,13 +374,10 @@ class DopplerRelayClient:
         if not html and not text:
             raise ValueError("Debes proveer 'html' o 'text'.")
 
-        print(f"\n=== INICIANDO ENVÍO DE MENSAJE ===")
-        print(f"Account ID: {account_id}")
-        print(f"From: {from_email}")
-        print(f"To: {list(to)}")
-        print(f"Subject: {subject}")
-        print(f"HTML: {'Sí' if html else 'No'}")
-        print(f"Text: {'Sí' if text else 'No'}")
+        to = list(to)
+        cc = list(cc)
+        bcc = list(bcc)
+        logger.info("Enviando mensaje simple a %s destinatarios", len(to) + len(cc) + len(bcc))
 
         # Validar la API key
         if not self.session.headers.get('Authorization'):
@@ -569,16 +561,18 @@ class DopplerRelayClient:
         Ejemplo de variables en el payload:
             { "data": { "nombre": "Juan", "monto": "1000" } }
         """
-        print(f"\n=== ENVIANDO TEMPLATE {template_id} ===")
-        print("Formato de variables en plantilla: {{variable}}")
+        logger.info(
+            "Enviando template %s a %s destinatarios",
+            template_id,
+            len(recipients_model.get("recipients") or recipients_model.get("model", {}).get("recipients") or []),
+        )
 
         # Validación del modelo de datos
         if not isinstance(recipients_model, dict):
             raise ValueError("recipients_model debe ser un diccionario")
 
-        # Mostrar el modelo recibido para debug
-        print(f"\nModelo de datos recibido:")
-        print(json.dumps(recipients_model, indent=2, ensure_ascii=False))
+        if _debug_api_logs_enabled():
+            logger.debug("Modelo de datos recibido: %s", recipients_model)
 
         # Extraer y validar los destinatarios
         if "recipients" not in recipients_model:
@@ -622,20 +616,14 @@ class DopplerRelayClient:
             "recipients": []
         }
 
-        print("\n=== INICIANDO PROCESAMIENTO DE VARIABLES ===")
-
         # Procesar los destinatarios y sus variables
         for recipient in recipients:
             email = str(recipient.get("email", "")).strip()
             if not email:
                 continue
 
-            # Obtener todas las variables disponibles del destinatario
-            print(f"\n📧 Procesando destinatario: {email}")
-
             # Las variables vienen en el campo 'variables' del recipiente
             recipient_variables = recipient.get("variables", {})
-            print("Variables disponibles:", recipient_variables)
 
             # Procesar las variables para cada destinatario
             variables = {
@@ -644,11 +632,8 @@ class DopplerRelayClient:
                 if isinstance(key, str) and value not in (None, "")
             }
 
-            print("Variables procesadas:", variables)
-
             # Crear y agregar el recipient al modelo con sus variables
             if variables:
-                print(f"\nConfigurando payload para {email}:")
                 recipient_payload = {
                     "email": email,
                     # Nombre del destinatario
@@ -658,12 +643,9 @@ class DopplerRelayClient:
                 }
                 # Agregar las variables al modelo global para compatibilidad
                 model.setdefault("model", {}).update(variables)
-                print("Payload del destinatario:")
-                print(json.dumps(recipient_payload, indent=2, ensure_ascii=False))
                 model["recipients"].append(recipient_payload)
-                print("Destinatario agregado al modelo")
             else:
-                print(f"No se agrego {email} porque no tiene variables")
+                logger.debug("No se agrego %s porque no tiene variables", email)
 
         if "attachments" in recipients_model:
             attachments = []
@@ -692,7 +674,7 @@ class DopplerRelayClient:
                         "filename": str(attachment["filename"]).strip()
                     })
                 except Exception as e:
-                    print(f"Error procesando adjunto: {str(e)}")
+                    logger.warning("Error procesando adjunto: %s", str(e))
                     continue
 
             if attachments:
@@ -703,20 +685,15 @@ class DopplerRelayClient:
             raise ValueError(
                 "No hay destinatarios con variables para procesar")
 
-        # Debug detallado del envío
-        print("\n=== RESUMEN DE ENVÍO ===")
-        print(f"Template ID: {template_id}")
-        print(f"Total Destinatarios: {len(model['recipients'])}")
-        print("\nEstructura del Payload:")
-        print("1. Variables en la plantilla: {{variable}}")
-        print(
-            "2. Variables en el payload: { email: '...', name: '...', variables: { variable: 'valor' } }")
-        print("\nPayload Final:")
-        print(json.dumps(model, indent=2, ensure_ascii=False))
+        logger.info(
+            "Payload Doppler preparado para template %s con %s destinatarios",
+            template_id,
+            len(model["recipients"]),
+        )
+        if _debug_api_logs_enabled():
+            logger.debug("Payload final Doppler: %s", model)
 
         try:
-            # Hacer la llamada a la API con plantilla
-            print("\n📤 Enviando solicitud a Doppler Relay (Envío con Plantilla)...")
             response = self._request(
                 "POST",
                 f"/accounts/{str(account_id)}/templates/{str(template_id)}/message",
@@ -727,9 +704,9 @@ class DopplerRelayClient:
             result = response.json()
             result["_location"] = response.headers.get("Location")
 
-            print("\n✅ Envío exitoso")
-            print("Respuesta de la API:")
-            print(json.dumps(result, indent=2))
+            logger.info("Envio Doppler aceptado para template %s", template_id)
+            if _debug_api_logs_enabled():
+                logger.debug("Respuesta Doppler: %s", result)
 
             # Transformar la respuesta al formato requerido
             resultados = []
@@ -752,11 +729,9 @@ class DopplerRelayClient:
             }
 
         except Exception as e:
-            print("\n❌ Error durante el envío:")
-            print(str(e))
+            logger.exception("Error durante el envio con template %s", template_id)
             if hasattr(e, 'payload'):
-                print("\nDetalles del error:")
-                print(json.dumps(e.payload, indent=2))
+                logger.debug("Detalles del error Doppler: %s", e.payload)
             raise
 
     # --- Entregas & Eventos ---

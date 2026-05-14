@@ -248,6 +248,13 @@
       return e("span", {className: `badge ${cls}`}, text);
     }
 
+    function newClientRequestId() {
+      if (window.crypto && typeof window.crypto.randomUUID === "function") {
+        return window.crypto.randomUUID();
+      }
+      return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    }
+
     function NewBulkForm({onCreated, onCancel, setToast}) {
       const [senders, setSenders] = React.useState([]);
       const [defaultSender, setDefaultSender] = React.useState({label: "Usar correo predeterminado"});
@@ -263,6 +270,7 @@
       const [file, setFile] = React.useState(null);
       const [templateSearch, setTemplateSearch] = React.useState("");
       const [templateOpen, setTemplateOpen] = React.useState(false);
+      const [clientRequestId, setClientRequestId] = React.useState(newClientRequestId);
 
       React.useEffect(() => {
         api("/api/senders/").then(data => {
@@ -381,13 +389,21 @@
         fd.append("variables", form.variables || "{}");
         fd.append("scheduled_at", form.scheduled_at || "");
         fd.append("send_now", form.scheduled_at ? "0" : (form.send_now ? "1" : "0"));
+        fd.append("client_request_id", clientRequestId);
         fd.append("recipients_file", file);
         try {
           const data = await api("/api/bulk-sends/", {method: "POST", body: fd});
           setToast(data.message || "Envío creado");
+          setClientRequestId(newClientRequestId());
           onCreated(data.bulk);
         } catch (err) {
-          setToast(err.message);
+          const message = String(err.message || "");
+          if (message.toLowerCase().includes("failed to fetch")) {
+            setToast("No se pudo confirmar la respuesta. Revisa la lista antes de crear otro envio.");
+            onCreated(null);
+          } else {
+            setToast(message);
+          }
         } finally {
           submitLock.current = false;
           setSubmitting(false);

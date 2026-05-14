@@ -6,8 +6,11 @@ from django.conf import settings
 import json
 import csv
 import io
+import logging
 from .models import EmailMessage
 from .services.doppler_relay import DopplerRelayClient, DopplerRelayError
+
+logger = logging.getLogger(__name__)
 
 
 def process_csv_for_template(csv_content: str, email_column: str = "email") -> list:
@@ -108,7 +111,7 @@ def process_bulk_template_send(template_id, recipients, subject=None, adj_list=N
     if not template_id:
         raise ValueError("El ID de la plantilla es requerido")
 
-    print(f"Usando remitente: {FROM_EMAIL} ({FROM_NAME})")
+    logger.info("Preparando envio masivo con remitente %s (%s)", FROM_EMAIL, FROM_NAME)
 
     # Validar y procesar adjuntos si existen
     attachments = None
@@ -173,12 +176,8 @@ def process_bulk_template_send(template_id, recipients, subject=None, adj_list=N
                 single_model["attachments"] = attachments
 
             if attachments:
-                # Debug pre-envío
-                print(
-                    f"Adjuntos a enviar: {json.dumps(attachments, indent=2)}")
-            print(f"\nIntentando enviar a {email}")
-            print(f"Variables: {json.dumps(variables, indent=2)}")
-            print(f"Modelo: {json.dumps(single_model, indent=2)}")
+                logger.debug("Adjuntos a enviar: %s", attachments)
+            logger.debug("Intentando enviar a %s con variables %s", email, variables)
 
             # Envío individual
             sent = client.send_template_message(
@@ -187,7 +186,7 @@ def process_bulk_template_send(template_id, recipients, subject=None, adj_list=N
                 recipients_model=single_model
             )
 
-            print(f"Respuesta del servidor: {json.dumps(sent, indent=2)}")
+            logger.debug("Respuesta Doppler para %s: %s", email, sent)
 
             # Guardar en modelos locales
             email_obj = EmailMessage.objects.create(
@@ -215,9 +214,9 @@ def process_bulk_template_send(template_id, recipients, subject=None, adj_list=N
                 "variables": recipient.get("variables", {})
             }
             resultados.append(error_info)
-            print(f'Error Doppler para {recipient["email"]}: {str(e)}')
+            logger.warning('Error Doppler para %s: %s', recipient["email"], str(e))
             if hasattr(e, "payload"):
-                print(f"Payload de error: {e.payload}")
+                logger.debug("Payload de error Doppler: %s", e.payload)
 
         except Exception as e:
             error_info = {
@@ -227,7 +226,7 @@ def process_bulk_template_send(template_id, recipients, subject=None, adj_list=N
                 "variables": recipient.get("variables", {})
             }
             resultados.append(error_info)
-            print(f'Error general para {recipient["email"]}: {str(e)}')
+            logger.exception('Error general para %s', recipient["email"])
 
     return resultados
 

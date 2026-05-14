@@ -137,6 +137,9 @@ class Attachment(models.Model):
 
 class BulkSend(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
+    client_request_id = models.CharField(
+        max_length=64, blank=True, null=True, unique=True, db_index=True
+    )
     template_id = models.CharField(max_length=128)
     template_name = models.CharField(max_length=255, blank=True, null=True)
     subject = models.CharField(max_length=255, blank=True, null=True)

@@ -10,6 +10,7 @@ from django.contrib.auth.decorators import login_required
 from django.conf import settings
 from django.core.cache import cache
 from django.core.paginator import Paginator
+from django.db import IntegrityError
 from django.db.models import Q
 from django.http import FileResponse, Http404, HttpRequest, JsonResponse
 from django.utils import timezone
@@ -216,6 +217,7 @@ def _bulk_payload(bulk: BulkSend, *, include_detail: bool = False) -> dict:
             result = {"raw": result}
     payload = {
         "id": bulk.pk,
+        "client_request_id": bulk.client_request_id or "",
         "template_id": bulk.template_id,
         "template_name": bulk.template_name or bulk.template_id,
         "subject": bulk.subject or "",
@@ -250,6 +252,28 @@ def _bulk_payload(bulk: BulkSend, *, include_detail: bool = False) -> dict:
             ],
         })
     return payload
+
+
+def _enqueue_bulk_send_once(bulk: BulkSend, user, *, message: str) -> tuple[BackgroundJob | None, bool]:
+    active_job = BackgroundJob.objects.filter(
+        bulk=bulk,
+        job_type=BackgroundJob.TYPE_BULK_SEND,
+        state__in=[BackgroundJob.STATE_QUEUED, BackgroundJob.STATE_RUNNING],
+    ).first()
+    if active_job:
+        return active_job, False
+
+    bulk.processing_started_at = timezone.now()
+    username = getattr(user, "username", "sistema")
+    bulk.log = ((bulk.log or "") + f"\n[API] {message} por {username}").strip()
+    bulk.save(update_fields=["processing_started_at", "log"])
+    job = BackgroundJob.objects.create(
+        job_type=BackgroundJob.TYPE_BULK_SEND,
+        bulk=bulk,
+        triggered_by=user if getattr(user, "is_authenticated", False) else None,
+        message="Envio en cola",
+    )
+    return job, True
 
 
 @require_http_methods(["GET", "POST"])
@@ -322,12 +346,31 @@ def _bulk_send_create(request: HttpRequest) -> JsonResponse:
     send_now = (request.POST.get("send_now") or "").lower() in {"1", "true", "yes", "on"}
     scheduled_at_raw = (request.POST.get("scheduled_at") or "").strip()
     raw_variables = (request.POST.get("variables") or "").strip()
+    client_request_id = (request.POST.get("client_request_id") or "").strip()[:64]
     recipients_file = request.FILES.get("recipients_file")
 
     if not template_id:
         return _json_error("template_id es requerido.")
     if not recipients_file:
         return _json_error("Debe adjuntar recipients_file.")
+
+    if client_request_id:
+        existing = BulkSend.objects.filter(client_request_id=client_request_id).first()
+        if existing:
+            enqueued = False
+            if send_now and existing.status == "pending" and not existing.scheduled_at:
+                _, enqueued = _enqueue_bulk_send_once(
+                    existing,
+                    request.user,
+                    message="Envio confirmado y encolado tras reintento",
+                )
+            return JsonResponse({
+                "ok": True,
+                "duplicate": True,
+                "message": "Este envio ya habia sido creado. Se recupero el registro existente"
+                + (" y quedo en cola." if enqueued else "."),
+                "bulk": _bulk_payload(existing, include_detail=True),
+            }, status=200)
 
     variables = {}
     if raw_variables:
@@ -353,25 +396,37 @@ def _bulk_send_create(request: HttpRequest) -> JsonResponse:
             scheduled_at = timezone.make_aware(scheduled_at, timezone.get_current_timezone())
         send_now = False
 
-    bulk = BulkSend.objects.create(
-        template_id=template_id,
-        subject=subject,
-        variables=variables,
-        recipients_file=recipients_file,
-        scheduled_at=scheduled_at,
-        scheduled_by=request.user if request.user.is_authenticated else None,
-    )
+    try:
+        bulk = BulkSend.objects.create(
+            client_request_id=client_request_id or None,
+            template_id=template_id,
+            subject=subject,
+            variables=variables,
+            recipients_file=recipients_file,
+            scheduled_at=scheduled_at,
+            scheduled_by=request.user if request.user.is_authenticated else None,
+        )
+    except IntegrityError:
+        if not client_request_id:
+            raise
+        bulk = BulkSend.objects.get(client_request_id=client_request_id)
+        enqueued = False
+        if send_now and bulk.status == "pending" and not bulk.scheduled_at:
+            _, enqueued = _enqueue_bulk_send_once(
+                bulk,
+                request.user,
+                message="Envio confirmado y encolado tras reintento",
+            )
+        return JsonResponse({
+            "ok": True,
+            "duplicate": True,
+            "message": "Este envio ya habia sido creado. Se recupero el registro existente"
+            + (" y quedo en cola." if enqueued else "."),
+            "bulk": _bulk_payload(bulk, include_detail=True),
+        }, status=200)
 
     if send_now:
-        bulk.processing_started_at = timezone.now()
-        bulk.log = ((bulk.log or "") + f"\n[API] Envío creado y encolado por {request.user.username}").strip()
-        bulk.save(update_fields=["processing_started_at", "log"])
-        job = BackgroundJob.objects.create(
-            job_type=BackgroundJob.TYPE_BULK_SEND,
-            bulk=bulk,
-            triggered_by=request.user,
-            message="Envío en cola",
-        )
+        _enqueue_bulk_send_once(bulk, request.user, message="Envio creado y encolado")
 
     return JsonResponse({
         "ok": True,
@@ -411,15 +466,7 @@ def bulk_send_process(request: HttpRequest, pk: int) -> JsonResponse:
     ).exists():
         return _json_error("Ya existe un envio en cola o en ejecucion para este BulkSend.")
 
-    bulk.processing_started_at = timezone.now()
-    bulk.log = ((bulk.log or "") + f"\n[API] Envío encolado por {request.user.username}").strip()
-    bulk.save(update_fields=["processing_started_at", "log"])
-    job = BackgroundJob.objects.create(
-        job_type=BackgroundJob.TYPE_BULK_SEND,
-        bulk=bulk,
-        triggered_by=request.user,
-        message="Envío en cola",
-    )
+    job, _ = _enqueue_bulk_send_once(bulk, request.user, message="Envio encolado")
     return JsonResponse({"ok": True, "message": "Envío encolado", "job": _job_payload(job), "bulk": _bulk_payload(bulk)})
 
 
