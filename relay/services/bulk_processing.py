@@ -121,9 +121,28 @@ def process_bulk_id(bulk_id: int) -> None:
             from_name=from_name,
             user=None,
         )
-        bulk.result = (response.content.decode("utf-8") if hasattr(response, "content") else json.dumps(response))
-        bulk.status = "done"
+        result_payload = response.content.decode("utf-8") if hasattr(response, "content") else json.dumps(response)
+        bulk.result = result_payload
+        parsed_response = response
+        if isinstance(parsed_response, str):
+            parsed_response = json.loads(parsed_response)
+        if isinstance(parsed_response, list):
+            ok_count = sum(1 for item in parsed_response if item.get("status") == "ok")
+            error_count = sum(1 for item in parsed_response if item.get("status") == "error")
+        elif isinstance(parsed_response, dict):
+            resultados = parsed_response.get("resultados") or []
+            ok_count = sum(1 for item in resultados if item.get("status") == "ok")
+            error_count = sum(1 for item in resultados if item.get("status") == "error")
+        else:
+            ok_count = 0
+            error_count = 0
+        bulk.status = "done" if ok_count > 0 else "error"
         bulk.log = ((bulk.log or "") + f"\n[BG] Ejecutado a {timezone.now().isoformat()}").strip()
+        if bulk.status == "error":
+            bulk.log = (
+                (bulk.log or "")
+                + f"\n[BG] Envio finalizado sin destinatarios exitosos: ok={ok_count}, error={error_count}"
+            ).strip()
     except Exception as e:
         import traceback
         api_error = getattr(e, "payload", None)
@@ -139,4 +158,3 @@ def process_bulk_id(bulk_id: int) -> None:
         bulk.status = "error"
         bulk.log = ((bulk.log or "") + f"\n[BG] Error en envío: {e}").strip()
     bulk.save(update_fields=["result", "status", "log", "processing_started_at"])
-

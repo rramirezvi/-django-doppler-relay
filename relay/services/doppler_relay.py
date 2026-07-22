@@ -632,20 +632,17 @@ class DopplerRelayClient:
                 if isinstance(key, str) and value not in (None, "")
             }
 
-            # Crear y agregar el recipient al modelo con sus variables
+            recipient_payload = {
+                "email": email,
+                # Nombre del destinatario
+                "name": recipient.get("name", ""),
+                "type": "to",  # Tipo de destinatario
+                "model": variables,
+            }
             if variables:
-                recipient_payload = {
-                    "email": email,
-                    # Nombre del destinatario
-                    "name": recipient.get("name", ""),
-                    "type": "to",  # Tipo de destinatario
-                    "model": variables,
-                }
                 # Agregar las variables al modelo global para compatibilidad
                 model.setdefault("model", {}).update(variables)
-                model["recipients"].append(recipient_payload)
-            else:
-                logger.debug("No se agrego %s porque no tiene variables", email)
+            model["recipients"].append(recipient_payload)
 
         if "attachments" in recipients_model:
             attachments = []
