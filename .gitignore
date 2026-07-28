@@ -9,6 +9,13 @@ staticfiles/
 # Claude Code interno
 .claude/
 
+# Configuracion local generada para agentes y editores
+/.codex/
+/.config/opencode/
+/.copilot/
+/.gemini/
+/AppData/
+
 # Archivos temporales
 tmp_*
 
