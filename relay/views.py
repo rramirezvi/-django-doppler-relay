@@ -9,6 +9,7 @@ import io
 import logging
 from .models import EmailMessage
 from .services.doppler_relay import DopplerRelayClient, DopplerRelayError
+from .services.operator_permissions import can_operate_bulk_sends
 
 logger = logging.getLogger(__name__)
 
@@ -232,12 +233,23 @@ def process_bulk_template_send(template_id, recipients, subject=None, adj_list=N
 
 
 @require_POST
-@csrf_exempt
 def send_bulk_email(request: HttpRequest):
     """
     Endpoint para envío masivo de correos.
     Acepta tanto JSON como CSV para los destinatarios.
     """
+    if not request.user.is_authenticated:
+        return JsonResponse({
+            "ok": False,
+            "error": "Usuario no autenticado"
+        }, status=401)
+
+    if not can_operate_bulk_sends(request.user):
+        return JsonResponse({
+            "ok": False,
+            "error": "No autorizado"
+        }, status=403)
+
     if request.FILES.get("csv_file"):
         # Procesar CSV
         try:

@@ -17,6 +17,18 @@ OPERATOR_PERMISSIONS = (
 )
 
 
+def can_operate_bulk_sends(user) -> bool:
+    return bool(
+        user.is_authenticated
+        and user.is_active
+        and user.is_staff
+        and (
+            user.has_perm("relay.change_bulksend")
+            or user.has_perm("relay_super.change_bulksenduserconfigproxy")
+        )
+    )
+
+
 def ensure_operator_group(*, group_name: str = OPERATOR_GROUP_NAME, stdout=None) -> Group:
     group, created = Group.objects.get_or_create(name=group_name)
     permissions = []

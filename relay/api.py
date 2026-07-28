@@ -19,6 +19,7 @@ from django.views.decorators.http import require_GET, require_http_methods, requ
 
 from relay.models import BackgroundJob, BulkSend, UserEmailConfig
 from relay.services.doppler_relay import DopplerRelayClient
+from relay.services.operator_permissions import can_operate_bulk_sends
 from reports.models import GeneratedReport
 
 
@@ -26,17 +27,6 @@ EMAIL_COLUMNS = {"email", "correo", "e-mail", "mail", "email_address", "correo_e
 TEMPLATES_CACHE_KEY = "operator-app:templates"
 TEMPLATES_CACHE_SECONDS = 300
 REPORT_MANUAL_MIN_AGE_MINUTES = 30
-
-
-def _can_operate(user) -> bool:
-    return bool(
-        user.is_active
-        and user.is_staff
-        and (
-            user.has_perm("relay.change_bulksend")
-            or user.has_perm("relay_super.change_bulksenduserconfigproxy")
-        )
-    )
 
 
 def _can_view_jobs(user) -> bool:
@@ -337,7 +327,7 @@ def bulk_send_list(request: HttpRequest) -> JsonResponse:
 
 
 def _bulk_send_create(request: HttpRequest) -> JsonResponse:
-    if not _can_operate(request.user):
+    if not can_operate_bulk_sends(request.user):
         return _json_error("No tiene permiso para crear envíos", status=403)
 
     template_id = (request.POST.get("template_id") or "").strip()
@@ -450,7 +440,7 @@ def bulk_send_detail(request: HttpRequest, pk: int) -> JsonResponse:
 @require_POST
 @login_required
 def bulk_send_process(request: HttpRequest, pk: int) -> JsonResponse:
-    if not _can_operate(request.user):
+    if not can_operate_bulk_sends(request.user):
         return _json_error("No tiene permiso para procesar envíos", status=403)
     try:
         bulk = BulkSend.objects.get(pk=pk)
@@ -473,7 +463,7 @@ def bulk_send_process(request: HttpRequest, pk: int) -> JsonResponse:
 @require_POST
 @login_required
 def bulk_send_process_report(request: HttpRequest, pk: int) -> JsonResponse:
-    if not _can_operate(request.user):
+    if not can_operate_bulk_sends(request.user):
         return _json_error("No tiene permiso para generar reportes", status=403)
     try:
         bulk = BulkSend.objects.get(pk=pk)
@@ -646,7 +636,7 @@ def background_job_list(request: HttpRequest) -> JsonResponse:
 @require_POST
 @login_required
 def background_job_retry(request: HttpRequest, pk: int) -> JsonResponse:
-    if not _can_operate(request.user):
+    if not can_operate_bulk_sends(request.user):
         return _json_error("No tiene permiso para reintentar jobs", status=403)
     try:
         job = BackgroundJob.objects.get(pk=pk)

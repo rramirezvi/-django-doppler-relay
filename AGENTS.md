@@ -4,6 +4,9 @@ Guía rápida para agentes humanos o automáticos que trabajan en este repositor
 
 ## Flujo de envío
 - Usar `POST /relay/send/` como punto de entrada principal.
+- `POST /relay/send/` requiere sesión autenticada, usuario activo y `is_staff`,
+  uno de los permisos `relay.change_bulksend` o
+  `relay_super.change_bulksenduserconfigproxy`, y un token CSRF válido.
 - Normalizar la entrada a `recipients -> { email, variables }` antes de invocar `process_bulk_template_send`.
 - Evitar lotes vacíos: no llamar a la API si no hay destinatarios válidos.
 
