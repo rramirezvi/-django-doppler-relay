@@ -2,14 +2,38 @@ from pathlib import Path
 import environ
 import os
 
+from django.core.exceptions import ImproperlyConfigured
+
 BASE_DIR = Path(__file__).resolve().parent.parent
 env = environ.Env(DEBUG=(bool, False))
 environ.Env.read_env(os.path.join(BASE_DIR, '.env'), overwrite=True)
 
 DEBUG = env('DEBUG', default=False)
-SECRET_KEY = env('SECRET_KEY', default='unsafe-secret-key')
+SECRET_KEY = env('SECRET_KEY')
+if not SECRET_KEY.strip():
+    raise ImproperlyConfigured('SECRET_KEY must not be empty.')
+
 ALLOWED_HOSTS = [h.strip() for h in env(
     'ALLOWED_HOSTS', default='127.0.0.1,localhost').split(',') if h.strip()]
+
+# Seguridad HTTPS. Los defaults mantienen compatible el desarrollo local por HTTP.
+# Produccion debe habilitar explicitamente estas variables detras de un proxy confiable.
+SECURE_PROXY_SSL_HEADER_ENABLED = env.bool(
+    'SECURE_PROXY_SSL_HEADER_ENABLED', default=False
+)
+SECURE_PROXY_SSL_HEADER = (
+    ('HTTP_X_FORWARDED_PROTO', 'https')
+    if SECURE_PROXY_SSL_HEADER_ENABLED
+    else None
+)
+SECURE_SSL_REDIRECT = env.bool('SECURE_SSL_REDIRECT', default=False)
+SESSION_COOKIE_SECURE = env.bool('SESSION_COOKIE_SECURE', default=False)
+CSRF_COOKIE_SECURE = env.bool('CSRF_COOKIE_SECURE', default=False)
+SECURE_HSTS_SECONDS = env.int('SECURE_HSTS_SECONDS', default=0)
+SECURE_HSTS_INCLUDE_SUBDOMAINS = env.bool(
+    'SECURE_HSTS_INCLUDE_SUBDOMAINS', default=False
+)
+SECURE_HSTS_PRELOAD = env.bool('SECURE_HSTS_PRELOAD', default=False)
 
 INSTALLED_APPS = [
     'relay_super',

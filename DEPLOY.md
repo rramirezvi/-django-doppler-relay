@@ -84,6 +84,7 @@ Si esto no se hace, Django no puede crear la tabla `django_migrations` y `migrat
 ```dotenv
 DEBUG=False
 USE_SQLITE=0
+SECRET_KEY=<generar-y-guardar-fuera-de-git>
 DB_HOST=127.0.0.1
 DB_PORT=5432
 DB_NAME=doppler_prod
@@ -91,6 +92,15 @@ DB_USER=doppler_user
 DB_PASSWORD=la_password_segura
 
 ALLOWED_HOSTS=IP_PUBLICA,dominio.com
+
+# Seguridad HTTPS detras de Nginx
+SECURE_PROXY_SSL_HEADER_ENABLED=True
+SECURE_SSL_REDIRECT=True
+SESSION_COOKIE_SECURE=True
+CSRF_COOKIE_SECURE=True
+SECURE_HSTS_SECONDS=300
+SECURE_HSTS_INCLUDE_SUBDOMAINS=False
+SECURE_HSTS_PRELOAD=False
 
 DOPPLER_RELAY_API_KEY=...
 DOPPLER_RELAY_ACCOUNT_ID=...
@@ -113,6 +123,7 @@ Ejemplo final recomendado para producción:
 ```dotenv
 DEBUG=False
 USE_SQLITE=0
+SECRET_KEY=<conservar-la-clave-actual-de-produccion>
 
 DB_HOST=127.0.0.1
 DB_PORT=5432
@@ -121,6 +132,14 @@ DB_USER=doppler_user
 DB_PASSWORD=la_password_segura
 
 ALLOWED_HOSTS=app1.ramirezvi.com,165.232.xx.xx,localhost,127.0.0.1
+
+SECURE_PROXY_SSL_HEADER_ENABLED=True
+SECURE_SSL_REDIRECT=True
+SESSION_COOKIE_SECURE=True
+CSRF_COOKIE_SECURE=True
+SECURE_HSTS_SECONDS=300
+SECURE_HSTS_INCLUDE_SUBDOMAINS=False
+SECURE_HSTS_PRELOAD=False
 
 DOPPLER_RELAY_API_KEY=...
 DOPPLER_RELAY_ACCOUNT_ID=...
@@ -133,6 +152,51 @@ Importante: si cambias o agregas un dominio nuevo, actualiza `ALLOWED_HOSTS` en 
 ```bash
 sudo systemctl restart django
 ```
+
+### 6.1) Rollback especifico de TD-03A/B
+
+Ejecutar este rollback si ocurre cualquiera de estas condiciones despues del despliegue:
+- bucle de redireccion;
+- errores de sesion o CSRF;
+- Django no reconoce HTTPS detras de Nginx;
+- fallo de arranque porque `SECRET_KEY` esta ausente o vacia.
+
+Antes de editar, respaldar el `.env` actual sin mostrar ni copiar sus secretos a logs o Git:
+```bash
+cd /opt/app/django-doppler-relay
+sudo cp --preserve=all .env .env.backup-td03ab-$(date +%Y%m%d-%H%M%S)
+```
+
+Para desactivar temporalmente el endurecimiento HTTPS en Django, editar unicamente estas variables en `.env`:
+```dotenv
+SECURE_PROXY_SSL_HEADER_ENABLED=False
+SECURE_SSL_REDIRECT=False
+SESSION_COOKIE_SECURE=False
+CSRF_COOKIE_SECURE=False
+SECURE_HSTS_SECONDS=0
+SECURE_HSTS_INCLUDE_SUBDOMAINS=False
+SECURE_HSTS_PRELOAD=False
+```
+
+Para `SECRET_KEY`:
+- restaurar exactamente la clave valida anterior desde el respaldo seguro;
+- no generar una clave nueva durante el rollback, porque invalidaria sesiones y firmas;
+- no volver a introducir el fallback `unsafe-secret-key` en el codigo.
+
+Reiniciar unicamente los servicios Django afectados y comprobar su estado y logs:
+```bash
+sudo systemctl restart django.service
+sudo systemctl restart doppler-background-jobs.service
+sudo systemctl status django.service doppler-background-jobs.service --no-pager
+sudo journalctl -u django.service -u doppler-background-jobs.service -n 100 --no-pager
+
+cd /opt/app/django-doppler-relay
+/opt/app/django-doppler-relay/.venv/bin/python manage.py check
+curl -I http://127.0.0.1/admin/
+curl -I https://app1.ramirezvi.com/admin/
+```
+
+No modificar Nginx, certificados, firewall, base de datos ni `MEDIA_ROOT` durante este rollback. Si el navegador ya recibio HSTS, puede continuar forzando HTTPS hasta que expire el `max-age`. Con el rollout inicial de 300 segundos, esperar ese periodo si fuera necesario antes de concluir que el rollback no funciono.
 
 7) Migraciones, collectstatic y superusuario (orden real)
 ```bash
