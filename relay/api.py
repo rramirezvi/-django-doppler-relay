@@ -18,6 +18,8 @@ from django.utils.dateparse import parse_datetime
 from django.views.decorators.http import require_GET, require_http_methods, require_POST
 
 from relay.models import BackgroundJob, BulkSend, UserEmailConfig
+from relay.services.bulk_import import BulkImportError, BulkImportService
+from relay.services.bulk_progress import get_bulk_import_progress
 from relay.services.doppler_relay import DopplerRelayClient
 from relay.services.operator_permissions import can_operate_bulk_sends
 from reports.models import GeneratedReport
@@ -205,6 +207,7 @@ def _bulk_payload(bulk: BulkSend, *, include_detail: bool = False) -> dict:
             result = json.loads(result)
         except Exception:
             result = {"raw": result}
+    import_progress = get_bulk_import_progress(bulk)
     payload = {
         "id": bulk.pk,
         "client_request_id": bulk.client_request_id or "",
@@ -212,6 +215,27 @@ def _bulk_payload(bulk: BulkSend, *, include_detail: bool = False) -> dict:
         "template_name": bulk.template_name or bulk.template_id,
         "subject": bulk.subject or "",
         "status": bulk.status,
+        "engine_version": bulk.engine_version,
+        "import_version": bulk.import_version,
+        "import_status": bulk.import_status,
+        "import": {
+            "status": bulk.import_status,
+            "total_rows": import_progress.total_rows,
+            "valid_rows": import_progress.valid_rows,
+            "invalid_rows": import_progress.invalid_rows,
+            "pending_rows": import_progress.pending_rows,
+            "started_at": (
+                bulk.import_started_at.isoformat()
+                if bulk.import_started_at
+                else None
+            ),
+            "finished_at": (
+                bulk.import_finished_at.isoformat()
+                if bulk.import_finished_at
+                else None
+            ),
+            "error": bulk.import_error or "",
+        },
         "created_at": bulk.created_at.isoformat() if bulk.created_at else None,
         "scheduled_at": bulk.scheduled_at.isoformat() if bulk.scheduled_at else None,
         "age_hours": age_hours,
@@ -245,6 +269,10 @@ def _bulk_payload(bulk: BulkSend, *, include_detail: bool = False) -> dict:
 
 
 def _enqueue_bulk_send_once(bulk: BulkSend, user, *, message: str) -> tuple[BackgroundJob | None, bool]:
+    if bulk.engine_version != BulkSend.ENGINE_LEGACY:
+        raise ValueError(
+            "TD-02A no permite encolar campanas del motor v2."
+        )
     active_job = BackgroundJob.objects.filter(
         bulk=bulk,
         job_type=BackgroundJob.TYPE_BULK_SEND,
@@ -322,6 +350,13 @@ def bulk_send_list(request: HttpRequest) -> JsonResponse:
         "page": page.number,
         "num_pages": paginator.num_pages,
         "period": period,
+        "capabilities": {
+            "bulk_processing_v2_create": bool(
+                getattr(settings, "BULK_PROCESSING_ENGINE_V2", False)
+                and can_operate_bulk_sends(request.user)
+            ),
+            "bulk_processing_v2_send": False,
+        },
         "results": [_bulk_payload(bulk) for bulk in page.object_list],
     })
 
@@ -337,18 +372,42 @@ def _bulk_send_create(request: HttpRequest) -> JsonResponse:
     scheduled_at_raw = (request.POST.get("scheduled_at") or "").strip()
     raw_variables = (request.POST.get("variables") or "").strip()
     client_request_id = (request.POST.get("client_request_id") or "").strip()[:64]
+    engine_version = (
+        request.POST.get("engine_version") or BulkSend.ENGINE_LEGACY
+    ).strip().lower()
     recipients_file = request.FILES.get("recipients_file")
 
     if not template_id:
         return _json_error("template_id es requerido.")
     if not recipients_file:
         return _json_error("Debe adjuntar recipients_file.")
+    if engine_version not in {
+        BulkSend.ENGINE_LEGACY,
+        BulkSend.ENGINE_V2,
+    }:
+        return _json_error("engine_version no es valido.")
+    if engine_version == BulkSend.ENGINE_V2:
+        if not getattr(settings, "BULK_PROCESSING_ENGINE_V2", False):
+            return _json_error(
+                "El motor v2 no esta habilitado para nuevas campanas.",
+                status=409,
+            )
+        if send_now or scheduled_at_raw:
+            return _json_error(
+                "TD-02A solo importa el ledger v2; el envio v2 aun no esta habilitado.",
+                status=409,
+            )
 
     if client_request_id:
         existing = BulkSend.objects.filter(client_request_id=client_request_id).first()
         if existing:
             enqueued = False
-            if send_now and existing.status == "pending" and not existing.scheduled_at:
+            if (
+                existing.engine_version == BulkSend.ENGINE_LEGACY
+                and send_now
+                and existing.status == "pending"
+                and not existing.scheduled_at
+            ):
                 _, enqueued = _enqueue_bulk_send_once(
                     existing,
                     request.user,
@@ -393,6 +452,7 @@ def _bulk_send_create(request: HttpRequest) -> JsonResponse:
             subject=subject,
             variables=variables,
             recipients_file=recipients_file,
+            engine_version=engine_version,
             scheduled_at=scheduled_at,
             scheduled_by=request.user if request.user.is_authenticated else None,
         )
@@ -401,7 +461,12 @@ def _bulk_send_create(request: HttpRequest) -> JsonResponse:
             raise
         bulk = BulkSend.objects.get(client_request_id=client_request_id)
         enqueued = False
-        if send_now and bulk.status == "pending" and not bulk.scheduled_at:
+        if (
+            bulk.engine_version == BulkSend.ENGINE_LEGACY
+            and send_now
+            and bulk.status == "pending"
+            and not bulk.scheduled_at
+        ):
             _, enqueued = _enqueue_bulk_send_once(
                 bulk,
                 request.user,
@@ -415,7 +480,20 @@ def _bulk_send_create(request: HttpRequest) -> JsonResponse:
             "bulk": _bulk_payload(bulk, include_detail=True),
         }, status=200)
 
-    if send_now:
+    if engine_version == BulkSend.ENGINE_V2:
+        try:
+            BulkImportService(bulk, import_version=1).import_file()
+        except BulkImportError as exc:
+            return JsonResponse(
+                {
+                    "ok": False,
+                    "error": str(exc),
+                    "error_code": exc.code,
+                    "bulk": _bulk_payload(bulk, include_detail=True),
+                },
+                status=400,
+            )
+    elif send_now:
         _enqueue_bulk_send_once(bulk, request.user, message="Envio creado y encolado")
 
     return JsonResponse({
@@ -446,6 +524,11 @@ def bulk_send_process(request: HttpRequest, pk: int) -> JsonResponse:
         bulk = BulkSend.objects.get(pk=pk)
     except BulkSend.DoesNotExist:
         return _json_error("BulkSend no encontrado", status=404)
+    if bulk.engine_version != BulkSend.ENGINE_LEGACY:
+        return _json_error(
+            "TD-02A no permite procesar campanas del motor v2.",
+            status=409,
+        )
     if bulk.status != "pending":
         return _json_error(f"El envío está en estado {bulk.status}; solo se procesa pending.")
 
@@ -644,6 +727,15 @@ def background_job_retry(request: HttpRequest, pk: int) -> JsonResponse:
         return _json_error("Job no encontrado", status=404)
     if job.state != BackgroundJob.STATE_ERROR:
         return _json_error(f"Solo se puede reintentar un job en error. Estado actual: {job.state}")
+    if (
+        job.job_type == BackgroundJob.TYPE_BULK_SEND
+        and job.bulk
+        and job.bulk.engine_version != BulkSend.ENGINE_LEGACY
+    ):
+        return _json_error(
+            "TD-02A no permite reintentar jobs de envio v2.",
+            status=409,
+        )
 
     retry = BackgroundJob.objects.create(
         job_type=job.job_type,

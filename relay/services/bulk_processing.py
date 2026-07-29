@@ -36,6 +36,10 @@ def _detect_reader(content: str) -> tuple[csv.DictReader, list[str], str | None]
 
 def process_bulk_id(bulk_id: int) -> None:
     bulk = BulkSend.objects.get(id=bulk_id)
+    if bulk.engine_version != BulkSend.ENGINE_LEGACY:
+        raise ValueError(
+            "TD-02A no permite procesar campanas del motor v2 con el worker legacy."
+        )
 
     # Obtener variables requeridas por la plantilla
     try:

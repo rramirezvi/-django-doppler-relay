@@ -16,7 +16,12 @@ class Command(BaseCommand):
         now = timezone.now()
         # Seleccionar candidatos programados (scheduled_at no nulo y en el pasado)
         qs = (
-            BulkSend.objects.filter(status="pending", scheduled_at__isnull=False, scheduled_at__lte=now)
+            BulkSend.objects.filter(
+                engine_version=BulkSend.ENGINE_LEGACY,
+                status="pending",
+                scheduled_at__isnull=False,
+                scheduled_at__lte=now,
+            )
             .order_by("scheduled_at")
         )
 
@@ -32,7 +37,12 @@ class Command(BaseCommand):
             with transaction.atomic():
                 row = (
                     BulkSend.objects.select_for_update(skip_locked=True)
-                    .filter(id=bulk_id, status="pending", scheduled_at__lte=timezone.now())
+                    .filter(
+                        id=bulk_id,
+                        engine_version=BulkSend.ENGINE_LEGACY,
+                        status="pending",
+                        scheduled_at__lte=timezone.now(),
+                    )
                     .first()
                 )
                 if not row:

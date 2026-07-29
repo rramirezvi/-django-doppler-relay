@@ -149,3 +149,21 @@ DOPPLER_REPORTS = {
     "POLL_MAX_DELAY": int(env("DOPPLER_REPORTS_POLL_MAX_DELAY", default=15)),
     "POLL_TOTAL_TIMEOUT": int(env("DOPPLER_REPORTS_POLL_TOTAL_TIMEOUT", default=15 * 60)),
 }
+
+# TD-02A imports a persistent occurrence ledger only. Existing and default
+# campaigns remain on the legacy engine.
+BULK_PROCESSING_ENGINE_V2 = env.bool(
+    "BULK_PROCESSING_ENGINE_V2", default=False
+)
+BULK_PROCESSING_V2_IMPORT_BATCH_SIZE = env.int(
+    "BULK_PROCESSING_V2_IMPORT_BATCH_SIZE", default=1000
+)
+BULK_PROCESSING_V2_MAX_FILE_BYTES = env.int(
+    "BULK_PROCESSING_V2_MAX_FILE_BYTES", default=50 * 1024 * 1024
+)
+BULK_PROCESSING_V2_MAX_ROWS = env.int(
+    "BULK_PROCESSING_V2_MAX_ROWS", default=250000
+)
+BULK_PROCESSING_V2_SPOOL_MAX_AGE_SECONDS = env.int(
+    "BULK_PROCESSING_V2_SPOOL_MAX_AGE_SECONDS", default=86400
+)

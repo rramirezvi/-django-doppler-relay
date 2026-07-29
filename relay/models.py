@@ -136,6 +136,26 @@ class Attachment(models.Model):
 
 
 class BulkSend(models.Model):
+    ENGINE_LEGACY = "legacy"
+    ENGINE_V2 = "v2"
+    ENGINE_CHOICES = (
+        (ENGINE_LEGACY, "Legacy"),
+        (ENGINE_V2, "V2"),
+    )
+
+    IMPORT_NOT_STARTED = "not_started"
+    IMPORT_IMPORTING = "importing"
+    IMPORT_READY = "ready"
+    IMPORT_READY_WITH_ERRORS = "ready_with_errors"
+    IMPORT_ERROR = "error"
+    IMPORT_STATUS_CHOICES = (
+        (IMPORT_NOT_STARTED, "Not started"),
+        (IMPORT_IMPORTING, "Importing"),
+        (IMPORT_READY, "Ready"),
+        (IMPORT_READY_WITH_ERRORS, "Ready with errors"),
+        (IMPORT_ERROR, "Error"),
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     client_request_id = models.CharField(
         max_length=64, blank=True, null=True, unique=True, db_index=True
@@ -161,7 +181,39 @@ class BulkSend(models.Model):
     post_reports_status = models.CharField(max_length=16, blank=True, null=True)
     post_reports_loaded_at = models.DateTimeField(null=True, blank=True)
 
+    engine_version = models.CharField(
+        max_length=16,
+        choices=ENGINE_CHOICES,
+        default=ENGINE_LEGACY,
+        db_index=True,
+    )
+    import_version = models.PositiveIntegerField(default=0)
+    import_status = models.CharField(
+        max_length=24,
+        choices=IMPORT_STATUS_CHOICES,
+        default=IMPORT_NOT_STARTED,
+        db_index=True,
+    )
+    imported_rows = models.PositiveBigIntegerField(default=0)
+    valid_rows = models.PositiveBigIntegerField(default=0)
+    invalid_rows = models.PositiveBigIntegerField(default=0)
+    import_started_at = models.DateTimeField(null=True, blank=True)
+    import_finished_at = models.DateTimeField(null=True, blank=True)
+    import_error = models.TextField(blank=True, default="")
+
     def save(self, *args, **kwargs):
+        if self.pk:
+            previous = type(self).objects.filter(pk=self.pk).values(
+                "engine_version", "import_status"
+            ).first()
+            if (
+                previous
+                and previous["engine_version"] != self.engine_version
+                and previous["import_status"] != self.IMPORT_NOT_STARTED
+            ):
+                raise ValueError(
+                    "engine_version no puede cambiar una vez iniciada la importacion."
+                )
         # Completar template_name de forma centralizada (best‑effort)
         try:
             if self.template_id and not self.template_name:
@@ -235,6 +287,90 @@ class BackgroundJob(models.Model):
 
     def __str__(self):
         return f"{self.job_type} #{self.pk} [{self.state}]"
+
+
+class BulkSendRecipient(models.Model):
+    STATUS_PENDING = "pending"
+    STATUS_INVALID = "invalid"
+    STATUS_CHOICES = (
+        (STATUS_PENDING, "Pending"),
+        (STATUS_INVALID, "Invalid"),
+    )
+
+    bulk_send = models.ForeignKey(
+        BulkSend,
+        on_delete=models.CASCADE,
+        related_name="recipient_occurrences",
+    )
+    import_version = models.PositiveIntegerField()
+    source_row_number = models.PositiveBigIntegerField()
+    recipient = models.TextField(blank=True, default="")
+    normalized_recipient = models.TextField(blank=True, default="")
+    payload = models.JSONField(default=dict)
+    payload_hash = models.CharField(max_length=64)
+    idempotency_key = models.UUIDField(unique=True, editable=False)
+    status = models.CharField(
+        max_length=16,
+        choices=STATUS_CHOICES,
+        default=STATUS_PENDING,
+    )
+    last_error_code = models.CharField(max_length=64, blank=True, default="")
+    last_error_message = models.CharField(max_length=255, blank=True, default="")
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Ocurrencia de destinatario"
+        verbose_name_plural = "Ocurrencias de destinatarios"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["bulk_send", "import_version", "source_row_number"],
+                name="uniq_bulk_import_source_row",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(status__in=["pending", "invalid"]),
+                name="bulk_recipient_valid_status",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(import_version__gte=1),
+                name="bulk_recipient_import_version_gte_1",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(source_row_number__gte=1),
+                name="bulk_recipient_source_row_gte_1",
+            ),
+        ]
+        indexes = [
+            models.Index(
+                fields=["bulk_send", "status"],
+                name="bulk_recipient_status_idx",
+            ),
+            models.Index(
+                fields=["bulk_send", "import_version", "source_row_number"],
+                name="bulk_recipient_order_idx",
+            ),
+        ]
+
+    def __str__(self):
+        return (
+            f"BulkSend {self.bulk_send_id} v{self.import_version} "
+            f"row {self.source_row_number} [{self.status}]"
+        )
+
+    def save(self, *args, **kwargs):
+        if self.pk:
+            previous = type(self).objects.filter(pk=self.pk).values(
+                "bulk_send_id", "import_version", "source_row_number"
+            ).first()
+            if previous and (
+                previous["bulk_send_id"] != self.bulk_send_id
+                or previous["import_version"] != self.import_version
+                or previous["source_row_number"] != self.source_row_number
+            ):
+                raise ValueError(
+                    "La posicion logica y version de una ocurrencia son inmutables."
+                )
+        super().save(*args, **kwargs)
 
 
 class EmailMessage(models.Model):

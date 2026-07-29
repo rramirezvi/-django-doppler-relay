@@ -265,8 +265,9 @@
       const [templatePreviewLoading, setTemplatePreviewLoading] = React.useState(false);
       const [preview, setPreview] = React.useState(null);
       const [submitting, setSubmitting] = React.useState(false);
+      const [v2Available, setV2Available] = React.useState(false);
       const submitLock = React.useRef(false);
-      const [form, setForm] = React.useState({template_id: "", subject: "", sender_id: "", variables: "{}", send_now: true, scheduled_at: ""});
+      const [form, setForm] = React.useState({template_id: "", subject: "", sender_id: "", variables: "{}", send_now: true, scheduled_at: "", engine_version: "legacy"});
       const [file, setFile] = React.useState(null);
       const [templateSearch, setTemplateSearch] = React.useState("");
       const [templateOpen, setTemplateOpen] = React.useState(false);
@@ -277,6 +278,9 @@
           setSenders(data.results || []);
           setDefaultSender(data.default_sender || {label: "Usar correo predeterminado"});
         }).catch(err => setToast(err.message));
+        api("/api/bulk-sends/?page_size=1").then(data => {
+          setV2Available(!!data.capabilities?.bulk_processing_v2_create);
+        }).catch(() => setV2Available(false));
         loadTemplates(false);
       }, []);
 
@@ -389,6 +393,7 @@
         fd.append("variables", form.variables || "{}");
         fd.append("scheduled_at", form.scheduled_at || "");
         fd.append("send_now", form.scheduled_at ? "0" : (form.send_now ? "1" : "0"));
+        fd.append("engine_version", form.engine_version);
         fd.append("client_request_id", clientRequestId);
         fd.append("recipients_file", file);
         try {
@@ -464,6 +469,23 @@
               e("input", {value: form.template_id, onChange: ev => setForm({...form, template_id: ev.target.value}), placeholder: "Escribe el ID si no aparece en la lista"})
             ) : null,
             templatesError ? e("div", {className: "field full"}, e("strong", null, "Plantillas"), templatesError) : null,
+            e("label", null, "Motor",
+              e("select", {
+                value: form.engine_version,
+                onChange: ev => {
+                  const engine = ev.target.value;
+                  setForm({
+                    ...form,
+                    engine_version: engine,
+                    send_now: engine === "v2" ? false : form.send_now,
+                    scheduled_at: engine === "v2" ? "" : form.scheduled_at,
+                  });
+                },
+              },
+                e("option", {value: "legacy"}, "Legacy"),
+                v2Available ? e("option", {value: "v2"}, "V2 - solo importar") : null
+              )
+            ),
             e("label", {className: "full"}, "Asunto",
               e("input", {value: form.subject, onChange: ev => setForm({...form, subject: ev.target.value}), placeholder: "Opcional; puede venir de la plantilla"})
             ),
@@ -474,10 +496,10 @@
               e("button", {type: "button", disabled: !form.template_id || !file || templatePreviewLoading, onClick: openTemplatePreview}, templatePreviewLoading ? "Cargando..." : "Vista previa")
             ),
             e("label", null, "Programar envío",
-              e("input", {type: "datetime-local", value: form.scheduled_at, onChange: ev => setForm({...form, scheduled_at: ev.target.value, send_now: ev.target.value ? false : form.send_now})})
+              e("input", {type: "datetime-local", disabled: form.engine_version === "v2", value: form.scheduled_at, onChange: ev => setForm({...form, scheduled_at: ev.target.value, send_now: ev.target.value ? false : form.send_now})})
             ),
             e("label", {className: "switch-row full"},
-              e("input", {type: "checkbox", disabled: !!form.scheduled_at, checked: form.send_now && !form.scheduled_at, onChange: ev => setForm({...form, send_now: ev.target.checked}), style: {width: "auto"}}),
+              e("input", {type: "checkbox", disabled: !!form.scheduled_at || form.engine_version === "v2", checked: form.send_now && !form.scheduled_at, onChange: ev => setForm({...form, send_now: ev.target.checked}), style: {width: "auto"}}),
               "Encolar envío inmediatamente"
             ),
             null
@@ -747,6 +769,13 @@
 
       function sendDisplayStatus(bulk) {
         if (!bulk) return "-";
+        if (bulk.engine_version === "v2") {
+          const importStatus = bulk.import_status || bulk.import?.status;
+          if (importStatus === "importing") return "importando";
+          if (importStatus === "ready") return "lista";
+          if (importStatus === "ready_with_errors") return "lista con filas invalidas";
+          if (importStatus === "error") return "error de importacion";
+        }
         const job = activeBulkJob(bulk);
         if (job) {
           return job.state === "running" ? "enviando" : "en cola";
@@ -875,7 +904,7 @@
                       : null
                   ),
                   e("div", {className: "actions"},
-                    e("button", {className: "primary", disabled: selected.status !== "pending" || !!activeBulkJob(selected), onClick: () => runAction(`/api/bulk-sends/${selected.id}/process/`, "Envío encolado")}, "Encolar envío"),
+                    e("button", {className: "primary", disabled: selected.engine_version === "v2" || selected.status !== "pending" || !!activeBulkJob(selected), onClick: () => runAction(`/api/bulk-sends/${selected.id}/process/`, "Envío encolado")}, "Encolar envío"),
                     e("button", {disabled: !canUpdateReport(), onClick: () => runAction(`/api/bulk-sends/${selected.id}/process-report/`, "Reporte en actualización")}, reportActionLabel()),
                     e("button", {onClick: () => loadDetail(selected.id)}, "Refrescar detalle")
                   ),
