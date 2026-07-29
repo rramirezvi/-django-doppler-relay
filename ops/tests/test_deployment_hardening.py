@@ -33,6 +33,7 @@ from ops.deployment_hardening import (
     temporary_target_ref,
     unexpected_warning_codes,
     validate_token,
+    wait_for_application_ready,
     warning_codes,
 )
 
@@ -381,6 +382,94 @@ class SmokeTests(unittest.TestCase):
             )
 
 
+class ReadinessTests(unittest.TestCase):
+    class Clock:
+        def __init__(self):
+            self.value = 0.0
+        def monotonic(self):
+            return self.value
+        def sleep(self, seconds):
+            self.value += seconds
+
+    def _context(self):
+        return SimpleNamespace(
+            service=SimpleNamespace(unit="django.service", user="app"),
+            nginx=NginxTarget(
+                "app.example.com", 443, str(Path.cwd().anchor + "run/django/django.sock"), None
+            ),
+            baseline_smoke={
+                "/admin/login/": {
+                    "method": "GET", "path": "/admin/login/", "status": "200"
+                }
+            },
+        )
+
+    def test_waits_for_active_service_socket_and_valid_http_baseline(self):
+        state = {"active": 0, "socket": 0, "http": 0}
+        def handler(args, kwargs):
+            if args[:2] == ["systemctl", "is-active"]:
+                state["active"] += 1
+                if state["active"] == 1:
+                    return subprocess.CompletedProcess(args, 3, "activating\n", "")
+                return subprocess.CompletedProcess(args, 0, "active\n", "")
+            if args[:2] == ["test", "-S"]:
+                state["socket"] += 1
+                return subprocess.CompletedProcess(
+                    args, 1 if state["socket"] == 1 else 0, "", ""
+                )
+            if args[0] == "curl":
+                state["http"] += 1
+                status = "502" if state["http"] == 1 else "200"
+                return subprocess.CompletedProcess(
+                    args, 0, "__DEPLOY_SMOKE__" + status, ""
+                )
+            raise AssertionError(args)
+        clock = self.Clock()
+        result = wait_for_application_ready(
+            CommandMapRunner(handler), self._context(),
+            timeout_seconds=5, poll_interval=.25,
+            monotonic=clock.monotonic, sleeper=clock.sleep,
+        )
+        self.assertTrue(result["ready"])
+        self.assertEqual(result["probe"]["status"], "200")
+        self.assertEqual(state, {"active": 4, "socket": 3, "http": 2})
+
+    def test_never_sends_http_probe_before_service_and_socket_are_ready(self):
+        calls = []
+        def handler(args, kwargs):
+            calls.append(list(args))
+            if args[:2] == ["systemctl", "is-active"]:
+                return subprocess.CompletedProcess(args, 0, "active\n", "")
+            if args[:2] == ["test", "-S"]:
+                return subprocess.CompletedProcess(args, 1, "", "")
+            raise AssertionError("HTTP probe must not run before socket readiness")
+        clock = self.Clock()
+        with self.assertRaisesRegex(DeploymentError, "socket-not-ready"):
+            wait_for_application_ready(
+                CommandMapRunner(handler), self._context(),
+                timeout_seconds=.5, poll_interval=.25,
+                monotonic=clock.monotonic, sleeper=clock.sleep,
+            )
+        self.assertFalse(any(call and call[0] == "curl" for call in calls))
+
+    def test_http_502_until_timeout_is_fail_closed(self):
+        def handler(args, kwargs):
+            if args[:2] == ["systemctl", "is-active"]:
+                return subprocess.CompletedProcess(args, 0, "active\n", "")
+            if args[:2] == ["test", "-S"]:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if args[0] == "curl":
+                return subprocess.CompletedProcess(args, 0, "__DEPLOY_SMOKE__502", "")
+            raise AssertionError(args)
+        clock = self.Clock()
+        with self.assertRaisesRegex(DeploymentError, "http-502-expected-200"):
+            wait_for_application_ready(
+                CommandMapRunner(handler), self._context(),
+                timeout_seconds=.5, poll_interval=.25,
+                monotonic=clock.monotonic, sleeper=clock.sleep,
+            )
+
+
 class LocalRunner(Runner):
     def run(self, args, **kwargs):
         kwargs.pop("user", None)
@@ -502,6 +591,9 @@ class RollbackRepositoryTests(unittest.TestCase):
 
     def _execution_context(self):
         context = self._context()
+        context.nginx = NginxTarget(
+            "x", 443, str(Path.cwd().anchor + "run/django/django.sock"), None
+        )
         branch = context.branch
         self._git("restore", "--source", self.old, "--staged", "--worktree",
                   "--", *context.changed_files)
@@ -519,6 +611,9 @@ class RollbackRepositoryTests(unittest.TestCase):
         context.baseline_smoke = {
             "/": {"method": "GET", "path": "/", "status": "200"},
             "/app/": {"method": "GET", "path": "/app/", "status": "302"},
+            "/admin/login/": {
+                "method": "GET", "path": "/admin/login/", "status": "200"
+            },
         }
         return context
 
@@ -526,6 +621,7 @@ class RollbackRepositoryTests(unittest.TestCase):
         return Namespace(
             backup_root=str(backup_root), branch=self._git("branch", "--show-current").stdout.strip(),
             allowed_warning=[], restart_web=True, restart_unit=[],
+            readiness_timeout=5.0, readiness_poll_interval=0.01,
         )
 
     def test_restart_failure_rolls_back_and_restarts_only_affected_unit(self):
@@ -563,14 +659,17 @@ class RollbackRepositoryTests(unittest.TestCase):
                     return subprocess.CompletedProcess(args, 0, "", "")
                 if args[:2] == ["systemctl", "is-active"]:
                     return subprocess.CompletedProcess(args, 0, "active\n", "")
+                if args[:2] == ["test", "-S"]:
+                    return subprocess.CompletedProcess(args, 0, "", "")
                 if args and str(args[0]) == str(context.service.python):
                     return subprocess.CompletedProcess(args, 0, "System check identified no issues", "")
                 if args and args[0] == "curl":
                     url = args[-1]
                     method = args[args.index("--request") + 1]
-                    status = "500" if url.endswith("/") and "/relay/send/" not in url else (
+                    status = "200" if url.endswith("/admin/login/") else (
+                        "500" if url.endswith("/") and "/relay/send/" not in url else (
                         "405" if method == "GET" else "403"
-                    )
+                    ))
                     return subprocess.CompletedProcess(args, 0, "__DEPLOY_SMOKE__" + status, "")
                 return super(ExecutionRunner, inner).run(args, **kwargs)
         with tempfile.TemporaryDirectory() as backup:

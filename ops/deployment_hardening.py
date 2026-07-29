@@ -16,6 +16,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -581,6 +582,70 @@ def run_manage_check(
     return result.stdout, warning_codes(result.stdout)
 
 
+def wait_for_application_ready(
+    runner: Runner,
+    context: DeploymentContext,
+    *,
+    timeout_seconds: float = 60.0,
+    poll_interval: float = 0.25,
+    monotonic=time.monotonic,
+    sleeper=time.sleep,
+) -> dict[str, object]:
+    """Poll objective readiness signals; never rely on a fixed startup delay."""
+    if timeout_seconds <= 0 or poll_interval <= 0:
+        raise DeploymentError("Readiness timeout and poll interval must be positive")
+    socket_path = Path(context.nginx.upstream)
+    if not socket_path.is_absolute():
+        raise DeploymentError("Readiness socket path is not absolute")
+    expected = context.baseline_smoke.get("/admin/login/", {}).get("status")
+    if not expected:
+        raise DeploymentError("Missing login baseline for readiness validation")
+
+    started = monotonic()
+    attempts = 0
+    last_state = "not-started"
+    while monotonic() - started < timeout_seconds:
+        attempts += 1
+        active = runner.run(
+            ["systemctl", "is-active", context.service.unit], check=False
+        )
+        if active.returncode or active.stdout.strip() != "active":
+            last_state = "service-not-active"
+            sleeper(poll_interval)
+            continue
+        socket_ready = runner.run(
+            ["test", "-S", str(socket_path)], user=context.service.user, check=False
+        )
+        if socket_ready.returncode:
+            last_state = "socket-not-ready"
+            sleeper(poll_interval)
+            continue
+        try:
+            response = smoke_request(
+                runner, context.nginx, "/admin/login/", method="GET"
+            )
+        except DeploymentError:
+            last_state = "http-unreachable"
+            sleeper(poll_interval)
+            continue
+        if response["status"] == expected:
+            return {
+                "ready": True,
+                "attempts": attempts,
+                "elapsed_seconds": round(monotonic() - started, 3),
+                "service": context.service.unit,
+                "socket": str(socket_path),
+                "probe": response,
+            }
+        last_state = f"http-{response['status']}-expected-{expected}"
+        sleeper(poll_interval)
+
+    raise DeploymentError(
+        "Application readiness timeout "
+        f"after {timeout_seconds:g}s ({attempts} attempts); last={last_state}"
+    )
+
+
 def preflight(args: argparse.Namespace, runner: Runner) -> DeploymentContext:
     require_commands(
         "systemctl", "getent", "git", "nginx", "openssl", "curl", "runuser", "sha256sum"
@@ -842,6 +907,12 @@ def execute_deployment(
             if state != "active":
                 raise DeploymentError(f"Restarted unit is not active: {unit}")
 
+        readiness = wait_for_application_ready(
+            runner,
+            context,
+            timeout_seconds=args.readiness_timeout,
+            poll_interval=args.readiness_poll_interval,
+        )
         smoke = {
             "/": smoke_request(runner, context.nginx, "/"),
             "/app/": smoke_request(runner, context.nginx, "/app/"),
@@ -867,6 +938,7 @@ def execute_deployment(
             "backup": str(backup),
             "head": head,
             "restarted_units": restarted_units,
+            "readiness": readiness,
             "smoke": smoke,
             "migrations_executed": False,
             "collectstatic_executed": False,
@@ -917,6 +989,7 @@ def deployment_plan(args: argparse.Namespace, context: DeploymentContext) -> dic
             "Fast-forward with git merge --ff-only",
             "Post-update: manage.py check and check --deploy",
             "Post-update: restart only approved units",
+            "Post-update: wait for service, socket, and baseline HTTP readiness",
             "Post-update: smoke tests and runtime SHA256 verification",
             "Targeted rollback on any post-mutation failure",
         ],
@@ -934,6 +1007,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--allowed-warning", action="append", default=[])
     parser.add_argument("--restart-web", action="store_true")
     parser.add_argument("--restart-unit", action="append", default=[])
+    parser.add_argument("--readiness-timeout", type=float, default=60.0)
+    parser.add_argument("--readiness-poll-interval", type=float, default=0.25)
     parser.add_argument(
         "--fetch-target",
         action="store_true",

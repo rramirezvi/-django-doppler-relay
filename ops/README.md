@@ -85,8 +85,32 @@ Post-update performs:
 3. structured warning comparison;
 4. migration/static diff gate;
 5. only explicitly authorized restarts;
-6. baseline and security smoke tests;
-7. runtime SHA256 verification.
+6. objective application-readiness polling;
+7. baseline and security smoke tests;
+8. runtime SHA256 verification.
+
+## Application readiness
+
+`systemctl is-active` is necessary but not sufficient: during the failed
+production attempt systemd reported the unit started at `21:38:36.832490`,
+Gunicorn did not listen on the Unix socket until `21:38:37.220561`, and its
+second worker started at `21:38:37.332599`. Nginx returned 502 to smoke probes
+issued in that window.
+
+After an authorized restart, the procedure now polls these signals in order:
+
+1. the discovered web unit is `active`;
+2. the discovered absolute Unix socket exists and is a socket;
+3. a real TLS request through the effective Nginx vhost to `/admin/login/`
+   returns exactly the status captured in the preflight baseline.
+
+Only then do deployment smoke tests begin. This proves the complete path
+Nginx → socket → Gunicorn worker → Django can serve a known endpoint; socket
+existence alone cannot produce a false ready result from a stale or
+not-yet-serving socket. Polling defaults to every 250 ms with a fail-closed
+60-second upper bound, configurable through `--readiness-poll-interval` and
+`--readiness-timeout`. These values bound failure detection; they are not a
+fixed startup sleep.
 
 Any failure after mutation restores only the paths in the exact approved Git range from `OLD_COMMIT` with `git restore --source ... --staged --worktree`, then atomically restores the previous branch reference with `git update-ref`. Runtime files outside that range, `.env`, and untracked files are never included. A repeated rollback stops successfully when HEAD and the affected paths already match `OLD_COMMIT`; any ambiguous intermediate state aborts.
 
