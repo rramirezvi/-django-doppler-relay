@@ -14,7 +14,9 @@ from ops.deployment_hardening import (
     NginxTarget,
     Runner,
     ServiceMetadata,
+    acquire_target_object,
     changed_runtime_intersections,
+    delete_temporary_target_ref,
     discover_and_validate_nginx,
     discover_nginx_target,
     discover_service,
@@ -26,7 +28,9 @@ from ops.deployment_hardening import (
     resolve_commit,
     safe_repo_path,
     smoke_request,
+    snapshot_git_state,
     targeted_rollback,
+    temporary_target_ref,
     unexpected_warning_codes,
     validate_token,
     warning_codes,
@@ -579,5 +583,137 @@ class RollbackRepositoryTests(unittest.TestCase):
         self.assertEqual((self.repo / "runtime.txt").read_text(), "runtime local\n")
 
 
+class ControlledFetchTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        root = Path(self.tmp.name)
+        self.remote = root / "remote.git"
+        self.seed = root / "seed"
+        self.production = root / "production"
+        subprocess.run(["git", "init", "--bare", str(self.remote)], check=True,
+                       capture_output=True)
+        subprocess.run(["git", "init", str(self.seed)], check=True, capture_output=True)
+        self._run(self.seed, "config", "user.email", "test@example.invalid")
+        self._run(self.seed, "config", "user.name", "Test")
+        (self.seed / "app.py").write_text("old\n")
+        self._run(self.seed, "add", ".")
+        self._run(self.seed, "commit", "-m", "old")
+        self.branch = self._run(self.seed, "branch", "--show-current").stdout.strip()
+        self._run(self.seed, "remote", "add", "origin", str(self.remote))
+        self._run(self.seed, "push", "-u", "origin", self.branch)
+        subprocess.run(["git", "clone", str(self.remote), str(self.production)],
+                       check=True, capture_output=True)
+        self.old = self._run(self.production, "rev-parse", "HEAD").stdout.strip()
+        (self.seed / "app.py").write_text("target\n")
+        (self.seed / "new.py").write_text("new\n")
+        self._run(self.seed, "add", ".")
+        self._run(self.seed, "commit", "-m", "target")
+        self.target = self._run(self.seed, "rev-parse", "HEAD").stdout.strip()
+        self._run(self.seed, "push", "origin", self.branch)
+        self.runner = LocalRunner()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, cwd, *args):
+        return subprocess.run(["git", *args], cwd=cwd, text=True,
+                              capture_output=True, check=True)
+
+    def test_without_fetch_target_absent_aborts(self):
+        with self.assertRaises(DeploymentError):
+            resolve_commit(self.runner, self.production, self.target, "svc")
+
+    def test_controlled_fetch_preserves_active_git_state_and_remote_tracking_refs(self):
+        before = snapshot_git_state(self.runner, self.production, "origin", "svc")
+        origin_ref_before = self._run(
+            self.production, "rev-parse", f"refs/remotes/origin/{self.branch}"
+        ).stdout.strip()
+        ref, captured = acquire_target_object(
+            self.runner, self.production, remote="origin", branch=self.branch,
+            target_sha=self.target, user="svc",
+        )
+        self.assertEqual(captured, before)
+        self.assertEqual(
+            self._run(self.production, "rev-parse", ref).stdout.strip(), self.target
+        )
+        self.assertEqual(
+            self._run(self.production, "rev-parse", "HEAD").stdout.strip(), self.old
+        )
+        self.assertEqual(
+            self._run(self.production, "branch", "--show-current").stdout.strip(),
+            self.branch,
+        )
+        self.assertEqual(
+            self._run(
+                self.production, "rev-parse", f"refs/remotes/origin/{self.branch}"
+            ).stdout.strip(),
+            origin_ref_before,
+        )
+        self.assertEqual(
+            self._run(self.production, "status", "--porcelain=v1").stdout, ""
+        )
+        delete_temporary_target_ref(
+            self.runner, self.production, ref, self.target, "svc"
+        )
+        self.assertNotEqual(
+            subprocess.run(["git", "rev-parse", "--verify", ref],
+                           cwd=self.production, capture_output=True).returncode,
+            0,
+        )
+
+    def test_remote_hash_mismatch_aborts_without_fetch(self):
+        wrong = "a" * 40
+        with self.assertRaisesRegex(DeploymentError, "Remote target"):
+            acquire_target_object(
+                self.runner, self.production, remote="origin", branch=self.branch,
+                target_sha=wrong, user="svc",
+            )
+
+    def test_preexisting_wrong_temporary_ref_aborts(self):
+        ref = temporary_target_ref(self.target)
+        self._run(self.production, "update-ref", ref, self.old)
+        with self.assertRaisesRegex(DeploymentError, "Stale preflight ref"):
+            acquire_target_object(
+                self.runner, self.production, remote="origin", branch=self.branch,
+                target_sha=self.target, user="svc",
+            )
+        self.assertEqual(
+            self._run(self.production, "rev-parse", ref).stdout.strip(), self.old
+        )
+        delete_temporary_target_ref(
+            self.runner, self.production, ref, self.old, "svc"
+        )
+
+    def test_interrupted_fetch_leaves_detectable_recoverable_ref(self):
+        outer = self
+        class InterruptAfterFetch(LocalRunner):
+            def run(inner, args, **kwargs):
+                result = super(InterruptAfterFetch, inner).run(args, **kwargs)
+                if args[:2] == ["git", "fetch"]:
+                    raise DeploymentError("simulated interruption after fetch")
+                return result
+        ref = temporary_target_ref(self.target)
+        with self.assertRaisesRegex(DeploymentError, "simulated interruption"):
+            acquire_target_object(
+                InterruptAfterFetch(), self.production, remote="origin",
+                branch=self.branch, target_sha=self.target, user="svc",
+            )
+        self.assertEqual(
+            self._run(self.production, "rev-parse", ref).stdout.strip(), self.target
+        )
+        # A subsequent controlled acquisition validates and safely reuses it.
+        recovered_ref, _ = acquire_target_object(
+            self.runner, self.production, remote="origin", branch=self.branch,
+            target_sha=self.target, user="svc",
+        )
+        delete_temporary_target_ref(
+            self.runner, self.production, recovered_ref, self.target, "svc"
+        )
+        self.assertEqual(
+            self._run(self.production, "rev-parse", "HEAD").stdout.strip(), self.old
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
+    delete_temporary_target_ref,

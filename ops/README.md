@@ -28,6 +28,36 @@ sudo python3 ops/deployment_hardening.py \
   --branch PRODUCTION_BRANCH
 ```
 
+This strictly local mode performs no fetch. The target commit must already
+exist in the repository object database.
+
+When the approved target object is absent, controlled acquisition must be
+requested explicitly:
+
+```bash
+sudo python3 ops/deployment_hardening.py \
+  --service-unit django.service \
+  --old-sha OLD_COMMIT \
+  --target-sha TARGET_COMMIT \
+  --remote origin \
+  --branch PRODUCTION_BRANCH \
+  --fetch-target
+```
+
+`--fetch-target` is still non-deploying, but it is not metadata-read-only. It
+writes only fetched objects and the hash-qualified temporary reference
+`refs/deployment-preflight/TARGET_COMMIT`. Fetch uses `--no-tags`,
+`--no-prune`, `--no-write-fetch-head`, and an empty `--refmap=`; it does not update the local branch,
+HEAD, index, working tree, `FETCH_HEAD`, or `refs/remotes/origin/*`.
+The procedure snapshots and compares those active Git states, validates the
+temporary ref and remote hash, and deletes the ref with a compare-and-swap
+`git update-ref -d` in `finally`. It never runs `git gc`.
+
+An interrupted process may leave the isolated ref. A later controlled
+acquisition accepts it only if it points exactly to the requested hash;
+otherwise it aborts. The ref can be removed safely only by supplying its
+observed object ID to the compare-and-swap cleanup command.
+
 ### Post-update â€” after fast-forward
 
 Execution additionally requires an explicit absolute backup root and explicit

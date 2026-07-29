@@ -118,6 +118,22 @@ class DeploymentContext:
     baseline_warning_codes: set[str]
 
 
+@dataclasses.dataclass(frozen=True)
+class GitStateSnapshot:
+    head: str
+    branch: str
+    status: str
+    unstaged_diff: str
+    staged_diff: str
+    remote_refs: str
+
+
+def temporary_target_ref(target_sha: str) -> str:
+    if not re.fullmatch(r"[0-9a-fA-F]{40,64}", target_sha):
+        raise DeploymentError("Target SHA is not a full object id")
+    return f"refs/deployment-preflight/{target_sha.lower()}"
+
+
 def require_commands(*commands: str) -> None:
     missing = [command for command in commands if shutil.which(command) is None]
     if missing:
@@ -416,6 +432,108 @@ def changed_runtime_intersections(
     changed_files: list[str], runtime_files: list[str]
 ) -> list[str]:
     return sorted(set(changed_files) & set(runtime_files))
+
+
+def snapshot_git_state(
+    runner: Runner, cwd: Path, remote: str, user: str
+) -> GitStateSnapshot:
+    return GitStateSnapshot(
+        head=runner.run(["git", "rev-parse", "HEAD"], cwd=cwd, user=user).stdout.strip(),
+        branch=runner.run(
+            ["git", "branch", "--show-current"], cwd=cwd, user=user
+        ).stdout.strip(),
+        status=runner.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=cwd, user=user,
+        ).stdout,
+        unstaged_diff=runner.run(
+            ["git", "diff", "--binary", "--no-ext-diff"], cwd=cwd, user=user
+        ).stdout,
+        staged_diff=runner.run(
+            ["git", "diff", "--cached", "--binary", "--no-ext-diff"],
+            cwd=cwd, user=user,
+        ).stdout,
+        remote_refs=runner.run(
+            [
+                "git", "for-each-ref", "--format=%(refname) %(objectname)",
+                f"refs/remotes/{remote}/",
+            ],
+            cwd=cwd, user=user,
+        ).stdout,
+    )
+
+
+def assert_git_state_unchanged(
+    runner: Runner, cwd: Path, remote: str, user: str, expected: GitStateSnapshot
+) -> None:
+    actual = snapshot_git_state(runner, cwd, remote, user)
+    if actual != expected:
+        changed = [
+            field.name
+            for field in dataclasses.fields(GitStateSnapshot)
+            if getattr(actual, field.name) != getattr(expected, field.name)
+        ]
+        raise DeploymentError(
+            "Controlled target acquisition changed HEAD, branch, index, working tree, "
+            "or remote-tracking refs: " + ", ".join(changed)
+        )
+
+
+def acquire_target_object(
+    runner: Runner,
+    cwd: Path,
+    *,
+    remote: str,
+    branch: str,
+    target_sha: str,
+    user: str,
+) -> tuple[str, GitStateSnapshot]:
+    """Fetch an approved branch tip into an isolated, hash-qualified ref."""
+    ref = temporary_target_ref(target_sha)
+    before = snapshot_git_state(runner, cwd, remote, user)
+    existing = runner.run(
+        ["git", "rev-parse", "--verify", ref], cwd=cwd, user=user, check=False
+    )
+    if existing.returncode == 0 and existing.stdout.strip().lower() != target_sha.lower():
+        raise DeploymentError(
+            f"Stale preflight ref points to an unexpected object: {ref}"
+        )
+
+    remote_line = runner.run(
+        ["git", "ls-remote", "--exit-code", remote, f"refs/heads/{branch}"],
+        cwd=cwd, user=user,
+    ).stdout.strip().split()
+    if len(remote_line) != 2 or remote_line[0].lower() != target_sha.lower():
+        raise DeploymentError("Remote target does not match approved target SHA")
+
+    runner.run(
+        [
+            "git", "fetch", "--no-tags", "--no-prune", "--no-write-fetch-head",
+            "--refmap=", remote, f"refs/heads/{branch}:{ref}",
+        ],
+        cwd=cwd, user=user,
+    )
+    resolved = resolve_commit(runner, cwd, target_sha, user)
+    ref_value = runner.run(
+        ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"], cwd=cwd, user=user
+    ).stdout.strip().lower()
+    if ref_value != resolved or resolved != target_sha.lower():
+        raise DeploymentError("Temporary preflight ref did not resolve to approved target")
+    assert_git_state_unchanged(runner, cwd, remote, user, before)
+    return ref, before
+
+
+def delete_temporary_target_ref(
+    runner: Runner, cwd: Path, ref: str, target_sha: str, user: str
+) -> None:
+    current = runner.run(
+        ["git", "rev-parse", "--verify", ref], cwd=cwd, user=user, check=False
+    )
+    if current.returncode:
+        return
+    if current.stdout.strip().lower() != target_sha.lower():
+        raise DeploymentError(f"Ref cleanup refused because {ref} changed unexpectedly")
+    runner.run(["git", "update-ref", "-d", ref, target_sha], cwd=cwd, user=user)
 
 
 def smoke_request(runner: Runner, target: NginxTarget, path: str, method: str = "GET") -> dict[str, str]:
@@ -817,6 +935,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--restart-web", action="store_true")
     parser.add_argument("--restart-unit", action="append", default=[])
     parser.add_argument(
+        "--fetch-target",
+        action="store_true",
+        help=(
+            "Acquire the approved remote target into an isolated "
+            "refs/deployment-preflight/<SHA> ref before read-only analysis."
+        ),
+    )
+    parser.add_argument(
         "--execute",
         action="store_true",
         help="Apply fast-forward after Preflight. Without this flag, run Preflight only.",
@@ -827,7 +953,21 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     runner = Runner()
+    temporary_ref: str | None = None
+    acquisition_service: ServiceMetadata | None = None
     try:
+        if args.fetch_target:
+            validate_token(args.remote, "Git remote")
+            validate_token(args.branch, "Git branch")
+            acquisition_service = discover_service(runner, args.service_unit)
+            temporary_ref, _ = acquire_target_object(
+                runner,
+                acquisition_service.working_directory,
+                remote=args.remote,
+                branch=args.branch,
+                target_sha=args.target_sha,
+                user=acquisition_service.user,
+            )
         context = preflight(args, runner)
         report: dict[str, object] = {
             "phase": "preflight",
@@ -842,6 +982,20 @@ def main(argv: list[str] | None = None) -> int:
     except (DeploymentError, KeyboardInterrupt) as exc:
         print(f"DEPLOYMENT_ABORTED: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if temporary_ref and acquisition_service:
+            try:
+                delete_temporary_target_ref(
+                    runner,
+                    acquisition_service.working_directory,
+                    temporary_ref,
+                    args.target_sha,
+                    acquisition_service.user,
+                )
+            except DeploymentError as cleanup_error:
+                raise DeploymentError(
+                    f"PREFLIGHT_REF_CLEANUP_REQUIRED: {cleanup_error}"
+                ) from cleanup_error
 
 
 if __name__ == "__main__":
