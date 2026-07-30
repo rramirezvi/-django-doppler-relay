@@ -118,6 +118,10 @@ class DeploymentContext:
     baseline_smoke: dict[str, dict[str, str]]
     baseline_warning_codes: set[str]
     preflight_readiness: dict[str, object] | None = None
+    approved_commits: list[str] = dataclasses.field(default_factory=list)
+    runtime_metadata: dict[str, dict[str, object]] = dataclasses.field(
+        default_factory=dict
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -488,6 +492,68 @@ def assert_git_state_unchanged(
         )
 
 
+def refresh_deployment_ref(
+    runner: Runner,
+    cwd: Path,
+    *,
+    remote: str,
+    branch: str,
+    target_sha: str,
+    user: str,
+) -> str:
+    """Update exactly the remote-tracking ref consumed by deployment."""
+    validate_token(remote, "Git remote")
+    validate_token(branch, "Git branch")
+    before = snapshot_git_state(runner, cwd, remote, user)
+    remote_line = runner.run(
+        ["git", "ls-remote", "--exit-code", remote, f"refs/heads/{branch}"],
+        cwd=cwd, user=user,
+    ).stdout.strip().split()
+    if len(remote_line) != 2 or remote_line[0].lower() != target_sha.lower():
+        raise DeploymentError("Remote target does not match approved target SHA")
+    ref = f"refs/remotes/{remote}/{branch}"
+    runner.run(
+        [
+            "git", "fetch", "--no-tags", "--no-prune", "--no-write-fetch-head",
+            "--refmap=", remote, f"refs/heads/{branch}:{ref}",
+        ],
+        cwd=cwd, user=user,
+    )
+    resolved = runner.run(
+        ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
+        cwd=cwd, user=user,
+    ).stdout.strip().lower()
+    if resolved != target_sha.lower():
+        raise DeploymentError("Deployment remote-tracking ref is not the approved target")
+    resolve_commit(runner, cwd, target_sha, user)
+    after = snapshot_git_state(runner, cwd, remote, user)
+    for field in ("head", "branch", "status", "unstaged_diff", "staged_diff"):
+        if getattr(after, field) != getattr(before, field):
+            raise DeploymentError(
+                "Controlled deployment fetch changed active Git state: " + field
+            )
+    return ref
+
+
+def require_deployment_ref(
+    runner: Runner,
+    cwd: Path,
+    *,
+    remote: str,
+    branch: str,
+    target_sha: str,
+    user: str,
+) -> str:
+    ref = f"refs/remotes/{remote}/{branch}"
+    resolved = runner.run(
+        ["git", "rev-parse", "--verify", f"{ref}^{{commit}}"],
+        cwd=cwd, user=user,
+    ).stdout.strip().lower()
+    if resolved != target_sha.lower():
+        raise DeploymentError("Deployment ref does not match the exact approved target")
+    return ref
+
+
 def acquire_target_object(
     runner: Runner,
     cwd: Path,
@@ -754,6 +820,18 @@ def preflight(args: argparse.Namespace, runner: Runner) -> DeploymentContext:
     if len(remote_line) != 2 or remote_line[0].lower() != target_sha:
         raise DeploymentError("Remote target does not match approved target SHA")
     require_fast_forward(runner, cwd, old_sha, target_sha, service.user)
+    approved_commits = git_lines(
+        runner, cwd, "rev-list", "--reverse", f"{old_sha}..{target_sha}",
+        user=service.user,
+    )
+    expected_commits = [
+        resolve_commit(runner, cwd, oid, service.user)
+        for oid in getattr(args, "expected_commit", [])
+    ]
+    if expected_commits and approved_commits != expected_commits:
+        raise DeploymentError(
+            "Approved commit range differs from --expected-commit sequence"
+        )
 
     changed_files = git_lines(
         runner, cwd, "diff", "--name-only", f"{old_sha}..{target_sha}", user=service.user
@@ -769,6 +847,18 @@ def preflight(args: argparse.Namespace, runner: Runner) -> DeploymentContext:
         for name in runtime_files
         if safe_repo_path(cwd, name).is_file()
     }
+    runtime_metadata = {}
+    for name in runtime_hashes:
+        path = safe_repo_path(cwd, name, must_exist=True)
+        info = path.stat()
+        runtime_metadata[name] = {
+            "sha256": runtime_hashes[name],
+            "mode": stat.S_IMODE(info.st_mode),
+            "uid": info.st_uid,
+            "gid": info.st_gid,
+            "size": info.st_size,
+            "mtime_ns": info.st_mtime_ns,
+        }
 
     _, baseline_warning_codes = run_manage_check(runner, service)
     nginx_target = discover_and_validate_nginx(runner, service)
@@ -793,6 +883,8 @@ def preflight(args: argparse.Namespace, runner: Runner) -> DeploymentContext:
         baseline_smoke=baseline_smoke,
         baseline_warning_codes=baseline_warning_codes,
         preflight_readiness=preflight_readiness,
+        approved_commits=approved_commits,
+        runtime_metadata=runtime_metadata,
     )
 
 
@@ -869,8 +961,13 @@ def targeted_rollback(
     if not user:
         raise DeploymentError("Rollback refused: service user is empty")
     head = runner.run(["git", "rev-parse", "HEAD"], cwd=cwd, user=user).stdout.strip()
-    if head not in {context.old_sha, context.target_sha}:
-        raise DeploymentError("Rollback refused: HEAD is neither old nor target commit")
+    approved_commits = context.approved_commits or git_lines(
+        runner, cwd, "rev-list", "--reverse",
+        f"{context.old_sha}..{context.target_sha}", user=user,
+    )
+    allowed_heads = {context.old_sha, *approved_commits}
+    if head not in allowed_heads:
+        raise DeploymentError("Rollback refused: HEAD is outside the approved range")
 
     def paths_match(commit: str) -> bool:
         for cached in (False, True):
@@ -882,37 +979,52 @@ def targeted_rollback(
                 return False
         return True
 
-    if head == context.old_sha and paths_match(context.old_sha):
-        return
-    target_tree_present = paths_match(context.target_sha)
-    old_tree_present = paths_match(context.old_sha)
-    if head == context.target_sha and old_tree_present:
-        runner.run(
-            ["git", "update-ref", f"refs/heads/{context.branch}",
-             context.old_sha, context.target_sha],
-            cwd=cwd, user=user,
-        )
-    elif not target_tree_present:
-        raise DeploymentError("Rollback refused: deployment paths are in an ambiguous state")
-    else:
-        runner.run(
-            [
-                "git", "restore", "--source", context.old_sha, "--staged", "--worktree",
-                "--", *context.changed_files,
-            ],
-            cwd=cwd, user=user,
-        )
-        if head == context.target_sha:
+    if not paths_match(context.old_sha):
+        restorable_paths = []
+        for name in context.changed_files:
+            in_old = runner.run(
+                ["git", "cat-file", "-e", f"{context.old_sha}:{name}"],
+                cwd=cwd, user=user, check=False,
+            ).returncode == 0
+            in_index = runner.run(
+                ["git", "ls-files", "--error-unmatch", "--", name],
+                cwd=cwd, user=user, check=False,
+            ).returncode == 0
+            if in_old or in_index:
+                restorable_paths.append(name)
+        if restorable_paths:
             runner.run(
-                ["git", "update-ref", f"refs/heads/{context.branch}",
-                 context.old_sha, context.target_sha],
+                [
+                    "git", "restore", "--source", context.old_sha,
+                    "--staged", "--worktree", "--", *restorable_paths,
+                ],
                 cwd=cwd, user=user,
             )
+    if head != context.old_sha:
+        runner.run(
+            ["git", "update-ref", f"refs/heads/{context.branch}",
+             context.old_sha, head],
+            cwd=cwd, user=user,
+        )
     if not paths_match(context.old_sha):
         raise DeploymentError("Rollback did not restore the exact old Git tree")
     for name, expected in context.runtime_hashes.items():
-        if sha256_file(safe_repo_path(cwd, name, must_exist=True)) != expected:
+        path = safe_repo_path(cwd, name, must_exist=True)
+        if sha256_file(path) != expected:
             raise DeploymentError(f"Runtime changed during rollback: {name}")
+        expected_metadata = context.runtime_metadata.get(name)
+        if expected_metadata:
+            info = path.stat()
+            actual_metadata = {
+                "sha256": expected,
+                "mode": stat.S_IMODE(info.st_mode),
+                "uid": info.st_uid,
+                "gid": info.st_gid,
+                "size": info.st_size,
+                "mtime_ns": info.st_mtime_ns,
+            }
+            if actual_metadata != expected_metadata:
+                raise DeploymentError(f"Runtime metadata changed during rollback: {name}")
     for unit in restarted_units:
         runner.run(["systemctl", "restart", unit])
 
@@ -933,6 +1045,10 @@ def execute_deployment(
         previous_handlers[signum] = signal.signal(signum, interrupt)
     try:
         mutation_started = True
+        require_deployment_ref(
+            runner, cwd, remote=context.remote, branch=context.branch,
+            target_sha=context.target_sha, user=context.service.user,
+        )
         runner.run(
             ["git", "merge", "--ff-only", context.target_sha],
             cwd=cwd, user=context.service.user,
@@ -942,6 +1058,29 @@ def execute_deployment(
         ).stdout.strip()
         if head != context.target_sha:
             raise DeploymentError("HEAD does not match target after fast-forward")
+        for cached in (False, True):
+            command = ["git", "diff", "--quiet"]
+            if cached:
+                command.append("--cached")
+            command.extend([context.target_sha, "--", *context.changed_files])
+            if runner.run(
+                command, cwd=cwd, user=context.service.user, check=False
+            ).returncode:
+                raise DeploymentError("Working tree is partially materialized")
+        current_runtime = git_lines(
+            runner, cwd, "diff", "--name-only", user=context.service.user
+        )
+        if current_runtime != context.runtime_files:
+            raise DeploymentError("Post-merge runtime file set changed")
+        for name, expected in context.runtime_hashes.items():
+            if sha256_file(safe_repo_path(cwd, name, must_exist=True)) != expected:
+                raise DeploymentError(f"Runtime SHA256 changed after merge: {name}")
+        for name in context.changed_files:
+            path = safe_repo_path(cwd, name)
+            if path.exists() and runner.run(
+                ["test", "-O", str(path)], user=context.service.user, check=False
+            ).returncode:
+                raise DeploymentError(f"Changed path has unexpected ownership: {name}")
 
         migrations = [name for name in context.changed_files if "/migrations/" in name]
         static_changes = [
@@ -1042,6 +1181,7 @@ def deployment_plan(args: argparse.Namespace, context: DeploymentContext) -> dic
         "remote": context.remote,
         "OLD_COMMIT": context.old_sha,
         "TARGET_COMMIT": context.target_sha,
+        "approved_commits": context.approved_commits,
         "changed_files": context.changed_files,
         "runtime_files": context.runtime_files,
         "intersections": context.intersections,
@@ -1075,6 +1215,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--branch", required=True)
     parser.add_argument("--backup-root")
     parser.add_argument("--allowed-warning", action="append", default=[])
+    parser.add_argument(
+        "--expected-commit", action="append", default=[],
+        help="Full commit ID expected in OLD..TARGET order; repeat for each commit.",
+    )
     parser.add_argument("--restart-web", action="store_true")
     parser.add_argument("--restart-unit", action="append", default=[])
     parser.add_argument("--readiness-timeout", type=float, default=60.0)
@@ -1085,6 +1229,14 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Acquire the approved remote target into an isolated "
             "refs/deployment-preflight/<SHA> ref before read-only analysis."
+        ),
+    )
+    parser.add_argument(
+        "--refresh-deployment-ref",
+        action="store_true",
+        help=(
+            "Explicitly update refs/remotes/<remote>/<branch> to the approved "
+            "target and verify active HEAD/index/worktree remain unchanged."
         ),
     )
     parser.add_argument(
@@ -1101,6 +1253,20 @@ def main(argv: list[str] | None = None) -> int:
     temporary_ref: str | None = None
     acquisition_service: ServiceMetadata | None = None
     try:
+        if args.fetch_target and args.refresh_deployment_ref:
+            raise DeploymentError(
+                "Choose either isolated preflight fetch or deployment-ref refresh"
+            )
+        if args.refresh_deployment_ref:
+            acquisition_service = discover_service(runner, args.service_unit)
+            refresh_deployment_ref(
+                runner,
+                acquisition_service.working_directory,
+                remote=args.remote,
+                branch=args.branch,
+                target_sha=args.target_sha,
+                user=acquisition_service.user,
+            )
         if args.fetch_target:
             validate_token(args.remote, "Git remote")
             validate_token(args.branch, "Git branch")

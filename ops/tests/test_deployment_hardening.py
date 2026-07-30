@@ -25,6 +25,8 @@ from ops.deployment_hardening import (
     parse_environment_files,
     parse_exec_start_path,
     require_fast_forward,
+    refresh_deployment_ref,
+    require_deployment_ref,
     resolve_commit,
     safe_repo_path,
     smoke_request,
@@ -692,6 +694,44 @@ class RollbackRepositoryTests(unittest.TestCase):
             )
         self.assertEqual(calls, [])
 
+    def test_rollback_with_old_head_and_target_files_materialized(self):
+        context = self._context()
+        branch = context.branch
+        self._git("restore", "--source", self.old, "--staged", "--worktree",
+                  "--", *context.changed_files)
+        self._git("update-ref", f"refs/heads/{branch}", self.old, self.target)
+        self._git("restore", "--source", self.target, "--staged", "--worktree",
+                  "--", *context.changed_files)
+        self.assertEqual(self._git("rev-parse", "HEAD").stdout.strip(), self.old)
+        self.assertEqual((self.repo / "app.py").read_text(), "new\n")
+        targeted_rollback(Namespace(branch=branch), self.runner, context, [])
+        self.assertEqual(self._git("rev-parse", "HEAD").stdout.strip(), self.old)
+        self.assertEqual((self.repo / "app.py").read_text(), "old\n")
+        self.assertFalse((self.repo / "added.txt").exists())
+        self.assertEqual((self.repo / "runtime.txt").read_text(), "runtime local\n")
+
+    def test_rollback_from_approved_intermediate_commit(self):
+        intermediate = self.target
+        (self.repo / "app.py").write_text("final\n")
+        (self.repo / "final.py").write_text("final\n")
+        self._git("add", ".")
+        self._git("commit", "-m", "final")
+        final = self._git("rev-parse", "HEAD").stdout.strip()
+        context = self._context()
+        context.target_sha = final
+        context.approved_commits = [intermediate, final]
+        context.changed_files = ["added.txt", "app.py", "deleted.txt", "final.py"]
+        branch = context.branch
+        self._git("update-ref", f"refs/heads/{branch}", intermediate, final)
+        self._git("read-tree", "--reset", "-u", intermediate)
+        (self.repo / "runtime.txt").write_text("runtime local\n")
+        targeted_rollback(Namespace(branch=branch), self.runner, context, [])
+        self.assertEqual(self._git("rev-parse", "HEAD").stdout.strip(), self.old)
+        self.assertEqual((self.repo / "app.py").read_text(), "old\n")
+        self.assertFalse((self.repo / "added.txt").exists())
+        self.assertFalse((self.repo / "final.py").exists())
+        self.assertEqual((self.repo / "runtime.txt").read_text(), "runtime local\n")
+
     def test_interruption_between_restore_and_update_ref_is_detected_and_recovered(self):
         context = self._context()
         class InterruptingRunner(LocalRunner):
@@ -733,6 +773,7 @@ class RollbackRepositoryTests(unittest.TestCase):
         self._git("restore", "--source", self.old, "--staged", "--worktree",
                   "--", *context.changed_files)
         self._git("update-ref", f"refs/heads/{branch}", self.old, self.target)
+        self._git("update-ref", f"refs/remotes/origin/{branch}", self.target)
         wrapper = self.repo / "python3"
         wrapper.write_text("binary")
         fragment = self.repo / "django.service"
@@ -774,6 +815,8 @@ class RollbackRepositoryTests(unittest.TestCase):
                     return subprocess.CompletedProcess(args, 0, "", "")
                 if args and str(args[0]) == str(context.service.python):
                     return subprocess.CompletedProcess(args, 0, "System check identified no issues", "")
+                if args[:2] == ["test", "-O"]:
+                    return subprocess.CompletedProcess(args, 0, "", "")
                 return super(ExecutionRunner, inner).run(args, **kwargs)
         with tempfile.TemporaryDirectory() as backup:
             with self.assertRaisesRegex(DeploymentError, "ROLLBACK_COMPLETED"):
@@ -795,6 +838,8 @@ class RollbackRepositoryTests(unittest.TestCase):
                 if args[:2] == ["systemctl", "is-active"]:
                     return subprocess.CompletedProcess(args, 0, "active\n", "")
                 if args[:2] == ["test", "-S"]:
+                    return subprocess.CompletedProcess(args, 0, "", "")
+                if args[:2] == ["test", "-O"]:
                     return subprocess.CompletedProcess(args, 0, "", "")
                 if args and str(args[0]) == str(context.service.python):
                     return subprocess.CompletedProcess(args, 0, "System check identified no issues", "")
@@ -856,6 +901,58 @@ class ControlledFetchTests(unittest.TestCase):
     def test_without_fetch_target_absent_aborts(self):
         with self.assertRaises(DeploymentError):
             resolve_commit(self.runner, self.production, self.target, "svc")
+
+    def test_ls_remote_can_be_new_while_consumed_ref_is_stale(self):
+        remote = self._run(
+            self.production, "ls-remote", "origin", f"refs/heads/{self.branch}"
+        ).stdout.split()[0]
+        tracking = self._run(
+            self.production, "rev-parse", f"refs/remotes/origin/{self.branch}"
+        ).stdout.strip()
+        self.assertEqual(remote, self.target)
+        self.assertEqual(tracking, self.old)
+        with self.assertRaisesRegex(DeploymentError, "exact approved target"):
+            require_deployment_ref(
+                self.runner, self.production, remote="origin", branch=self.branch,
+                target_sha=self.target, user="svc",
+            )
+
+    def test_explicit_fetch_updates_consumed_ref_and_preserves_active_state(self):
+        before_head = self._run(self.production, "rev-parse", "HEAD").stdout.strip()
+        before_status = self._run(
+            self.production, "status", "--porcelain=v1"
+        ).stdout
+        ref = refresh_deployment_ref(
+            self.runner, self.production, remote="origin", branch=self.branch,
+            target_sha=self.target, user="svc",
+        )
+        self.assertEqual(ref, f"refs/remotes/origin/{self.branch}")
+        self.assertEqual(
+            self._run(self.production, "rev-parse", ref).stdout.strip(), self.target
+        )
+        self.assertEqual(
+            self._run(self.production, "rev-parse", "HEAD").stdout.strip(),
+            before_head,
+        )
+        self.assertEqual(
+            self._run(self.production, "status", "--porcelain=v1").stdout,
+            before_status,
+        )
+
+    def test_merge_uses_exact_full_target_after_ref_validation(self):
+        refresh_deployment_ref(
+            self.runner, self.production, remote="origin", branch=self.branch,
+            target_sha=self.target, user="svc",
+        )
+        require_deployment_ref(
+            self.runner, self.production, remote="origin", branch=self.branch,
+            target_sha=self.target, user="svc",
+        )
+        self._run(self.production, "merge", "--ff-only", self.target)
+        self.assertEqual(
+            self._run(self.production, "rev-parse", "HEAD").stdout.strip(),
+            self.target,
+        )
 
     def test_controlled_fetch_preserves_active_git_state_and_remote_tracking_refs(self):
         before = snapshot_git_state(self.runner, self.production, "origin", "svc")

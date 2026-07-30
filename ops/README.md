@@ -58,6 +58,25 @@ acquisition accepts it only if it points exactly to the requested hash;
 otherwise it aborts. The ref can be removed safely only by supplying its
 observed object ID to the compare-and-swap cleanup command.
 
+## Deployment target pinning
+
+An isolated `--fetch-target` preflight proves that an object can be inspected,
+but intentionally does not update `refs/remotes/origin/*`; therefore that mode
+must never be treated as proof that `origin/<branch>` is deployable. Before an
+authorized execution, use `--refresh-deployment-ref`. It performs an explicit,
+no-tags/no-prune/no-FETCH_HEAD fetch from the approved branch to the exact
+`refs/remotes/<remote>/<branch>` consumed by deployment, then requires that
+reference to resolve to the full approved SHA. HEAD, branch, index and working
+tree must remain byte-for-byte unchanged by this metadata update.
+
+The commit sequence can be pinned by repeating `--expected-commit` in
+OLD..TARGET order. Preflight rejects missing, reordered or additional commits.
+Execution revalidates the remote-tracking ref and then merges the full target
+object ID, never an abbreviation, `FETCH_HEAD`, or an unchecked branch name.
+Immediately after the fast-forward it requires exact HEAD, a fully materialized
+index/working tree for every range path, the original runtime file set and
+hashes, and service-user ownership of every existing changed path.
+
 ### Post-update â€” after fast-forward
 
 Execution additionally requires an explicit absolute backup root and explicit
@@ -141,6 +160,15 @@ Root must not restore working-tree files. If an emergency requires root, the
 exception must immediately restore the discovered user/group, verify content
 hashes and modes, and record `git status`; this is an operator exception, not
 an automatic fallback.
+
+Rollback captures OLD, TARGET, branch, the exact approved commit sequence,
+range paths, and runtime metadata. It accepts HEAD at OLD or at any approved
+intermediate commit, and it does not assume HEAD describes the index or working
+tree. It restores the complete approved range from OLD (which also removes only
+files introduced by that range), atomically moves the branch from the observed
+approved HEAD back to OLD, and verifies runtime SHA256, mode, owner, group,
+size, mtime and final Git state. A HEAD outside the approved range fails closed;
+there is no root fallback.
 
 ## Worker restarts
 
