@@ -112,6 +112,19 @@ not-yet-serving socket. Polling defaults to every 250 ms with a fail-closed
 `--readiness-timeout`. These values bound failure detection; they are not a
 fixed startup sleep.
 
+The hostname is never supplied by an operator or embedded in the runbook.
+The procedure parses the active output of `nginx -T`, selects the single TLS
+`server_name` whose proxy/upstream points to the socket discovered from
+`django.service`, rejects empty, invalid, absent, wildcard, variable, or
+ambiguous names, and verifies certificate coverage. Preflight then validates
+the layers separately: active systemd unit, Unix socket, `nginx -t`, local TLS
+connection through `127.0.0.1` with the discovered Host/SNI, and HTTP 200 from
+`/admin/login/`. Its evidence records the discovered hostname, URL, Host
+header, status, attempts and elapsed time without response bodies or secrets.
+An HTTP 000 is therefore reported only after hostname/TLS/connection/Nginx and
+socket context has been established; it is not classified directly as a
+Django failure.
+
 Any failure after mutation restores only the paths in the exact approved Git range from `OLD_COMMIT` with `git restore --source ... --staged --worktree`, then atomically restores the previous branch reference with `git update-ref`. Runtime files outside that range, `.env`, and untracked files are never included. A repeated rollback stops successfully when HEAD and the affected paths already match `OLD_COMMIT`; any ambiguous intermediate state aborts.
 
 If execution is interrupted after `git restore` but before `git update-ref`,
@@ -122,6 +135,12 @@ when the operator explicitly invokes the rollback path again. The rollback
 recognizes that exact split state, moves the branch reference to `OLD_COMMIT`,
 verifies the old tree and runtime SHA256 values, and does not touch `.env`.
 Any other split or ambiguous state aborts without alternative operations.
+All Git restore and reference operations in rollback run as the discovered
+systemd service user (normally `app`), including the idempotent recovery path.
+Root must not restore working-tree files. If an emergency requires root, the
+exception must immediately restore the discovered user/group, verify content
+hashes and modes, and record `git status`; this is an operator exception, not
+an automatic fallback.
 
 ## Worker restarts
 

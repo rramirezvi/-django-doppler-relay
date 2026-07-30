@@ -34,6 +34,7 @@ from ops.deployment_hardening import (
     unexpected_warning_codes,
     validate_token,
     wait_for_application_ready,
+    validate_readiness_layers,
     warning_codes,
 )
 
@@ -171,6 +172,38 @@ class NginxDiscoveryTests(unittest.TestCase):
         server { listen 443 ssl; server_name b.example.com; proxy_pass http://unix:/run/app.sock; }
         """
         with self.assertRaisesRegex(DeploymentError, "ambiguous"):
+            discover_nginx_target(config, "/run/app.sock")
+
+    def test_invalid_or_empty_effective_hostname_is_rejected(self):
+        config = """
+        server { listen 443 ssl; server_name bad/name;
+        proxy_pass http://unix:/run/app.sock; }
+        """
+        with self.assertRaisesRegex(DeploymentError, "empty or invalid"):
+            discover_nginx_target(config, "/run/app.sock")
+
+    def test_wildcard_vhost_is_rejected(self):
+        config = """
+        server { listen 443 ssl; server_name *.example.com;
+        proxy_pass http://unix:/run/app.sock; }
+        """
+        with self.assertRaisesRegex(DeploymentError, "candidates: none"):
+            discover_nginx_target(config, "/run/app.sock")
+
+    def test_nginx_variable_vhost_is_rejected(self):
+        config = """
+        server { listen 443 ssl; server_name $host;
+        proxy_pass http://unix:/run/app.sock; }
+        """
+        with self.assertRaisesRegex(DeploymentError, "candidates: none"):
+            discover_nginx_target(config, "/run/app.sock")
+
+    def test_vhost_for_unrelated_socket_is_rejected(self):
+        config = """
+        server { listen 443 ssl; server_name app.example.com;
+        proxy_pass http://unix:/run/other.sock; }
+        """
+        with self.assertRaisesRegex(DeploymentError, "candidates: none"):
             discover_nginx_target(config, "/run/app.sock")
 
 
@@ -371,14 +404,86 @@ class SmokeTests(unittest.TestCase):
         command = runner.calls[0][0]
         self.assertIn("--connect-timeout", command)
         self.assertIn("--max-time", command)
-        self.assertEqual(result, {"method": "POST", "path": "/relay/send/", "status": "403"})
+        self.assertEqual(result["method"], "POST")
+        self.assertEqual(result["path"], "/relay/send/")
+        self.assertEqual(result["status"], "403")
+        self.assertEqual(result["host_header"], "app.example.com")
+        self.assertEqual(result["url"], "https://app.example.com:443/relay/send/")
         self.assertNotIn("redirect_url", " ".join(command))
+
+    def test_preflight_readiness_reports_each_layer(self):
+        service = SimpleNamespace(unit="django.service", user="app")
+        socket_path = str(Path.cwd().anchor + "run/app.sock")
+        target = NginxTarget("app.example.com", 443, socket_path, None)
+        def handler(args, kwargs):
+            if args[:2] == ["systemctl", "is-active"]:
+                return subprocess.CompletedProcess(args, 0, "active\n", "")
+            if args[:2] == ["test", "-S"] or args == ["nginx", "-t"]:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if args[0] == "curl":
+                return subprocess.CompletedProcess(args, 0, "__DEPLOY_SMOKE__200", "")
+            raise AssertionError(args)
+        result = validate_readiness_layers(CommandMapRunner(handler), service, target)
+        self.assertEqual(result["service"]["status"], "active")
+        self.assertTrue(result["socket"]["available"])
+        self.assertEqual(result["nginx"]["connection"], "local-via-127.0.0.1")
+        self.assertEqual(result["application"]["status"], "200")
+        self.assertEqual(result["hostname_source"], "active-nginx-config")
+        self.assertEqual(result["attempts"], 1)
+
+    def test_preflight_readiness_stops_before_http_when_socket_is_missing(self):
+        calls = []
+        def handler(args, kwargs):
+            calls.append(args)
+            if args[:2] == ["systemctl", "is-active"]:
+                return subprocess.CompletedProcess(args, 0, "active\n", "")
+            if args[:2] == ["test", "-S"]:
+                return subprocess.CompletedProcess(args, 1, "", "")
+            raise AssertionError(args)
+        with self.assertRaisesRegex(DeploymentError, "socket is unavailable"):
+            validate_readiness_layers(
+                CommandMapRunner(handler),
+                SimpleNamespace(unit="django.service", user="app"),
+                NginxTarget(
+                    "app.example.com", 443,
+                    str(Path.cwd().anchor + "run/app.sock"), None,
+                ),
+            )
+        self.assertFalse(any(call and call[0] == "curl" for call in calls))
 
     def test_curl_timeout_or_connection_failure_is_fatal(self):
         with self.assertRaises(DeploymentError):
             smoke_request(
                 RecordingRunner(returncode=28),
                 NginxTarget("app.example.com", 443, "/run/app.sock", None), "/",
+            )
+
+    def test_tls_connection_failure_is_fatal(self):
+        runner = RecordingRunner(returncode=35)
+        with self.assertRaisesRegex(DeploymentError, "curl failed"):
+            smoke_request(
+                runner,
+                NginxTarget("app.example.com", 443, "/run/app.sock", None),
+                "/admin/login/",
+            )
+
+    def test_preflight_readiness_rejects_unexpected_http_status(self):
+        def handler(args, kwargs):
+            if args[:2] == ["systemctl", "is-active"]:
+                return subprocess.CompletedProcess(args, 0, "active\n", "")
+            if args[:2] == ["test", "-S"] or args == ["nginx", "-t"]:
+                return subprocess.CompletedProcess(args, 0, "", "")
+            if args[0] == "curl":
+                return subprocess.CompletedProcess(args, 0, "__DEPLOY_SMOKE__503", "")
+            raise AssertionError(args)
+        with self.assertRaisesRegex(DeploymentError, "returned HTTP 503"):
+            validate_readiness_layers(
+                CommandMapRunner(handler),
+                SimpleNamespace(unit="django.service", user="app"),
+                NginxTarget(
+                    "app.example.com", 443,
+                    str(Path.cwd().anchor + "run/app.sock"), None,
+                ),
             )
 
 
@@ -556,6 +661,36 @@ class RollbackRepositoryTests(unittest.TestCase):
         targeted_rollback(args, self.runner, context, [])
         targeted_rollback(args, self.runner, context, [])
         self.assertEqual(self._git("rev-parse", "HEAD").stdout.strip(), self.old)
+
+    def test_rollback_git_mutations_run_as_discovered_service_user(self):
+        context = self._context()
+        seen = []
+        class UserRecordingRunner(LocalRunner):
+            def run(inner, args, **kwargs):
+                if args[:2] in (["git", "restore"], ["git", "update-ref"]):
+                    seen.append((list(args), kwargs.get("user")))
+                return super().run(args, **kwargs)
+        targeted_rollback(
+            Namespace(branch=context.branch), UserRecordingRunner(), context, []
+        )
+        self.assertTrue(seen)
+        self.assertTrue(all(user == "service" for _, user in seen))
+
+    def test_rollback_refuses_missing_service_user_before_git_mutation(self):
+        context = self._context()
+        context.service = SimpleNamespace(
+            working_directory=self.repo, user=""
+        )
+        calls = []
+        class RecordingLocalRunner(LocalRunner):
+            def run(inner, args, **kwargs):
+                calls.append(list(args))
+                return super().run(args, **kwargs)
+        with self.assertRaisesRegex(DeploymentError, "service user is empty"):
+            targeted_rollback(
+                Namespace(branch=context.branch), RecordingLocalRunner(), context, []
+            )
+        self.assertEqual(calls, [])
 
     def test_interruption_between_restore_and_update_ref_is_detected_and_recovered(self):
         context = self._context()

@@ -117,6 +117,7 @@ class DeploymentContext:
     runtime_hashes: dict[str, str]
     baseline_smoke: dict[str, dict[str, str]]
     baseline_warning_codes: set[str]
+    preflight_readiness: dict[str, object] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -355,7 +356,14 @@ def discover_nginx_target(config: str, bind_path: str) -> NginxTarget:
     if len(unique) != 1:
         rendered = ", ".join(sorted(name for name, _, _ in unique)) or "none"
         raise DeploymentError(f"Nginx target is ambiguous; candidates: {rendered}")
-    return next(iter(unique.values()))
+    target = next(iter(unique.values()))
+    if not re.fullmatch(
+        r"(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
+        r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?",
+        target.server_name,
+    ):
+        raise DeploymentError("Discovered Nginx server_name is empty or invalid")
+    return target
 
 
 def discover_and_validate_nginx(runner: Runner, service: ServiceMetadata) -> NginxTarget:
@@ -537,7 +545,14 @@ def delete_temporary_target_ref(
     runner.run(["git", "update-ref", "-d", ref, target_sha], cwd=cwd, user=user)
 
 
-def smoke_request(runner: Runner, target: NginxTarget, path: str, method: str = "GET") -> dict[str, str]:
+def smoke_request(
+    runner: Runner,
+    target: NginxTarget,
+    path: str,
+    method: str = "GET",
+    *,
+    monotonic=time.monotonic,
+) -> dict[str, object]:
     if method not in {"GET", "POST"} or not path.startswith("/") or path.startswith("//"):
         raise DeploymentError("Unsafe smoke-test method or path")
     marker = "__DEPLOY_SMOKE__"
@@ -565,11 +580,60 @@ def smoke_request(runner: Runner, target: NginxTarget, path: str, method: str = 
             f"https://{target.server_name}:{target.port}{path}",
         ]
     )
+    started = monotonic()
     output = runner.run(args).stdout
+    elapsed = round(monotonic() - started, 3)
     payload = output.split(marker, 1)[-1].strip()
     if not re.fullmatch(r"\d{3}", payload):
         raise DeploymentError("curl did not return a valid HTTP status")
-    return {"method": method, "path": path, "status": payload}
+    return {
+        "method": method,
+        "path": path,
+        "status": payload,
+        "host_header": target.server_name,
+        "url": f"https://{target.server_name}:{target.port}{path}",
+        "elapsed_seconds": elapsed,
+    }
+
+
+def validate_readiness_layers(
+    runner: Runner,
+    service: ServiceMetadata,
+    target: NginxTarget,
+    *,
+    path: str = "/admin/login/",
+) -> dict[str, object]:
+    """Validate each layer before deployment so HTTP 000 is never misattributed."""
+    service_state = runner.run(
+        ["systemctl", "is-active", service.unit], check=False
+    )
+    if service_state.returncode or service_state.stdout.strip() != "active":
+        raise DeploymentError("Readiness layer failed: systemd service is not active")
+
+    socket_path = Path(target.upstream)
+    if not socket_path.is_absolute():
+        raise DeploymentError("Readiness layer failed: socket path is not absolute")
+    socket_state = runner.run(
+        ["test", "-S", str(socket_path)], user=service.user, check=False
+    )
+    if socket_state.returncode:
+        raise DeploymentError("Readiness layer failed: application socket is unavailable")
+
+    runner.run(["nginx", "-t"])
+    response = smoke_request(runner, target, path)
+    if response["status"] != "200":
+        raise DeploymentError(
+            "Readiness layer failed: application endpoint returned "
+            f"HTTP {response['status']}"
+        )
+    return {
+        "service": {"unit": service.unit, "status": "active"},
+        "socket": {"path": str(socket_path), "available": True},
+        "nginx": {"configuration": "valid", "connection": "local-via-127.0.0.1"},
+        "application": response,
+        "hostname_source": "active-nginx-config",
+        "attempts": 1,
+    }
 
 
 def run_manage_check(
@@ -708,9 +772,11 @@ def preflight(args: argparse.Namespace, runner: Runner) -> DeploymentContext:
 
     _, baseline_warning_codes = run_manage_check(runner, service)
     nginx_target = discover_and_validate_nginx(runner, service)
+    preflight_readiness = validate_readiness_layers(runner, service, nginx_target)
     baseline_smoke = {
-        path: smoke_request(runner, nginx_target, path)
-        for path in ("/", "/app/", "/admin/login/")
+        "/": smoke_request(runner, nginx_target, "/"),
+        "/app/": smoke_request(runner, nginx_target, "/app/"),
+        "/admin/login/": preflight_readiness["application"],
     }
     return DeploymentContext(
         service=service,
@@ -726,6 +792,7 @@ def preflight(args: argparse.Namespace, runner: Runner) -> DeploymentContext:
         runtime_hashes=runtime_hashes,
         baseline_smoke=baseline_smoke,
         baseline_warning_codes=baseline_warning_codes,
+        preflight_readiness=preflight_readiness,
     )
 
 
@@ -799,6 +866,8 @@ def targeted_rollback(
 ) -> None:
     cwd = context.service.working_directory
     user = context.service.user
+    if not user:
+        raise DeploymentError("Rollback refused: service user is empty")
     head = runner.run(["git", "rev-parse", "HEAD"], cwd=cwd, user=user).stdout.strip()
     if head not in {context.old_sha, context.target_sha}:
         raise DeploymentError("Rollback refused: HEAD is neither old nor target commit")
@@ -980,6 +1049,7 @@ def deployment_plan(args: argparse.Namespace, context: DeploymentContext) -> dic
         "service_user": context.service.user,
         "web_unit": context.service.unit,
         "vhost": context.nginx.server_name,
+        "preflight_readiness": context.preflight_readiness,
         "restart_units": restart_units,
         "steps": [
             "Preflight: discovery and environment validation",
