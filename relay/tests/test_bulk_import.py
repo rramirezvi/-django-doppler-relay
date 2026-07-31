@@ -215,12 +215,25 @@ class BulkImportServiceTests(TestCase):
     def test_same_import_version_cannot_be_repeated(self):
         bulk = self.make_bulk(b"email\na@example.com\n")
         BulkImportService(bulk).import_file()
+        before = list(
+            bulk.recipient_occurrences.values_list(
+                "idempotency_key", "payload_hash"
+            )
+        )
         with self.assertRaises(BulkImportError) as error:
             BulkImportService(bulk).import_file()
         self.assertEqual(error.exception.code, "import_already_started")
         self.assertEqual(bulk.recipient_occurrences.count(), 1)
         bulk.refresh_from_db()
         self.assertEqual(bulk.import_status, BulkSend.IMPORT_READY)
+        self.assertEqual(
+            list(
+                bulk.recipient_occurrences.values_list(
+                    "idempotency_key", "payload_hash"
+                )
+            ),
+            before,
+        )
 
     def test_explicit_next_import_version_preserves_prior_occurrences(self):
         bulk = self.make_bulk(b"email\na@example.com\n")
@@ -267,6 +280,12 @@ class BulkImportServiceTests(TestCase):
         self.assertEqual(bulk.recipient_occurrences.count(), 0)
         bulk.refresh_from_db()
         self.assertEqual(bulk.import_status, BulkSend.IMPORT_ERROR)
+
+        retried = BulkImportService(bulk).import_file()
+        bulk.refresh_from_db()
+        self.assertEqual(retried.total_rows, 2)
+        self.assertEqual(bulk.import_status, BulkSend.IMPORT_READY)
+        self.assertEqual(bulk.recipient_occurrences.count(), 2)
 
     def test_progress_can_be_reconstructed_from_database(self):
         bulk = self.make_bulk(

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import uuid
+from unittest.mock import patch
 
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import IntegrityError, transaction
@@ -18,6 +19,20 @@ class BulkSendRecipientModelTests(TestCase):
             engine_version=BulkSend.ENGINE_V2,
             **kwargs,
         )
+
+    def test_v2_requires_local_template_name_without_doppler_lookup(self):
+        with patch(
+            "relay.services.doppler_relay.DopplerRelayClient",
+            side_effect=AssertionError("Doppler must not be instantiated"),
+        ):
+            with self.assertRaisesRegex(ValueError, "template_name"):
+                BulkSend.objects.create(
+                    template_id="tpl",
+                    recipients_file=SimpleUploadedFile(
+                        "rows.csv", b"email\na@example.com\n"
+                    ),
+                    engine_version=BulkSend.ENGINE_V2,
+                )
 
     def make_occurrence(self, bulk, **kwargs):
         values = {

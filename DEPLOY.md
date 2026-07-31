@@ -839,3 +839,26 @@ sudo systemctl restart post-send-reports.timer
 # (opcional) si usas el procesador de pendientes
 sudo systemctl restart reports-process.timer
 ```
+# TD-02B: activacion canary de importacion V2
+
+El motor V2 permanece deshabilitado por defecto. Una importacion canary exige
+simultaneamente los dos flags activos, un `client_request_id` y un usuario
+incluidos de forma exacta en sus allowlists, entre 1 y el maximo configurado de
+filas, `send_now=False`, ausencia de programacion y lookup externo desactivado.
+El servidor cuenta las filas reales antes de persistir. Una configuracion vacia,
+duplicada, con comodines o ambigua falla de forma cerrada.
+
+Variables:
+
+- `BULK_PROCESSING_ENGINE_V2=False`
+- `BULK_PROCESSING_V2_CANARY_ENABLED=False`
+- `BULK_PROCESSING_V2_CANARY_REQUEST_IDS=`
+- `BULK_PROCESSING_V2_CANARY_USER_IDS=`
+- `BULK_PROCESSING_V2_CANARY_MAX_ROWS=20`
+- `BULK_PROCESSING_V2_ALLOW_EXTERNAL_TEMPLATE_LOOKUP=False`
+
+El canary es exclusivamente de importacion: no crea `BackgroundJob`, no envia,
+no programa y no consulta Doppler. `template_name` debe suministrarse
+explicitamente. La activacion productiva requiere un procedimiento separado y
+aprobacion operativa; desplegar este codigo debe mantener ambos flags en
+`False`.

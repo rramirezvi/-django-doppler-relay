@@ -13,12 +13,18 @@ from relay.admin import BulkSendForm
 from relay.services.doppler_relay import DopplerRelayError
 
 
-@override_settings(CACHES={
-    'default': {
-        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
-        'LOCATION': 'bulk-send-tests',
-    }
-})
+@override_settings(
+    CACHES={
+        'default': {
+            'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+            'LOCATION': 'bulk-send-tests',
+        }
+    },
+    # The form intentionally skips remote template loading when no account is
+    # configured. Pin a synthetic non-production account so this test measures
+    # cache behavior instead of depending on the developer's environment.
+    DOPPLER_RELAY={'ACCOUNT_ID': 1},
+)
 class BulkSendTemplateFormTests(TestCase):
     def setUp(self) -> None:
         self.factory = RequestFactory()

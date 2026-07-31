@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
+import logging
+import time as monotonic_time
 from datetime import datetime, time, timezone as dt_timezone
 from pathlib import Path
 
@@ -19,6 +22,7 @@ from django.views.decorators.http import require_GET, require_http_methods, requ
 
 from relay.models import BackgroundJob, BulkSend, UserEmailConfig
 from relay.services.bulk_import import BulkImportError, BulkImportService
+from relay.services.bulk_v2_canary import count_uploaded_csv_rows, evaluate_canary
 from relay.services.bulk_progress import get_bulk_import_progress
 from relay.services.doppler_relay import DopplerRelayClient
 from relay.services.operator_permissions import can_operate_bulk_sends
@@ -29,14 +33,20 @@ EMAIL_COLUMNS = {"email", "correo", "e-mail", "mail", "email_address", "correo_e
 TEMPLATES_CACHE_KEY = "operator-app:templates"
 TEMPLATES_CACHE_SECONDS = 300
 REPORT_MANUAL_MIN_AGE_MINUTES = 30
+logger = logging.getLogger(__name__)
 
 
 def _can_view_jobs(user) -> bool:
     return bool(user.is_active and user.is_staff)
 
 
-def _json_error(message: str, *, status: int = 400) -> JsonResponse:
-    return JsonResponse({"ok": False, "error": message}, status=status)
+def _json_error(
+    message: str, *, status: int = 400, code: str | None = None
+) -> JsonResponse:
+    payload = {"ok": False, "error": message}
+    if code:
+        payload["error_code"] = code
+    return JsonResponse(payload, status=status)
 
 
 def _normalize_template_items(payload) -> list[dict]:
@@ -366,6 +376,7 @@ def _bulk_send_create(request: HttpRequest) -> JsonResponse:
         return _json_error("No tiene permiso para crear envíos", status=403)
 
     template_id = (request.POST.get("template_id") or "").strip()
+    template_name = (request.POST.get("template_name") or "").strip()
     subject = (request.POST.get("subject") or "").strip()
     sender_id = (request.POST.get("sender_id") or "").strip()
     send_now = (request.POST.get("send_now") or "").lower() in {"1", "true", "yes", "on"}
@@ -387,15 +398,64 @@ def _bulk_send_create(request: HttpRequest) -> JsonResponse:
     }:
         return _json_error("engine_version no es valido.")
     if engine_version == BulkSend.ENGINE_V2:
-        if not getattr(settings, "BULK_PROCESSING_ENGINE_V2", False):
+        if not template_name or len(template_name) > 255:
             return _json_error(
-                "El motor v2 no esta habilitado para nuevas campanas.",
+                "template_name explicito y valido es obligatorio para v2.",
                 status=409,
+                code="template_name_required",
             )
-        if send_now or scheduled_at_raw:
+        configured_limit = getattr(
+            settings, "BULK_PROCESSING_V2_CANARY_MAX_ROWS", 20
+        )
+        try:
+            counter_limit = max(1, int(configured_limit))
+            total_rows = count_uploaded_csv_rows(
+                recipients_file, stop_after=counter_limit
+            )
+        except (csv.Error, UnicodeDecodeError, ValueError):
             return _json_error(
-                "TD-02A solo importa el ledger v2; el envio v2 aun no esta habilitado.",
+                "No fue posible contar las filas del CSV de forma segura.",
                 status=409,
+                code="canary_row_count_invalid",
+            )
+        decision = evaluate_canary(
+            engine_enabled=getattr(
+                settings, "BULK_PROCESSING_ENGINE_V2", False
+            ),
+            canary_enabled=getattr(
+                settings, "BULK_PROCESSING_V2_CANARY_ENABLED", False
+            ),
+            request_allowlist=getattr(
+                settings, "BULK_PROCESSING_V2_CANARY_REQUEST_IDS", ""
+            ),
+            user_allowlist=getattr(
+                settings, "BULK_PROCESSING_V2_CANARY_USER_IDS", ""
+            ),
+            max_rows=configured_limit,
+            allow_external_template_lookup=getattr(
+                settings,
+                "BULK_PROCESSING_V2_ALLOW_EXTERNAL_TEMPLATE_LOOKUP",
+                False,
+            ),
+            client_request_id=client_request_id,
+            user_id=getattr(request.user, "pk", None),
+            total_rows=total_rows,
+            send_now=send_now,
+            scheduled_at=scheduled_at_raw,
+            import_only=True,
+        )
+        request_fingerprint = hashlib.sha256(
+            client_request_id.encode("utf-8")
+        ).hexdigest()[:12]
+        logger.info(
+            "bulk_v2_canary decision=%s request=%s rows=%s external_calls=0",
+            decision.code,
+            request_fingerprint,
+            total_rows,
+        )
+        if not decision.allowed:
+            return _json_error(
+                decision.message, status=409, code=decision.code
             )
 
     if client_request_id:
@@ -449,6 +509,11 @@ def _bulk_send_create(request: HttpRequest) -> JsonResponse:
         bulk = BulkSend.objects.create(
             client_request_id=client_request_id or None,
             template_id=template_id,
+            template_name=(
+                template_name
+                if engine_version == BulkSend.ENGINE_V2
+                else None
+            ),
             subject=subject,
             variables=variables,
             recipients_file=recipients_file,
@@ -481,8 +546,9 @@ def _bulk_send_create(request: HttpRequest) -> JsonResponse:
         }, status=200)
 
     if engine_version == BulkSend.ENGINE_V2:
+        started_at = monotonic_time.monotonic()
         try:
-            BulkImportService(bulk, import_version=1).import_file()
+            result = BulkImportService(bulk, import_version=1).import_file()
         except BulkImportError as exc:
             return JsonResponse(
                 {
@@ -493,6 +559,17 @@ def _bulk_send_create(request: HttpRequest) -> JsonResponse:
                 },
                 status=400,
             )
+        logger.info(
+            "bulk_v2_import bulk_id=%s engine=v2 result=%s rows=%s "
+            "ledger=%s duration_ms=%s spool_bytes=%s background_jobs=0 "
+            "external_calls=0",
+            bulk.pk,
+            bulk.import_status,
+            result.total_rows,
+            bulk.recipient_occurrences.count(),
+            round((monotonic_time.monotonic() - started_at) * 1000),
+            getattr(recipients_file, "size", 0),
+        )
     elif send_now:
         _enqueue_bulk_send_once(bulk, request.user, message="Envio creado y encolado")
 

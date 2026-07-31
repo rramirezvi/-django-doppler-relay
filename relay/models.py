@@ -214,9 +214,18 @@ class BulkSend(models.Model):
                 raise ValueError(
                     "engine_version no puede cambiar una vez iniciada la importacion."
                 )
-        # Completar template_name de forma centralizada (best‑effort)
+        if self.engine_version == self.ENGINE_V2 and not self.template_name:
+            raise ValueError(
+                "template_name es obligatorio para el motor v2 y no puede "
+                "resolverse mediante servicios externos."
+            )
+        # Completar template_name de forma centralizada (best‑effort) solo en legacy.
         try:
-            if self.template_id and not self.template_name:
+            if (
+                self.engine_version == self.ENGINE_LEGACY
+                and self.template_id
+                and not self.template_name
+            ):
                 from django.conf import settings
                 from .services.doppler_relay import DopplerRelayClient
                 account = getattr(settings, 'DOPPLER_RELAY', {}) or {}

@@ -4,6 +4,7 @@ import csv
 import hashlib
 import io
 import json
+import logging
 import math
 import os
 import tempfile
@@ -36,6 +37,7 @@ BULK_RECIPIENT_NAMESPACE = uuid.UUID("ff03ea1c-8dc4-5e94-bcf8-c6c72b3b7ba1")
 SPOOL_FORMAT_VERSION = 1
 SPOOL_PREFIX = "bulk-import-"
 SPOOL_SUFFIX = ".jsonl"
+logger = logging.getLogger(__name__)
 
 
 class BulkImportError(ValueError):
@@ -240,12 +242,26 @@ class BulkImportService:
         spool_path: Path | None = None
         try:
             spool_path, total, valid, invalid = self._build_spool()
-            return self._persist_spool(
+            spool_bytes = spool_path.stat().st_size
+            logger.info(
+                "bulk_v2_spool bulk_id=%s rows=%s bytes=%s mode=0600",
+                self.bulk_send.pk,
+                total,
+                spool_bytes,
+            )
+            result = self._persist_spool(
                 spool_path,
                 total_rows=total,
                 valid_rows=valid,
                 invalid_rows=invalid,
             )
+            logger.info(
+                "bulk_v2_spool bulk_id=%s result=%s ledger=%s",
+                self.bulk_send.pk,
+                result.import_status,
+                result.total_rows,
+            )
+            return result
         except BulkImportError as exc:
             self._record_import_error(exc)
             raise
@@ -504,8 +520,10 @@ class BulkImportService:
                     "engine_changed", "La campana ya no utiliza engine v2."
                 )
             first_import = (
-                bulk.import_status == BulkSend.IMPORT_NOT_STARTED
+                bulk.import_status
+                in {BulkSend.IMPORT_NOT_STARTED, BulkSend.IMPORT_ERROR}
                 and bulk.import_version == 0
+                and not bulk.recipient_occurrences.exists()
             )
             explicit_next_version = (
                 self.allow_new_version
@@ -589,7 +607,11 @@ class BulkImportService:
         BulkSend.objects.filter(
             pk=self.bulk_send.pk,
             engine_version=BulkSend.ENGINE_V2,
-            import_status=BulkSend.IMPORT_NOT_STARTED,
+            import_status__in=[
+                BulkSend.IMPORT_NOT_STARTED,
+                BulkSend.IMPORT_ERROR,
+            ],
+            import_version=0,
         ).update(
             import_status=BulkSend.IMPORT_ERROR,
             import_finished_at=timezone.now(),

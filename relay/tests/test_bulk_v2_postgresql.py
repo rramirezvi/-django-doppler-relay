@@ -4,11 +4,13 @@ import threading
 import uuid
 from unittest import skipUnless
 
+from django.contrib.auth.models import Permission, User
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.db import IntegrityError, close_old_connections, connection, transaction
-from django.test import TransactionTestCase, override_settings
+from django.test import Client, TransactionTestCase, override_settings
+from django.urls import reverse
 
-from relay.models import BulkSend, BulkSendRecipient
+from relay.models import BackgroundJob, BulkSend, BulkSendRecipient
 from relay.services.bulk_import import BulkImportError, BulkImportService
 
 
@@ -58,6 +60,21 @@ class BulkV2PostgreSQLTests(TransactionTestCase):
                 )
         occurrence.refresh_from_db()
         self.assertEqual(occurrence.status, BulkSendRecipient.STATUS_PENDING)
+
+    def test_database_rejects_duplicate_client_request_id(self):
+        first = self.make_bulk()
+        first.client_request_id = "postgres-unique-request"
+        first.save(update_fields=["client_request_id"])
+        with self.assertRaises(IntegrityError), transaction.atomic():
+            BulkSend.objects.create(
+                client_request_id="postgres-unique-request",
+                template_id="tpl",
+                template_name="Template",
+                recipients_file=SimpleUploadedFile(
+                    "other.csv", b"email\nother@example.com\n"
+                ),
+                engine_version=BulkSend.ENGINE_V2,
+            )
 
     def test_database_rejects_zero_source_row_and_import_version(self):
         bulk = self.make_bulk()
@@ -194,3 +211,78 @@ class BulkV2PostgreSQLTests(TransactionTestCase):
             bulk.recipient_occurrences.values("source_row_number").distinct().count(),
             2,
         )
+
+    def test_concurrent_api_requests_with_same_client_request_id_are_idempotent(self):
+        user = User.objects.create_user(
+            "postgres-canary", password="unused", is_staff=True
+        )
+        user.user_permissions.add(
+            Permission.objects.get(
+                content_type__app_label="relay",
+                codename="change_bulksend",
+            )
+        )
+        barrier = threading.Barrier(2)
+        results: list[tuple[int, bool]] = []
+        errors: list[str] = []
+        lock = threading.Lock()
+
+        def create_same_canary():
+            close_old_connections()
+            client = Client()
+            client.force_login(User.objects.get(pk=user.pk))
+            barrier.wait(timeout=10)
+            try:
+                response = client.post(
+                    reverse("api_bulk_send_list"),
+                    {
+                        "template_id": "tpl",
+                        "template_name": "Controlled template",
+                        "engine_version": "v2",
+                        "send_now": "0",
+                        "client_request_id": "postgres-concurrent-canary",
+                        "recipients_file": SimpleUploadedFile(
+                            "rows.csv",
+                            b"email,name\na@example.com,A\nb@example.com,B\n",
+                        ),
+                    },
+                )
+                result = (
+                    response.status_code,
+                    bool(response.json().get("duplicate", False)),
+                )
+                with lock:
+                    results.append(result)
+            except Exception as exc:  # pragma: no cover - diagnostic boundary
+                with lock:
+                    errors.append(type(exc).__name__)
+            finally:
+                close_old_connections()
+
+        with override_settings(
+            BULK_PROCESSING_ENGINE_V2=True,
+            BULK_PROCESSING_V2_CANARY_ENABLED=True,
+            BULK_PROCESSING_V2_CANARY_REQUEST_IDS="postgres-concurrent-canary",
+            BULK_PROCESSING_V2_CANARY_USER_IDS=str(user.pk),
+            BULK_PROCESSING_V2_CANARY_MAX_ROWS=20,
+            BULK_PROCESSING_V2_ALLOW_EXTERNAL_TEMPLATE_LOOKUP=False,
+            CONN_MAX_AGE=0,
+        ):
+            threads = [
+                threading.Thread(target=create_same_canary),
+                threading.Thread(target=create_same_canary),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=20)
+
+        self.assertFalse(any(thread.is_alive() for thread in threads))
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(code for code, _ in results), [200, 201])
+        self.assertEqual(sum(duplicate for _, duplicate in results), 1)
+        bulk = BulkSend.objects.get(
+            client_request_id="postgres-concurrent-canary"
+        )
+        self.assertEqual(bulk.recipient_occurrences.count(), 2)
+        self.assertEqual(BackgroundJob.objects.count(), 0)
