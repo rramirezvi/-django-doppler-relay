@@ -4,6 +4,32 @@
 hardcoding the application directory, virtualenv, service user, or Nginx host.
 It does not modify Django application behavior.
 
+## TD-02C worker restart gate
+
+`td02c_worker_gate.py` classifies the worker state around the temporarily
+approved `django.service` restart used by an import-only canary. Production
+currently declares `Requires=django.service` in
+`doppler-background-jobs.service`, so a new worker PID is expected when Django
+is restarted and is not, by itself, an abort condition.
+
+Before the restart, capture the worker unit's `MainPID`, `NRestarts`,
+`ActiveState`, `SubState`, `ActiveEnterTimestamp`, `ExecMainStartTimestamp`,
+`ExecStart`/command and `Requires`, plus queued/running job counts, running job
+IDs and recent warning-or-higher journal entries. The precondition requires an
+active, idle worker with the expected `process_background_jobs` command.
+
+After the restart and application readiness, take at least two worker samples
+over a brief bounded stability window. The gate passes when the worker is
+active with one valid stable PID, the command and dependency are unchanged,
+`NRestarts` has stabilized, job counts did not grow, no queued/running/orphaned
+job exists, and no new critical journal message appeared. An unchanged healthy
+PID also passes. Missing/different `Requires`, a restart loop, ambiguous PID,
+unexpected work or errors fail closed with an explicit diagnostic.
+
+Readiness remains layered and independent: `django.service`, Gunicorn socket,
+Nginx/TLS, `GET /admin/login/ == 200`, then the worker stability gate. The gate
+never restarts a unit and never changes application or database state.
+
 ## Phases
 
 ### Preflight â€” before fast-forward
