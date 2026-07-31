@@ -30,6 +30,26 @@ Readiness remains layered and independent: `django.service`, Gunicorn socket,
 Nginx/TLS, `GET /admin/login/ == 200`, then the worker stability gate. The gate
 never restarts a unit and never changes application or database state.
 
+## TD-02C HTTP client contract
+
+The canary client must use the Nginx-discovered host with normal TLS and local
+`--resolve`, create a new authenticated session, and keep its cookie jar and
+curl configuration in a private temporary directory (`0700`, files `0600`).
+It obtains CSRF through a safe GET and confirms the cookie jar contains both
+`sessionid` and `csrftoken` without printing either value.
+
+The multipart POST sends `Host: app1.ramirezvi.com`, matching HTTPS `Origin`
+and `Referer`, `X-CSRFToken` from the cookie, the authenticated cookie jar, and
+`Accept: application/json`. It never uses `-k` or `--location`. Secret headers
+belong in a mode-0600 curl config rather than argv. Record only method, path,
+status, content type, sanitized Location, redirect count and duration; never
+record response bodies, tokens, cookies, credentials or recipient data.
+
+`201 application/json` is valid only for initial creation and `200
+application/json` only for the one authorized idempotent retry. Redirects,
+HTML and all other statuses abort without retry. The temporary workspace is
+deleted on success and failure.
+
 ## Phases
 
 ### Preflight â€” before fast-forward

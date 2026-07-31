@@ -3,6 +3,8 @@ from __future__ import annotations
 from unittest.mock import patch
 
 from django.contrib.auth.models import Permission, User
+from django.contrib.sessions.models import Session
+from django.conf import settings
 from django.core.files.uploadedfile import SimpleUploadedFile
 from django.middleware.csrf import _get_new_csrf_string
 from django.test import Client, TestCase, override_settings
@@ -84,6 +86,109 @@ class BulkV2ApiTests(TestCase):
         client.force_login(self.user)
         response = client.post(self.url, self.payload())
         self.assertEqual(response.status_code, 403)
+        self.assertEqual(BulkSend.objects.count(), 0)
+
+    @override_settings(BULK_PROCESSING_ENGINE_V2=True)
+    def test_https_csrf_with_matching_origin_reaches_view(self):
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.user)
+        token = _get_new_csrf_string()
+        client.cookies["csrftoken"] = token
+        response = client.post(
+            self.url,
+            self.payload(),
+            secure=True,
+            HTTP_HOST="app1.ramirezvi.com",
+            HTTP_ORIGIN="https://app1.ramirezvi.com",
+            HTTP_REFERER="https://app1.ramirezvi.com/app/",
+            HTTP_X_CSRFTOKEN=token,
+        )
+        self.assertEqual(response.status_code, 201)
+
+    @override_settings(BULK_PROCESSING_ENGINE_V2=True)
+    def test_https_csrf_with_matching_referer_reaches_view_without_origin(self):
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.user)
+        token = _get_new_csrf_string()
+        client.cookies["csrftoken"] = token
+        response = client.post(
+            self.url,
+            self.payload(),
+            secure=True,
+            HTTP_HOST="app1.ramirezvi.com",
+            HTTP_REFERER="https://app1.ramirezvi.com/app/",
+            HTTP_X_CSRFTOKEN=token,
+        )
+        self.assertEqual(response.status_code, 201)
+
+    @override_settings(BULK_PROCESSING_ENGINE_V2=True)
+    def test_https_without_origin_or_referer_is_csrf_403(self):
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.user)
+        token = _get_new_csrf_string()
+        client.cookies["csrftoken"] = token
+        response = client.post(
+            self.url,
+            self.payload(),
+            secure=True,
+            HTTP_HOST="app1.ramirezvi.com",
+            HTTP_X_CSRFTOKEN=token,
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(response["Content-Type"].split(";", 1)[0], "text/html")
+        self.assertEqual(BulkSend.objects.count(), 0)
+
+    @override_settings(BULK_PROCESSING_ENGINE_V2=True)
+    def test_https_wrong_origin_is_csrf_403(self):
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.user)
+        token = _get_new_csrf_string()
+        client.cookies["csrftoken"] = token
+        response = client.post(
+            self.url,
+            self.payload(),
+            secure=True,
+            HTTP_HOST="app1.ramirezvi.com",
+            HTTP_ORIGIN="https://wrong.invalid",
+            HTTP_X_CSRFTOKEN=token,
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(BulkSend.objects.count(), 0)
+
+    @override_settings(BULK_PROCESSING_ENGINE_V2=True)
+    def test_mismatched_csrf_cookie_and_header_is_403(self):
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.user)
+        client.cookies["csrftoken"] = _get_new_csrf_string()
+        response = client.post(
+            self.url,
+            self.payload(),
+            secure=True,
+            HTTP_HOST="app1.ramirezvi.com",
+            HTTP_ORIGIN="https://app1.ramirezvi.com",
+            HTTP_X_CSRFTOKEN=_get_new_csrf_string(),
+        )
+        self.assertEqual(response.status_code, 403)
+        self.assertEqual(BulkSend.objects.count(), 0)
+
+    def test_expired_session_redirect_is_visible_and_not_followed(self):
+        client = Client(enforce_csrf_checks=True)
+        client.force_login(self.user)
+        Session.objects.filter(session_key=client.session.session_key).delete()
+        token = _get_new_csrf_string()
+        client.cookies["csrftoken"] = token
+        response = client.post(
+            self.url,
+            self.payload(),
+            secure=True,
+            HTTP_HOST="app1.ramirezvi.com",
+            HTTP_ORIGIN="https://app1.ramirezvi.com",
+            HTTP_X_CSRFTOKEN=token,
+            follow=False,
+        )
+        self.assertEqual(response.status_code, 302)
+        self.assertFalse(hasattr(response, "redirect_chain"))
+        self.assertIn(settings.LOGIN_URL, response["Location"])
         self.assertEqual(BulkSend.objects.count(), 0)
 
     @override_settings(BULK_PROCESSING_ENGINE_V2=False)
