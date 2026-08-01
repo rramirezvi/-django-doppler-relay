@@ -269,11 +269,38 @@ el orden `d7de839...` → `1bc524a...` no coincide.
 
 ### B. Permitido durante el despliegue productivo
 
-- `py_compile` y la suite `ops`, que usa repositorios temporales;
+- `py_compile` exclusivamente mediante `ops/isolated_py_compile.py`. El helper
+  recibe el repositorio, el Python y el usuario descubiertos desde systemd,
+  crea un cache efimero `0700` fuera del checkout, lo asigna al usuario
+  operativo, establece `PYTHONPYCACHEPREFIX` solo para la compilacion y lo
+  elimina tanto en exito como en error. Verifica que `git status` y los `.pyc`
+  del checkout no cambien. El cache root debe ser absoluto, real, no symlink y
+  externo al repositorio; no se cambia ni elimina ningun `__pycache__`
+  preexistente;
+- la suite `ops`, que usa repositorios temporales;
 - `manage.py check` y `manage.py check --deploy`;
 - ORM read-only, readiness, GET autenticados y smoke tests no destructivos;
 - flags, allowlists y conteos read-only de jobs, BulkSend, ledger y
   EmailMessage.
+
+El gate invoca el helper con los valores descubiertos desde `django.service`,
+no con rutas o usuarios codificados:
+
+```bash
+python3 ops/isolated_py_compile.py \
+  --repository "$DISCOVERED_WORKING_DIRECTORY" \
+  --python "$DISCOVERED_PYTHON" \
+  --service-user "$DISCOVERED_SERVICE_USER" \
+  --cache-root /tmp \
+  ops/td02c_http_client.py \
+  ops/deployment_hardening.py \
+  ops/td02c_worker_gate.py
+```
+
+El proceso coordinador puede ejecutarse con privilegios administrativos solo
+para crear, asignar y finalmente borrar su directorio efimero. La compilacion,
+los snapshots Git y cualquier lectura del checkout se ejecutan como el usuario
+operativo descubierto. Un error de sintaxis conserva el exit code no-cero.
 
 ### C. Prohibido en producción
 
