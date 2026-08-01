@@ -3,6 +3,8 @@ from __future__ import annotations
 import io
 import os
 import stat
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -17,10 +19,12 @@ except ImportError:
 from ops.td02c_authenticated_get_runner import (
     Baseline,
     CurlOperations,
+    EXPECTED_MODULE,
     RunnerFailure,
     delete_exact_file,
     run,
     validate_credential_file,
+    validate_module_entrypoint,
 )
 from ops.td02c_http_client import AuthenticatedGetFailure
 from ops.deployment_hardening import NginxTarget
@@ -169,7 +173,7 @@ class RunnerOrchestrationTests(unittest.TestCase):
         self.assertIn("run_authenticated_get_gate(operations, log)", source)
 
     def test_wrapper_contract_is_only_the_versioned_runner(self):
-        command = "python ops/td02c_authenticated_get_runner.py --credential-file <0600-path>"
+        command = "python -m ops.td02c_authenticated_get_runner --credential-file <0600-path>"
         self.assertNotIn("curl", command); self.assertNotIn("manage.py shell", command)
 
     def test_session_is_identified_from_new_login_cookie(self):
@@ -214,6 +218,90 @@ class RunnerOrchestrationTests(unittest.TestCase):
         operations._curl = Mock(return_value=SimpleNamespace(status=200))
         with self.assertRaises(AuthenticatedGetFailure):
             operations.authenticate(workspace, NginxTarget("example.test", 443, "/run/django.sock", None))
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX module entrypoint")
+class ModuleEntrypointTests(unittest.TestCase):
+    def setUp(self):
+        self.repository = Path.cwd().resolve()
+        self.service = SimpleNamespace(
+            working_directory=self.repository,
+            user="app",
+        )
+
+    def validate(self, *, cwd=None, service=None, effective_user="app", path=None):
+        module = sys.modules[EXPECTED_MODULE]
+        with (
+            patch.object(module, "__package__", "ops"),
+            patch.object(module, "__spec__", SimpleNamespace(name=EXPECTED_MODULE)),
+            patch("ops.td02c_authenticated_get_runner.discover_service", return_value=service or self.service),
+            patch("ops.td02c_authenticated_get_runner.Path.cwd", return_value=cwd or self.repository),
+            patch("ops.td02c_authenticated_get_runner.os.geteuid", return_value=1000),
+            patch("ops.td02c_authenticated_get_runner.pwd.getpwuid", return_value=SimpleNamespace(pw_name=effective_user)),
+            patch.object(sys, "path", path or [str(self.repository)]),
+        ):
+            validate_module_entrypoint("django.service")
+
+    def test_module_entrypoint_valid_from_discovered_repository(self):
+        self.validate()
+
+    def test_package_is_importable_from_repository(self):
+        result = subprocess.run(
+            [sys.executable, "-c", "import ops.td02c_authenticated_get_runner"],
+            cwd=self.repository, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_module_help_executes_but_direct_file_is_unsupported(self):
+        module_result = subprocess.run(
+            [sys.executable, "-m", EXPECTED_MODULE, "--help"],
+            cwd=self.repository, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, check=False,
+        )
+        direct_result = subprocess.run(
+            [sys.executable, "ops/td02c_authenticated_get_runner.py", "--help"],
+            cwd=self.repository, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, check=False,
+        )
+        self.assertEqual(module_result.returncode, 0, module_result.stderr)
+        self.assertNotEqual(direct_result.returncode, 0)
+        self.assertIn("No module named 'ops'", direct_result.stderr)
+
+    def test_wrong_working_directory_fails_before_credential_or_http(self):
+        with tempfile.TemporaryDirectory() as other:
+            with self.assertRaisesRegex(RunnerFailure, "working_directory_mismatch"):
+                self.validate(cwd=Path(other).resolve())
+
+    def test_discovered_working_directory_mismatch_fails(self):
+        with tempfile.TemporaryDirectory() as other:
+            service = SimpleNamespace(working_directory=Path(other), user="app")
+            with self.assertRaisesRegex(RunnerFailure, "working_directory_mismatch"):
+                self.validate(service=service)
+
+    def test_wrong_effective_user_fails(self):
+        with self.assertRaisesRegex(RunnerFailure, "effective_user_mismatch"):
+            self.validate(effective_user="root")
+
+    def test_missing_repository_import_root_fails(self):
+        with tempfile.TemporaryDirectory() as other:
+            with self.assertRaisesRegex(RunnerFailure, "repository_not_importable"):
+                self.validate(path=[other])
+
+    def test_entrypoint_failure_does_not_read_credential_or_run_http_cleanup(self):
+        module = sys.modules[EXPECTED_MODULE]
+        stream = io.StringIO()
+        with (
+            patch("ops.td02c_authenticated_get_runner.validate_module_entrypoint", side_effect=RunnerFailure("effective_user_mismatch")),
+            patch("ops.td02c_authenticated_get_runner.run") as runner,
+            patch.object(module.sys, "stdout", stream),
+        ):
+            self.assertEqual(module.main(["--credential-file", "not-read"]), 1)
+        runner.assert_not_called()
+        diagnostic = stream.getvalue()
+        self.assertIn('"substage": "entrypoint_validated"', diagnostic)
+        self.assertIn('"classification": "effective_user_mismatch"', diagnostic)
+        self.assertNotIn("not-read", diagnostic)
 
 
 if __name__ == "__main__":

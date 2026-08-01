@@ -37,10 +37,37 @@ from ops.td02c_http_client import (
 
 EXPECTED_USER_ID = 1
 EXPECTED_USERNAME = "ricardo"
+EXPECTED_MODULE = "ops.td02c_authenticated_get_runner"
 
 
 class RunnerFailure(RuntimeError):
     pass
+
+
+def validate_module_entrypoint(service_unit: str) -> None:
+    """Require package-module execution from the discovered service checkout."""
+    if pwd is None:
+        raise RunnerFailure("posix_required")
+    if __package__ != "ops" or __spec__ is None or __spec__.name != EXPECTED_MODULE:
+        raise RunnerFailure("module_entrypoint_required")
+
+    service = discover_service(Runner(), service_unit)
+    repository = service.working_directory.resolve(strict=True)
+    current_directory = Path.cwd().resolve(strict=True)
+    if current_directory != repository:
+        raise RunnerFailure("working_directory_mismatch")
+    if not (repository / "ops" / "td02c_authenticated_get_runner.py").is_file():
+        raise RunnerFailure("runner_module_missing")
+
+    import_roots = {
+        Path(value or current_directory).resolve(strict=False) for value in sys.path
+    }
+    if repository not in import_roots:
+        raise RunnerFailure("repository_not_importable")
+
+    effective_user = pwd.getpwuid(os.geteuid()).pw_name
+    if effective_user != service.user:
+        raise RunnerFailure("effective_user_mismatch")
 
 
 @dataclass(frozen=True)
@@ -288,7 +315,23 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--service-unit", default="django.service")
     parser.add_argument("--credential-file", required=True, type=Path)
-    return run(parser.parse_args(argv))
+    args = parser.parse_args(argv)
+    log = SafeDiagnosticLog(sys.stdout)
+    started = time.monotonic()
+    try:
+        validate_module_entrypoint(args.service_unit)
+    except (OSError, RunnerFailure, subprocess.SubprocessError) as exc:
+        classification = str(exc)
+        allowed = {
+            "posix_required", "module_entrypoint_required",
+            "working_directory_mismatch", "runner_module_missing",
+            "repository_not_importable", "effective_user_mismatch",
+        }
+        emit(log, "entrypoint_validated", "FAIL", started,
+             classification if classification in allowed else "entrypoint_validation_failed")
+        return 1
+    emit(log, "entrypoint_validated", "PASS", started)
+    return run(args)
 
 
 if __name__ == "__main__":

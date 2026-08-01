@@ -327,16 +327,33 @@ Todo estado ambiguo termina en `unknown_failure`. La limpieza ocurre en
 `finally` y un fallo al eliminar temporales también aborta. El workspace se
 mantiene fuera del checkout y no se conserva como evidencia.
 
-La ejecución productiva se realiza exclusivamente mediante el adaptador
-versionado `ops/td02c_authenticated_get_runner.py`; un wrapper temporal no puede
+La ejecución productiva se realiza exclusivamente como módulo del paquete
+versionado `ops.td02c_authenticated_get_runner`; un wrapper temporal no puede
 reconstruir cookies, buscar sesiones ORM existentes ni ejecutar `curl` por su
 cuenta. Su única invocación permitida es equivalente a:
 
 ```bash
-python ops/td02c_authenticated_get_runner.py \
+cd /opt/app/django-doppler-relay
+.venv/bin/python -m ops.td02c_authenticated_get_runner \
   --service-unit django.service \
   --credential-file /ruta/temporal/externa/credential
 ```
+
+La ejecución directa `python ops/td02c_authenticated_get_runner.py` no está
+soportada y no admite fallback. Antes de solicitar la credencial, el runbook
+comprueba sin ejecutar el runner:
+
+```bash
+cd "$DISCOVERED_WORKING_DIRECTORY"
+"$DISCOVERED_PYTHON" -c "import ops.td02c_authenticated_get_runner"
+```
+
+Al iniciar con `-m`, el runner vuelve a comprobar fail-closed que el
+`WorkingDirectory` descubierto desde `django.service` coincide exactamente con
+el directorio actual, que el archivo del módulo existe, que la raíz del
+repositorio está en `sys.path` y que el usuario efectivo coincide con el usuario
+del servicio. No modifica `PYTHONPATH`, no introduce hacks de `sys.path` y no
+permite ejecución como otro usuario.
 
 El archivo contiene solo la contraseña técnica, debe ser absoluto, externo al
 checkout, no symlink, propiedad del usuario operativo y modo `0600`. El runner
