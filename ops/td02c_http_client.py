@@ -16,11 +16,20 @@ from pathlib import Path
 from typing import Iterator
 from urllib.parse import urlsplit, urlunsplit
 
+from ops.deployment_hardening import NginxTarget, discover_nginx_target
 
-CANARY_HOST = "app1.ramirezvi.com"
-CANARY_URL = f"https://{CANARY_HOST}/api/bulk-sends/"
-CANARY_ORIGIN = f"https://{CANARY_HOST}"
-CANARY_REFERER = f"https://{CANARY_HOST}/app/"
+
+def discover_canary_target(
+    nginx_config: str,
+    bind_path: str,
+    *,
+    asserted_hostname: str | None = None,
+) -> NginxTarget:
+    """Return the unique target selected by the deployment preflight rules."""
+    target = discover_nginx_target(nginx_config, bind_path)
+    if asserted_hostname is not None and asserted_hostname != target.server_name:
+        raise ValueError("asserted hostname does not match validated Nginx target")
+    return target
 
 
 @dataclass(frozen=True)
@@ -83,6 +92,7 @@ def secure_cookie_workspace(prefix: str = "td02c-http-") -> Iterator[Path]:
 def write_post_curl_config(
     directory: Path,
     *,
+    target: NginxTarget,
     csrf_token: str,
     csv_path: Path,
 ) -> Path:
@@ -94,15 +104,20 @@ def write_post_curl_config(
         raise ValueError("cookie jar must exist with mode 0600")
     if not csrf_token:
         raise ValueError("csrf token is required")
+    host = target.server_name
+    port = target.port
+    origin = f"https://{host}" if port == 443 else f"https://{host}:{port}"
+    url = f"{origin}/api/bulk-sends/"
+    referer = f"{origin}/app/"
     config = directory / "post.curl.conf"
     lines = [
-        f'url = "{CANARY_URL}"',
-        f'resolve = "{CANARY_HOST}:443:127.0.0.1"',
+        f'url = "{url}"',
+        f'resolve = "{host}:{port}:127.0.0.1"',
         f'cookie = "{cookie_jar}"',
         f'cookie-jar = "{cookie_jar}"',
-        f'header = "Host: {CANARY_HOST}"',
-        f'header = "Origin: {CANARY_ORIGIN}"',
-        f'header = "Referer: {CANARY_REFERER}"',
+        f'header = "Host: {host}"',
+        f'header = "Origin: {origin}"',
+        f'header = "Referer: {referer}"',
         f'header = "X-CSRFToken: {csrf_token}"',
         'header = "Accept: application/json"',
         'request = "POST"',

@@ -32,14 +32,19 @@ never restarts a unit and never changes application or database state.
 
 ## TD-02C HTTP client contract
 
-The canary client must use the Nginx-discovered host with normal TLS and local
+The canary client receives the unique validated `NginxTarget` produced by the
+same active-configuration discovery used by deployment preflight. It rejects
+zero or multiple candidates, wildcards, Nginx variables, invalid names, and
+any separately asserted hostname that differs from that target. URL, Host,
+SNI, Origin, Referer and local `--resolve` are all derived from this single
+value. The client then uses normal TLS and local
 `--resolve`, create a new authenticated session, and keep its cookie jar and
 curl configuration in a private temporary directory (`0700`, files `0600`).
 It obtains CSRF through a safe GET and confirms the cookie jar contains both
 `sessionid` and `csrftoken` without printing either value.
 
-The multipart POST sends `Host: app1.ramirezvi.com`, matching HTTPS `Origin`
-and `Referer`, `X-CSRFToken` from the cookie, the authenticated cookie jar, and
+The multipart POST sends the discovered Host, matching HTTPS `Origin` and
+`Referer`, `X-CSRFToken` from the cookie, the authenticated cookie jar, and
 `Accept: application/json`. It never uses `-k` or `--location`. Secret headers
 belong in a mode-0600 curl config rather than argv. Record only method, path,
 status, content type, sanitized Location, redirect count and duration; never
