@@ -298,6 +298,31 @@ el orden `d7de839...` → `1bc524a...` no coincide.
 - flags, allowlists y conteos read-only de jobs, BulkSend, ledger y
   EmailMessage.
 
+#### Diagnóstico del GET autenticado TD-02C
+
+El GET autenticado permitido debe ejecutarse mediante
+`run_authenticated_get_gate` de `ops.td02c_http_client`. El coordinador recibe
+operaciones secret-bearing inyectadas y emite una línea JSON sanitizada por
+subetapa: creación del workspace `0700`, cookie jar `0600`, descubrimiento de
+vhost, preparación TLS/resolución local, GET de login, autenticación, presencia
+de `sessionid` y `csrftoken`, GET autenticado, clasificación de respuesta y
+limpieza final.
+
+Cada registro contiene únicamente subetapa, PASS/FAIL, exit code, duración y
+clasificación segura. Los registros HTTP se limitan a método, ruta, status,
+Content-Type, Location sin query/fragment/credenciales, redirects,
+`ssl_verify_result` y tiempo total. Nunca se registran cuerpos, cookies,
+tokens, credenciales, formularios ni headers sensibles. La representación del
+comando se construye antes de ejecutar con marcadores `<redacted>` y no se
+reconstruye desde argv después de un fallo.
+
+El gate no sigue redirects. Un 302 hacia login se clasifica como
+`authentication_failed`; TLS, conexión, cookies ausentes, status inesperado,
+Content-Type inesperado y fallos de limpieza tienen clasificaciones distintas.
+Todo estado ambiguo termina en `unknown_failure`. La limpieza ocurre en
+`finally` y un fallo al eliminar temporales también aborta. El workspace se
+mantiene fuera del checkout y no se conserva como evidencia.
+
 El gate invoca el helper con los valores descubiertos desde `django.service`,
 no con rutas o usuarios codificados:
 
