@@ -81,10 +81,13 @@ class StageDiagnostic:
 
     def as_safe_dict(self) -> dict[str, object]:
         value: dict[str, object] = {
+            "phase": "authenticated_get",
+            "substage": self.stage,
             "stage": self.stage,
             "result": self.result,
             "exit_code": self.exit_code,
             "duration_seconds": round(self.duration_seconds, 6),
+            "classification": self.error_class,
             "error_class": self.error_class,
         }
         if self.http is not None:
@@ -160,13 +163,28 @@ def _response_error(metadata: ResponseMetadata, *, authenticated: bool) -> str:
         return "redirect_detected"
     if metadata.status != 200:
         return "unexpected_status"
-    allowed_content_types = {"application/json"} if authenticated else {
-        "text/html",
-        "application/json",
-    }
+    allowed_content_types = (
+        ({"text/html"} if metadata.path == "/app/" else {"application/json"})
+        if authenticated
+        else {"text/html", "application/json"}
+    )
     if content_type not in allowed_content_types:
         return "unexpected_content_type"
     return ""
+
+
+def _login_post_error(metadata: ResponseMetadata) -> str:
+    """Accept only Django's explicit, unfollowed successful login redirect."""
+    if metadata.ssl_verify_result != 0:
+        return "tls_failed"
+    if metadata.status == 0:
+        return "connection_failed"
+    if metadata.redirects:
+        return "redirect_detected"
+    location = urlsplit(sanitize_location(metadata.location)).path
+    if metadata.status == 302 and location == "/app/":
+        return ""
+    return "authentication_failed"
 
 
 def run_authenticated_get_gate(
@@ -202,19 +220,19 @@ def run_authenticated_get_gate(
         manager = (workspace_factory or secure_cookie_workspace)()
         workspace = stage("workspace_created", lambda: manager.__enter__(), "session_creation_failed")  # type: ignore[assignment]
         manager_entered = True
-        stage("cookie_jar_protected", lambda: _validate_workspace(workspace), "session_creation_failed")
-        target = stage("vhost_discovered", operations.discover_target, "connection_failed")
-        stage("tls_and_local_resolution_prepared", lambda: operations.prepare_tls(target), "tls_failed")  # type: ignore[arg-type]
-        login = _http_stage("login_get", lambda: operations.get_login(workspace, target), log, authenticated=False, fallback="login_page_failed", command=sanitized_command("GET", "/admin/login/", target.server_name))  # type: ignore[arg-type,union-attr]
+        stage("cookie_jar_created", lambda: _validate_workspace(workspace), "session_creation_failed")
+        target = stage("nginx_target_discovered", operations.discover_target, "connection_failed")
+        stage("tls_resolution_prepared", lambda: operations.prepare_tls(target), "tls_failed")  # type: ignore[arg-type]
+        login = _http_stage("login_page_loaded", lambda: operations.get_login(workspace, target), log, authenticated=False, fallback="login_page_failed", command=sanitized_command("GET", "/admin/login/", target.server_name))  # type: ignore[arg-type,union-attr]
         if _response_error(login, authenticated=False):
             raise AuthenticatedGetFailure(_response_error(login, authenticated=False))
-        auth = _http_stage("authentication", lambda: operations.authenticate(workspace, target), log, authenticated=False, fallback="authentication_failed", command=sanitized_command("POST", "/admin/login/", target.server_name))  # type: ignore[arg-type,union-attr]
-        error = _response_error(auth, authenticated=False)
+        auth = _http_stage("login_post_completed", lambda: operations.authenticate(workspace, target), log, authenticated=False, fallback="authentication_failed", command=sanitized_command("POST", "/admin/login/", target.server_name), classifier=_login_post_error)  # type: ignore[arg-type,union-attr]
+        error = _login_post_error(auth)
         if error:
             raise AuthenticatedGetFailure("authentication_failed" if error == "redirect_detected" else error)
-        stage("sessionid_present", lambda: _require_cookie(operations, workspace, "sessionid", "session_cookie_missing"), "session_cookie_missing")
-        stage("csrftoken_present", lambda: _require_cookie(operations, workspace, "csrftoken", "csrf_cookie_missing"), "csrf_cookie_missing")
-        response = _http_stage("authenticated_get", lambda: operations.authenticated_get(workspace, target), log, authenticated=True, fallback="authenticated_get_failed", command=sanitized_command("GET", "/api/bulk-sends/", target.server_name))  # type: ignore[arg-type,union-attr]
+        stage("authentication_confirmed", lambda: _require_cookie(operations, workspace, "sessionid", "session_cookie_missing"), "session_cookie_missing")
+        stage("csrf_cookie_present", lambda: _require_cookie(operations, workspace, "csrftoken", "csrf_cookie_missing"), "csrf_cookie_missing")
+        response = _http_stage("authenticated_get_completed", lambda: operations.authenticated_get(workspace, target), log, authenticated=True, fallback="authenticated_get_failed", command=sanitized_command("GET", "/app/", target.server_name))  # type: ignore[arg-type,union-attr]
         error = _response_error(response, authenticated=True)
         if error:
             log.emit(StageDiagnostic("response_classified", "FAIL", 1, 0.0, error, response))
@@ -230,12 +248,12 @@ def run_authenticated_get_gate(
         if manager is not None and manager_entered:
             try:
                 manager.__exit__(None, None, None)
-                log.emit(StageDiagnostic("temporaries_removed", "PASS", 0, time.monotonic() - started))
+                log.emit(StageDiagnostic("temporary_files_cleanup_completed", "PASS", 0, time.monotonic() - started))
             except Exception:
-                log.emit(StageDiagnostic("temporaries_removed", "FAIL", 1, time.monotonic() - started, "cleanup_failed"))
+                log.emit(StageDiagnostic("temporary_files_cleanup_completed", "FAIL", 1, time.monotonic() - started, "cleanup_failed"))
                 raise AuthenticatedGetFailure("cleanup_failed") from None
         elif manager is not None:
-            log.emit(StageDiagnostic("temporaries_removed", "PASS", 0, time.monotonic() - started))
+            log.emit(StageDiagnostic("temporary_files_cleanup_completed", "PASS", 0, time.monotonic() - started))
 
 
 def _http_stage(
@@ -246,6 +264,7 @@ def _http_stage(
     authenticated: bool,
     fallback: str,
     command: str,
+    classifier: Callable[[ResponseMetadata], str] | None = None,
 ) -> ResponseMetadata:
     started = time.monotonic()
     try:
@@ -257,7 +276,7 @@ def _http_stage(
         error = AuthenticatedGetFailure(fallback, exit_code=getattr(exc, "returncode", 1))
         log.emit(StageDiagnostic(name, "FAIL", error.exit_code, time.monotonic() - started, error.error_class, command=command))
         raise error from None
-    error = _response_error(metadata, authenticated=authenticated)
+    error = (classifier or (lambda item: _response_error(item, authenticated=authenticated)))(metadata)
     log.emit(StageDiagnostic(name, "PASS" if not error else "FAIL", 0 if not error else 1, time.monotonic() - started, error, metadata, command))
     return metadata
 

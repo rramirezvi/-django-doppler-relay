@@ -319,12 +319,34 @@ tokens, credenciales, formularios ni headers sensibles. La representación del
 comando se construye antes de ejecutar con marcadores `<redacted>` y no se
 reconstruye desde argv después de un fallo.
 
-El gate no sigue redirects. Un 302 hacia login se clasifica como
-`authentication_failed`; TLS, conexión, cookies ausentes, status inesperado,
+El gate no sigue redirects. El único redirect aceptado es el `302` explícito y
+no seguido de `POST /admin/login/` hacia `/app/`; cualquier otro 302 se clasifica
+como `authentication_failed`; TLS, conexión, cookies ausentes, status inesperado,
 Content-Type inesperado y fallos de limpieza tienen clasificaciones distintas.
 Todo estado ambiguo termina en `unknown_failure`. La limpieza ocurre en
 `finally` y un fallo al eliminar temporales también aborta. El workspace se
 mantiene fuera del checkout y no se conserva como evidencia.
+
+La ejecución productiva se realiza exclusivamente mediante el adaptador
+versionado `ops/td02c_authenticated_get_runner.py`; un wrapper temporal no puede
+reconstruir cookies, buscar sesiones ORM existentes ni ejecutar `curl` por su
+cuenta. Su única invocación permitida es equivalente a:
+
+```bash
+python ops/td02c_authenticated_get_runner.py \
+  --service-unit django.service \
+  --credential-file /ruta/temporal/externa/credential
+```
+
+El archivo contiene solo la contraseña técnica, debe ser absoluto, externo al
+checkout, no symlink, propiedad del usuario operativo y modo `0600`. El runner
+lo elimina verificando device/inode. El usuario está fijado por contrato a
+`user_id=1`, `username=ricardo`. Tras validar actividad, staff y permisos, el
+runner toma baselines de conteos, ejecuta `GET /admin/login/`, el único POST
+permitido `POST /admin/login/`, y `GET /app/`. Identifica la nueva sesión por la
+cookie obtenida y la diferencia frente al baseline, elimina solamente esa clave
+y verifica que sesiones preexistentes y datos funcionales no cambien. Si la
+credencial falta o la sesión es ambigua, aborta sin buscar sesiones existentes.
 
 El gate invoca el helper con los valores descubiertos desde `django.service`,
 no con rutas o usuarios codificados:

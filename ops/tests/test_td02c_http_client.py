@@ -28,8 +28,8 @@ from ops.td02c_http_client import (
 class FakeAuthenticatedOperations:
     def __init__(self, **changes):
         self.login = metadata(method="GET", path="/admin/login/", status=200, content_type="text/html")
-        self.auth = metadata(method="POST", path="/admin/login/", status=200, content_type="text/html")
-        self.get = metadata(method="GET", path="/api/bulk-sends/", status=200)
+        self.auth = metadata(method="POST", path="/admin/login/", status=302, content_type="text/html", location="https://canary.example.com/app/")
+        self.get = metadata(method="GET", path="/app/", status=200, content_type="text/html")
         self.cookies = {"sessionid", "csrftoken"}
         self.fail_at = ""
         self.exit_code = 1
@@ -240,7 +240,7 @@ class AuthenticatedGetDiagnosticTests(unittest.TestCase):
         self.assertEqual(caught.exception.error_class, expected)
         self.assertEqual(caught.exception.exit_code, exit_code)
         self.assertFalse(harness.workspace.exists())
-        self.assertEqual(harness.json_lines()[-1]["stage"], "temporaries_removed")
+        self.assertEqual(harness.json_lines()[-1]["stage"], "temporary_files_cleanup_completed")
         self.assertEqual(harness.json_lines()[-1]["result"], "PASS")
         return harness
 
@@ -253,25 +253,25 @@ class AuthenticatedGetDiagnosticTests(unittest.TestCase):
             stages,
             [
                 "workspace_created",
-                "cookie_jar_protected",
-                "vhost_discovered",
-                "tls_and_local_resolution_prepared",
-                "login_get",
-                "authentication",
-                "sessionid_present",
-                "csrftoken_present",
-                "authenticated_get",
+                "cookie_jar_created",
+                "nginx_target_discovered",
+                "tls_resolution_prepared",
+                "login_page_loaded",
+                "login_post_completed",
+                "authentication_confirmed",
+                "csrf_cookie_present",
+                "authenticated_get_completed",
                 "response_classified",
-                "temporaries_removed",
+                "temporary_files_cleanup_completed",
             ],
         )
         self.assertTrue(all(record["result"] == "PASS" for record in records))
-        http = next(record["http"] for record in records if record["stage"] == "authenticated_get")
-        command = next(record["command"] for record in records if record["stage"] == "authenticated_get")
+        http = next(record["http"] for record in records if record["stage"] == "authenticated_get_completed")
+        command = next(record["command"] for record in records if record["stage"] == "authenticated_get_completed")
         self.assertEqual(http["method"], "GET")
-        self.assertEqual(http["path"], "/api/bulk-sends/")
+        self.assertEqual(http["path"], "/app/")
         self.assertEqual(http["status"], 200)
-        self.assertEqual(http["content_type"], "application/json; charset=utf-8")
+        self.assertEqual(http["content_type"], "text/html")
         self.assertEqual(http["redirects"], 0)
         self.assertEqual(http["ssl_verify_result"], 0)
         self.assertEqual(http["time_total"], 0.1)
@@ -296,7 +296,7 @@ class AuthenticatedGetDiagnosticTests(unittest.TestCase):
         self.assertEqual(caught.exception.error_class, "session_creation_failed")
         self.assertEqual(harness.json_lines()[0]["stage"], "workspace_created")
         self.assertEqual(harness.json_lines()[0]["result"], "FAIL")
-        self.assertEqual(harness.json_lines()[-1]["stage"], "temporaries_removed")
+        self.assertEqual(harness.json_lines()[-1]["stage"], "temporary_files_cleanup_completed")
 
     def test_symlink_workspace_is_rejected(self):
         if os.name == "nt":
@@ -346,7 +346,7 @@ class AuthenticatedGetDiagnosticTests(unittest.TestCase):
     def test_expired_session_redirect_is_authentication_failure(self):
         response = metadata(method="GET", status=302, content_type="text/html", location="https://canary.example.com/admin/login/?next=/api/private")
         harness = self.assert_failure(FakeAuthenticatedOperations(get=response), "authentication_failed")
-        record = next(item for item in harness.json_lines() if item["stage"] == "authenticated_get")
+        record = next(item for item in harness.json_lines() if item["stage"] == "authenticated_get_completed")
         self.assertEqual(record["http"]["location"], "https://canary.example.com/admin/login/")
         self.assertEqual(record["http"]["redirects"], 0)
 
@@ -359,7 +359,7 @@ class AuthenticatedGetDiagnosticTests(unittest.TestCase):
     def test_tls_failure_preserves_stage_and_exit_code(self):
         harness = self.assert_failure(FakeAuthenticatedOperations(fail_at="tls", exit_code=60), "tls_failed", exit_code=60)
         failed = next(item for item in harness.json_lines() if item["result"] == "FAIL")
-        self.assertEqual(failed["stage"], "tls_and_local_resolution_prepared")
+        self.assertEqual(failed["stage"], "tls_resolution_prepared")
         self.assertEqual(failed["exit_code"], 60)
 
     def test_connection_failure(self):
@@ -372,9 +372,9 @@ class AuthenticatedGetDiagnosticTests(unittest.TestCase):
                 self.assert_failure(FakeAuthenticatedOperations(get=metadata(method="GET", status=status)), "unexpected_status")
 
     def test_unexpected_content_type_and_html_are_rejected(self):
-        for content_type in ("text/plain", "text/html"):
+        for content_type in ("text/plain", "image/png"):
             with self.subTest(content_type=content_type):
-                self.assert_failure(FakeAuthenticatedOperations(get=metadata(method="GET", status=200, content_type=content_type)), "unexpected_content_type")
+                self.assert_failure(FakeAuthenticatedOperations(get=metadata(method="GET", path="/app/", status=200, content_type=content_type)), "unexpected_content_type")
 
     def test_authenticated_get_execution_failure(self):
         self.assert_failure(FakeAuthenticatedOperations(fail_at="get", exit_code=7), "authenticated_get_failed", exit_code=7)
