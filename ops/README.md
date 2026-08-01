@@ -30,6 +30,21 @@ Readiness remains layered and independent: `django.service`, Gunicorn socket,
 Nginx/TLS, `GET /admin/login/ == 200`, then the worker stability gate. The gate
 never restarts a unit and never changes application or database state.
 
+## TD-02C effective-settings gate
+
+`td02c_settings_gate.py` validates the six effective canary settings after
+activation and again after deactivation. It uses the same
+`relay.services.bulk_v2_canary.normalize_allowlist` function as the production
+policy instead of comparing raw setting strings with Python sets.
+
+The active gate accepts only the canonical raw values
+`td02c-canary-import-v1-20260731` and `1`, whose normalized forms must be
+exactly `{td02c-canary-import-v1-20260731}` and `{1}`. Whitespace, duplicates,
+wildcards, prefixes, extra entries and invalid/non-positive user IDs fail
+closed. The inactive gate requires both raw allowlists and both normalized
+allowlists to be empty. Both modes also validate the engine/canary flags,
+`max_rows=20`, and external template lookup disabled.
+
 ## TD-02C HTTP client contract
 
 The canary client receives the unique validated `NginxTarget` produced by the

@@ -13,7 +13,7 @@ class CanaryDecision:
     message: str
 
 
-def _normalize_allowlist(
+def normalize_allowlist(
     value: str | Iterable[Any], *, integer: bool = False
 ) -> tuple[tuple[str | int, ...], str | None]:
     raw = value.split(",") if isinstance(value, str) else list(value or ())
@@ -60,8 +60,8 @@ def evaluate_canary(
         return CanaryDecision(
             False, "canary_disabled", "La activacion canary no esta habilitada."
         )
-    request_ids, request_error = _normalize_allowlist(request_allowlist)
-    user_ids, user_error = _normalize_allowlist(user_allowlist, integer=True)
+    request_ids, request_error = normalize_allowlist(request_allowlist)
+    user_ids, user_error = normalize_allowlist(user_allowlist, integer=True)
     try:
         row_limit = int(max_rows)
     except (TypeError, ValueError):
