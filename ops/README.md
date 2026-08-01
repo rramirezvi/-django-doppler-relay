@@ -285,13 +285,16 @@ el orden `d7de839...` → `1bc524a...` no coincide.
 ### B. Permitido durante el despliegue productivo
 
 - `py_compile` exclusivamente mediante `ops/isolated_py_compile.py`. El helper
-  recibe el repositorio, el Python y el usuario descubiertos desde systemd,
-  crea un cache efimero `0700` fuera del checkout, lo asigna al usuario
-  operativo, establece `PYTHONPYCACHEPREFIX` solo para la compilacion y lo
-  elimina tanto en exito como en error. Verifica que `git status` y los `.pyc`
-  del checkout no cambien. El cache root debe ser absoluto, real, no symlink y
-  externo al repositorio; no se cambia ni elimina ningun `__pycache__`
-  preexistente;
+  recibe el repositorio, el Python y el usuario descubiertos desde systemd.
+  Crea directamente como ese usuario un workspace unico
+  `td02c-pycache-XXXXXXXXXX`, modo `0700`, bajo un directorio temporal absoluto,
+  real, no symlink y externo al checkout. No reutiliza un cache root fijo. Antes
+  de compilar prueba efectivamente crear, escribir, leer y borrar dentro del
+  workspace. `PYTHONPYCACHEPREFIX` apunta solo a ese workspace. El helper
+  verifica owner, grupo, modo, `git status` y que no aparezcan `.pyc` en el
+  checkout, y elimina de forma fail-closed exactamente el workspace creado en
+  exito, error, excepcion o señal terminable. No cambia ni elimina ningun
+  `__pycache__` preexistente;
 - la suite `ops`, que usa repositorios temporales;
 - `manage.py check` y `manage.py check --deploy`;
 - ORM read-only, readiness, GET autenticados y smoke tests no destructivos;
@@ -337,10 +340,13 @@ python3 ops/isolated_py_compile.py \
   ops/td02c_worker_gate.py
 ```
 
-El proceso coordinador puede ejecutarse con privilegios administrativos solo
-para crear, asignar y finalmente borrar su directorio efimero. La compilacion,
-los snapshots Git y cualquier lectura del checkout se ejecutan como el usuario
-operativo descubierto. Un error de sintaxis conserva el exit code no-cero.
+`--cache-root` designa solo el padre temporal seguro; el workspace hijo se crea
+con `mktemp` como el usuario operativo y nunca usa `/tmp/td02c-pycache-root` ni
+otro nombre fijo. La compilacion, la prueba efectiva de escritura, los snapshots
+Git y la limpieza se ejecutan como el usuario operativo descubierto. Un error
+de sintaxis conserva el exit code no-cero. Solo se registran creación y metadata
+no sensible, resultado del probe/compilación y cleanup; nunca el contenido del
+cache.
 
 ### C. Prohibido en producción
 

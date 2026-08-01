@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
-import shutil
+import signal
 import stat
 import subprocess
-import tempfile
 from pathlib import Path
 from typing import Sequence
 
@@ -20,6 +20,24 @@ except ImportError:  # pragma: no cover - operational helper is Linux-only
 
 class PyCompileValidationError(RuntimeError):
     pass
+
+
+@contextlib.contextmanager
+def _cleanup_on_termination():
+    """Turn normal termination signals into exceptions so cleanup runs."""
+    previous = {}
+
+    def interrupt(signum, _frame):
+        raise InterruptedError(f"interrupted by signal {signum}")
+
+    for signum in (signal.SIGINT, signal.SIGTERM, signal.SIGHUP):
+        previous[signum] = signal.getsignal(signum)
+        signal.signal(signum, interrupt)
+    try:
+        yield
+    finally:
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)
 
 
 def _inside(path: Path, parent: Path) -> bool:
@@ -98,6 +116,137 @@ def _checkout_bytecode(repository: Path) -> set[Path]:
     return {path.relative_to(repository) for path in repository.rglob("*.pyc")}
 
 
+def _account(service_user: str):
+    if pwd is None:
+        raise PyCompileValidationError("operational py_compile requires POSIX")
+    try:
+        return pwd.getpwnam(service_user)
+    except KeyError as exc:
+        raise PyCompileValidationError("operational user does not exist") from exc
+
+
+def _validate_workspace(
+    *,
+    repository: Path,
+    workspace: Path,
+    service_user: str,
+    cache_root: Path | None = None,
+) -> Path:
+    """Validate the exact workspace created for this invocation."""
+    if not workspace.is_absolute() or workspace.is_symlink():
+        raise PyCompileValidationError("temporary cache workspace is ambiguous")
+    resolved = workspace.resolve(strict=True)
+    if not resolved.is_dir() or _inside(resolved, repository):
+        raise PyCompileValidationError("temporary cache workspace is unsafe")
+    if cache_root is not None and resolved.parent != cache_root:
+        raise PyCompileValidationError("temporary cache workspace escaped its parent")
+    metadata = resolved.stat(follow_symlinks=False)
+    account = _account(service_user)
+    if metadata.st_uid != account.pw_uid or metadata.st_gid != account.pw_gid:
+        raise PyCompileValidationError("temporary cache owner or group is unexpected")
+    if stat.S_IMODE(metadata.st_mode) != 0o700:
+        raise PyCompileValidationError("temporary cache mode is not 0700")
+    return resolved
+
+
+def _write_probe(workspace: Path, service_user: str) -> None:
+    probe = workspace / ".write-probe"
+    result = _run_as_user(
+        [
+            "sh",
+            "-c",
+            'set -eu; umask 077; printf probe > "$1"; test "$(cat "$1")" = probe; rm -- "$1"',
+            "td02c-write-probe",
+            str(probe),
+        ],
+        cwd=workspace,
+        user=service_user,
+    )
+    if result.returncode or probe.exists():
+        raise PyCompileValidationError("effective cache write/read/delete probe failed")
+
+
+def _remove_workspace(
+    *,
+    repository: Path,
+    workspace: Path,
+    service_user: str,
+    cache_root: Path,
+    identity: tuple[int, int],
+) -> None:
+    workspace = _validate_workspace(
+        repository=repository,
+        workspace=workspace,
+        service_user=service_user,
+        cache_root=cache_root,
+    )
+    metadata = workspace.stat(follow_symlinks=False)
+    if (metadata.st_dev, metadata.st_ino) != identity:
+        raise PyCompileValidationError("temporary cache workspace identity changed")
+    if not workspace.name.startswith("td02c-pycache-"):
+        raise PyCompileValidationError("refusing to remove unexpected cache workspace")
+    result = _run_as_user(
+        ["rm", "-rf", "--", str(workspace)], cwd=workspace.parent, user=service_user
+    )
+    if result.returncode or workspace.exists():
+        raise PyCompileValidationError("temporary cache cleanup failed")
+
+
+@contextlib.contextmanager
+def unique_cache_workspace(
+    *, repository: Path, cache_root: Path, service_user: str
+):
+    """Create a unique 0700 cache workspace directly as the operational user."""
+    repository, cache_root = validate_cache_root(repository, cache_root)
+    account = _account(service_user)
+    result = _run_as_user(
+        ["mktemp", "-d", "-p", str(cache_root), "td02c-pycache-XXXXXXXXXX"],
+        cwd=cache_root,
+        user=service_user,
+    )
+    if result.returncode:
+        raise PyCompileValidationError("could not create unique cache workspace")
+    lines = result.stdout.splitlines()
+    if len(lines) != 1:
+        raise PyCompileValidationError("mktemp returned an ambiguous cache path")
+    workspace = Path(lines[0])
+    identity = None
+    try:
+        workspace = _validate_workspace(
+            repository=repository,
+            workspace=workspace,
+            service_user=service_user,
+            cache_root=cache_root,
+        )
+        # Explicitly document that group ownership is expected to match the
+        # operational account's primary group.
+        if workspace.stat(follow_symlinks=False).st_gid != account.pw_gid:
+            raise PyCompileValidationError("temporary cache group is unexpected")
+        metadata = workspace.stat(follow_symlinks=False)
+        identity = (metadata.st_dev, metadata.st_ino)
+        print(
+            "pycache_workspace_created "
+            f"owner_uid={metadata.st_uid} group_gid={metadata.st_gid} mode=0700"
+        )
+        _write_probe(workspace, service_user)
+        print("pycache_write_probe=PASS")
+        yield workspace
+    finally:
+        if workspace.exists() or workspace.is_symlink():
+            if identity is None:
+                raise PyCompileValidationError(
+                    "refusing cleanup without validated workspace identity"
+                )
+            _remove_workspace(
+                repository=repository,
+                workspace=workspace,
+                service_user=service_user,
+                cache_root=cache_root,
+                identity=identity,
+            )
+            print("pycache_cleanup=PASS")
+
+
 def isolated_py_compile(
     *,
     repository: Path,
@@ -113,24 +262,14 @@ def isolated_py_compile(
     python = python.resolve(strict=True)
     if not python.is_file() or not os.access(python, os.X_OK):
         raise PyCompileValidationError("Python interpreter is not executable")
-    account = pwd.getpwnam(service_user)
+    _account(service_user)
     validated_sources = _safe_sources(repository, sources)
     status_before = _git_status(repository, service_user)
     bytecode_before = _checkout_bytecode(repository)
 
-    cache = Path(tempfile.mkdtemp(prefix="td02c-pycache-", dir=cache_root))
-    try:
-        if cache.is_symlink() or cache.resolve().parent != cache_root:
-            raise PyCompileValidationError("temporary cache path is ambiguous")
-        os.chmod(cache, 0o700)
-        if os.geteuid() == 0:
-            os.chown(cache, account.pw_uid, account.pw_gid)
-        metadata = cache.stat(follow_symlinks=False)
-        if stat.S_IMODE(metadata.st_mode) != 0o700:
-            raise PyCompileValidationError("temporary cache mode is not 0700")
-        if metadata.st_uid != account.pw_uid:
-            raise PyCompileValidationError("temporary cache owner is not service user")
-
+    with unique_cache_workspace(
+        repository=repository, cache_root=cache_root, service_user=service_user
+    ) as cache:
         result = _run_as_user(
             [
                 "env",
@@ -148,8 +287,6 @@ def isolated_py_compile(
         if _checkout_bytecode(repository) != bytecode_before:
             raise PyCompileValidationError("py_compile wrote bytecode in the checkout")
         return result
-    finally:
-        shutil.rmtree(cache, ignore_errors=False)
 
 
 def main(argv: Sequence[str] | None = None) -> int:
@@ -161,18 +298,20 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("sources", nargs="+", type=Path)
     args = parser.parse_args(argv)
     try:
-        result = isolated_py_compile(
-            repository=args.repository,
-            python=args.python,
-            service_user=args.service_user,
-            sources=args.sources,
-            cache_root=args.cache_root,
-        )
-    except (OSError, KeyError, PyCompileValidationError) as exc:
+        with _cleanup_on_termination():
+            result = isolated_py_compile(
+                repository=args.repository,
+                python=args.python,
+                service_user=args.service_user,
+                sources=args.sources,
+                cache_root=args.cache_root,
+            )
+    except (OSError, KeyError, InterruptedError, PyCompileValidationError) as exc:
         print(f"py_compile validation failed: {exc}")
         return 1
     if result.stdout:
         print(result.stdout, end="")
+    print(f"py_compile_result={'PASS' if result.returncode == 0 else 'FAIL'}")
     return result.returncode
 
 
