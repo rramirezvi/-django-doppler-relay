@@ -1,3 +1,4 @@
+import os
 import shutil
 import subprocess
 import tempfile
@@ -39,6 +40,25 @@ from ops.deployment_hardening import (
     validate_readiness_layers,
     warning_codes,
 )
+
+
+def isolate_git_environment(testcase, root):
+    """Keep temporary Git repositories independent from the invoking user."""
+    home = root / "git-home"
+    xdg = home / ".config"
+    xdg.mkdir(parents=True)
+    patcher = patch.dict(
+        os.environ,
+        {
+            "HOME": str(home),
+            "XDG_CONFIG_HOME": str(xdg),
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_ATTR_NOSYSTEM": "1",
+        },
+    )
+    patcher.start()
+    testcase.addCleanup(patcher.stop)
 
 
 class InterpreterDiscoveryTests(unittest.TestCase):
@@ -587,10 +607,12 @@ class RollbackRepositoryTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.repo = Path(self.tmp.name)
+        isolate_git_environment(self, self.repo)
         self.runner = LocalRunner()
         self._git("init")
         self._git("config", "user.email", "test@example.invalid")
         self._git("config", "user.name", "Test")
+        self._git("config", "core.autocrlf", "false")
         (self.repo / "app.py").write_text("old\n")
         (self.repo / "deleted.txt").write_text("restore me\n")
         (self.repo / "runtime.txt").write_text("runtime base\n")
@@ -800,8 +822,20 @@ class RollbackRepositoryTests(unittest.TestCase):
             readiness_timeout=5.0, readiness_poll_interval=0.01,
         )
 
+    def _assert_runtime_baseline(self, context):
+        current = self._git("diff", "--name-only").stdout.splitlines()
+        self.assertEqual(current, context.runtime_files)
+        self.assertEqual(current, ["runtime.txt"])
+        self.assertEqual(
+            __import__("hashlib").sha256(
+                (self.repo / "runtime.txt").read_bytes()
+            ).hexdigest(),
+            context.runtime_hashes["runtime.txt"],
+        )
+
     def test_restart_failure_rolls_back_and_restarts_only_affected_unit(self):
         context = self._execution_context()
+        self._assert_runtime_baseline(context)
         calls = []
         failed_once = {"value": False}
         outer = self
@@ -821,6 +855,7 @@ class RollbackRepositoryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as backup:
             with self.assertRaisesRegex(DeploymentError, "ROLLBACK_COMPLETED"):
                 execute_deployment(self._execute_args(backup), ExecutionRunner(), context)
+        self._assert_runtime_baseline(context)
         self.assertEqual(self._git("rev-parse", "HEAD").stdout.strip(), self.old)
         restarts = [call[2] for call in calls if call[:2] == ["systemctl", "restart"]]
         self.assertEqual(restarts, ["django.service", "django.service"])
@@ -829,7 +864,9 @@ class RollbackRepositoryTests(unittest.TestCase):
 
     def test_post_restart_smoke_failure_rolls_back_and_preserves_runtime(self):
         context = self._execution_context()
+        self._assert_runtime_baseline(context)
         calls = []
+        smoke_failure_reached = {"value": False}
         class ExecutionRunner(LocalRunner):
             def run(inner, args, **kwargs):
                 calls.append(list(args))
@@ -850,6 +887,8 @@ class RollbackRepositoryTests(unittest.TestCase):
                         "500" if url.endswith("/") and "/relay/send/" not in url else (
                         "405" if method == "GET" else "403"
                     ))
+                    if status == "500":
+                        smoke_failure_reached["value"] = True
                     return subprocess.CompletedProcess(args, 0, "__DEPLOY_SMOKE__" + status, "")
                 return super(ExecutionRunner, inner).run(args, **kwargs)
         with tempfile.TemporaryDirectory() as backup:
@@ -857,15 +896,46 @@ class RollbackRepositoryTests(unittest.TestCase):
                 DeploymentError, "DEPLOYMENT_FAILED; ROLLBACK_COMPLETED"
             ) as caught:
                 execute_deployment(self._execute_args(backup), ExecutionRunner(), context)
+        self._assert_runtime_baseline(context)
+        self.assertTrue(smoke_failure_reached["value"])
         self.assertIn("Smoke baseline changed", str(caught.exception))
         self.assertEqual(self._git("rev-parse", "HEAD").stdout.strip(), self.old)
         self.assertEqual((self.repo / "runtime.txt").read_text(), "runtime local\n")
+
+    def test_runtime_modified_during_merge_aborts_before_restart(self):
+        context = self._execution_context()
+        self._assert_runtime_baseline(context)
+        restart_calls = []
+        repo = self.repo
+        class RuntimeMutatingRunner(LocalRunner):
+            def run(inner, args, **kwargs):
+                result = super().run(args, **kwargs)
+                if args[:3] == ["git", "merge", "--ff-only"]:
+                    (repo / "runtime.txt").write_text(
+                        "runtime changed during merge\n", encoding="utf-8"
+                    )
+                if args[:2] == ["systemctl", "restart"]:
+                    restart_calls.append(list(args))
+                if args[:2] == ["test", "-O"]:
+                    return subprocess.CompletedProcess(args, 0, "", "")
+                return result
+        with tempfile.TemporaryDirectory() as backup:
+            with self.assertRaisesRegex(
+                DeploymentError,
+                "DEPLOYMENT_FAILED; ROLLBACK_INCOMPLETE: Runtime changed",
+            ):
+                execute_deployment(
+                    self._execute_args(backup), RuntimeMutatingRunner(), context
+                )
+        self.assertEqual(restart_calls, [])
+        self.assertEqual(self._git("rev-parse", "HEAD").stdout.strip(), self.old)
 
 
 class ControlledFetchTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         root = Path(self.tmp.name)
+        isolate_git_environment(self, root)
         self.remote = root / "remote.git"
         self.seed = root / "seed"
         self.production = root / "production"
@@ -874,6 +944,7 @@ class ControlledFetchTests(unittest.TestCase):
         subprocess.run(["git", "init", str(self.seed)], check=True, capture_output=True)
         self._run(self.seed, "config", "user.email", "test@example.invalid")
         self._run(self.seed, "config", "user.name", "Test")
+        self._run(self.seed, "config", "core.autocrlf", "false")
         (self.seed / "app.py").write_text("old\n")
         self._run(self.seed, "add", ".")
         self._run(self.seed, "commit", "-m", "old")
@@ -882,6 +953,7 @@ class ControlledFetchTests(unittest.TestCase):
         self._run(self.seed, "push", "-u", "origin", self.branch)
         subprocess.run(["git", "clone", str(self.remote), str(self.production)],
                        check=True, capture_output=True)
+        self._run(self.production, "config", "core.autocrlf", "false")
         self.old = self._run(self.production, "rev-parse", "HEAD").stdout.strip()
         (self.seed / "app.py").write_text("target\n")
         (self.seed / "new.py").write_text("new\n")
@@ -991,6 +1063,69 @@ class ControlledFetchTests(unittest.TestCase):
                            cwd=self.production, capture_output=True).returncode,
             0,
         )
+
+    def test_clean_temporary_repository_has_deterministic_snapshot(self):
+        first = snapshot_git_state(self.runner, self.production, "origin", "svc")
+        second = snapshot_git_state(self.runner, self.production, "origin", "svc")
+        self.assertEqual(first, second)
+        self.assertEqual(first.status, "")
+        self.assertEqual(first.unstaged_diff, "")
+
+    def test_helper_outside_repository_does_not_change_snapshot(self):
+        before = snapshot_git_state(self.runner, self.production, "origin", "svc")
+        helper = self.production.parent / ".td02c_outside_local.tmp.sh"
+        helper.write_text("echo safe\n", encoding="utf-8")
+        after = snapshot_git_state(self.runner, self.production, "origin", "svc")
+        self.assertEqual(after, before)
+
+    def test_helper_created_inside_repository_aborts_controlled_fetch(self):
+        production = self.production
+        class HelperCreatingRunner(LocalRunner):
+            def run(inner, args, **kwargs):
+                result = super().run(args, **kwargs)
+                if args[:2] == ["git", "fetch"]:
+                    (production / ".td02c_inside_local.tmp.sh").write_text(
+                        "echo unsafe\n", encoding="utf-8"
+                    )
+                return result
+        with self.assertRaisesRegex(DeploymentError, "status"):
+            acquire_target_object(
+                HelperCreatingRunner(), self.production, remote="origin",
+                branch=self.branch, target_sha=self.target, user="svc",
+            )
+
+    def test_real_unstaged_change_during_fetch_is_detected(self):
+        production = self.production
+        class TrackedFileMutatingRunner(LocalRunner):
+            def run(inner, args, **kwargs):
+                result = super().run(args, **kwargs)
+                if args[:2] == ["git", "fetch"]:
+                    (production / "app.py").write_text(
+                        "unexpected local change\n", encoding="utf-8"
+                    )
+                return result
+        with self.assertRaisesRegex(DeploymentError, "unstaged_diff|status"):
+            acquire_target_object(
+                TrackedFileMutatingRunner(), self.production, remote="origin",
+                branch=self.branch, target_sha=self.target, user="svc",
+            )
+
+    def test_autocrlf_and_filemode_local_settings_do_not_change_clean_fetch(self):
+        for autocrlf, filemode in (("false", "true"), ("input", "false")):
+            with self.subTest(autocrlf=autocrlf, filemode=filemode):
+                self._run(self.production, "config", "core.autocrlf", autocrlf)
+                self._run(self.production, "config", "core.filemode", filemode)
+                before = snapshot_git_state(
+                    self.runner, self.production, "origin", "svc"
+                )
+                ref, captured = acquire_target_object(
+                    self.runner, self.production, remote="origin",
+                    branch=self.branch, target_sha=self.target, user="svc",
+                )
+                self.assertEqual(captured, before)
+                delete_temporary_target_ref(
+                    self.runner, self.production, ref, self.target, "svc"
+                )
 
     def test_remote_hash_mismatch_aborts_without_fetch(self):
         wrong = "a" * 40
