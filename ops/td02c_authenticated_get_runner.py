@@ -20,6 +20,7 @@ except ImportError:  # pragma: no cover - operational runner is Linux-only
     pwd = None  # type: ignore[assignment]
 
 from ops.deployment_hardening import (
+    DeploymentError,
     Runner,
     application_bind_from_exec_start,
     discover_and_validate_nginx,
@@ -285,7 +286,13 @@ def run(args: argparse.Namespace, stream: TextIO = sys.stdout) -> int:
         state = DjangoState(); baseline = state.baseline(); emit_counts(stream, "baseline_before", baseline)
         operations = CurlOperations(service_unit=args.service_unit, credential_file=credential, state=state, baseline=baseline, log=log)
         run_authenticated_get_gate(operations, log)
-    except (AuthenticatedGetFailure, RunnerFailure, OSError, subprocess.SubprocessError) as exc:
+    except (
+        AuthenticatedGetFailure,
+        DeploymentError,
+        RunnerFailure,
+        OSError,
+        subprocess.SubprocessError,
+    ) as exc:
         failure = True
         if not isinstance(exc, AuthenticatedGetFailure):
             emit(log, "runner", "FAIL", time.monotonic(), str(exc) if str(exc) in {"credential_missing"} else "runner_failed")
@@ -320,12 +327,15 @@ def main(argv: Sequence[str] | None = None) -> int:
     started = time.monotonic()
     try:
         validate_module_entrypoint(args.service_unit)
-    except (OSError, RunnerFailure, subprocess.SubprocessError) as exc:
-        classification = str(exc)
+    except (DeploymentError, OSError, RunnerFailure, subprocess.SubprocessError) as exc:
+        classification = str(exc).split(":", 1)[0]
         allowed = {
             "posix_required", "module_entrypoint_required",
             "working_directory_mismatch", "runner_module_missing",
             "repository_not_importable", "effective_user_mismatch",
+            "already_running_as_service_user",
+            "switched_from_root_to_service_user", "cannot_switch_user",
+            "service_user_mismatch", "command_failed",
         }
         emit(log, "entrypoint_validated", "FAIL", started,
              classification if classification in allowed else "entrypoint_validation_failed")

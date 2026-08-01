@@ -27,7 +27,7 @@ from ops.td02c_authenticated_get_runner import (
     validate_module_entrypoint,
 )
 from ops.td02c_http_client import AuthenticatedGetFailure
-from ops.deployment_hardening import NginxTarget
+from ops.deployment_hardening import DeploymentError, NginxTarget
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX credential metadata")
@@ -301,6 +301,27 @@ class ModuleEntrypointTests(unittest.TestCase):
         diagnostic = stream.getvalue()
         self.assertIn('"substage": "entrypoint_validated"', diagnostic)
         self.assertIn('"classification": "effective_user_mismatch"', diagnostic)
+        self.assertNotIn("not-read", diagnostic)
+
+    def test_user_switch_failure_does_not_read_credential_create_workspace_or_http(self):
+        module = sys.modules[EXPECTED_MODULE]
+        stream = io.StringIO()
+        with (
+            patch(
+                "ops.td02c_authenticated_get_runner.validate_module_entrypoint",
+                side_effect=DeploymentError(
+                    "cannot_switch_user: effective user does not match service user"
+                ),
+            ),
+            patch("ops.td02c_authenticated_get_runner.run") as runner,
+            patch("ops.td02c_http_client.tempfile.mkdtemp") as workspace,
+            patch.object(module.sys, "stdout", stream),
+        ):
+            self.assertEqual(module.main(["--credential-file", "not-read"]), 1)
+        runner.assert_not_called()
+        workspace.assert_not_called()
+        diagnostic = stream.getvalue()
+        self.assertIn('"classification": "cannot_switch_user"', diagnostic)
         self.assertNotIn("not-read", diagnostic)
 
 

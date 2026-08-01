@@ -352,7 +352,11 @@ Al iniciar con `-m`, el runner vuelve a comprobar fail-closed que el
 `WorkingDirectory` descubierto desde `django.service` coincide exactamente con
 el directorio actual, que el archivo del módulo existe, que la raíz del
 repositorio está en `sys.path` y que el usuario efectivo coincide con el usuario
-del servicio. No modifica `PYTHONPATH`, no introduce hacks de `sys.path` y no
+del servicio. Las comprobaciones solicitadas bajo ese usuario se ejecutan
+directamente cuando el proceso ya corre como él; `runuser` se utiliza solamente
+cuando el invocador es `root`. Cualquier otro desajuste de usuario aborta sin
+leer la credencial, crear workspaces, iniciar HTTP ni buscar sesiones. No
+modifica `PYTHONPATH`, no introduce hacks de `sys.path` y no
 permite ejecución como otro usuario.
 
 El archivo contiene solo la contraseña técnica, debe ser absoluto, externo al

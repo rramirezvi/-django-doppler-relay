@@ -20,6 +20,11 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
+try:
+    import pwd
+except ImportError:  # pragma: no cover - operational tooling is POSIX-only
+    pwd = None  # type: ignore[assignment]
+
 
 class DeploymentError(RuntimeError):
     pass
@@ -27,6 +32,46 @@ class DeploymentError(RuntimeError):
 
 class DeploymentInterrupted(DeploymentError):
     pass
+
+
+@dataclasses.dataclass(frozen=True)
+class ServiceUserCommand:
+    argv: list[str]
+    classification: str
+
+
+def run_as_service_user_command(
+    args: list[str],
+    target_user: str,
+    *,
+    effective_uid: int | None = None,
+    effective_user: str | None = None,
+) -> ServiceUserCommand:
+    """Choose a fail-closed command for the discovered service user."""
+    if not target_user or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.-]*", target_user):
+        raise DeploymentError("service_user_mismatch: invalid service user")
+    if not args:
+        raise DeploymentError("command_failed: empty command")
+    if pwd is None or not hasattr(os, "geteuid"):
+        raise DeploymentError("cannot_switch_user: POSIX user discovery unavailable")
+
+    uid = os.geteuid() if effective_uid is None else effective_uid
+    if effective_user is None:
+        try:
+            effective_user = pwd.getpwuid(uid).pw_name
+        except KeyError as exc:
+            raise DeploymentError("service_user_mismatch: unknown effective user") from exc
+
+    if effective_user == target_user:
+        return ServiceUserCommand(list(args), "already_running_as_service_user")
+    if uid == 0:
+        return ServiceUserCommand(
+            ["runuser", "-u", target_user, "--", *args],
+            "switched_from_root_to_service_user",
+        )
+    raise DeploymentError(
+        "cannot_switch_user: effective user does not match service user"
+    )
 
 
 def redact_output(value: str) -> str:
@@ -53,7 +98,8 @@ class Runner:
     ) -> subprocess.CompletedProcess[str]:
         command = list(args)
         if user:
-            command = ["runuser", "-u", user, "--", *command]
+            decision = run_as_service_user_command(command, user)
+            command = decision.argv
         result = subprocess.run(
             command,
             cwd=cwd,
@@ -67,8 +113,9 @@ class Runner:
         )
         if check and result.returncode:
             rendered = shlex.join(command)
+            classification = "command_failed"
             raise DeploymentError(
-                f"Command failed ({result.returncode}): {rendered}\n"
+                f"{classification}: Command failed ({result.returncode}): {rendered}\n"
                 f"{redact_output(result.stdout)}"
             )
         return result

@@ -28,6 +28,7 @@ from ops.deployment_hardening import (
     require_fast_forward,
     refresh_deployment_ref,
     require_deployment_ref,
+    run_as_service_user_command,
     resolve_commit,
     safe_repo_path,
     smoke_request,
@@ -59,6 +60,76 @@ def isolate_git_environment(testcase, root):
     )
     patcher.start()
     testcase.addCleanup(patcher.stop)
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX service-user execution")
+class ServiceUserExecutionTests(unittest.TestCase):
+    def test_matching_service_user_executes_directly(self):
+        decision = run_as_service_user_command(
+            ["python", "-c", "pass"], "app",
+            effective_uid=1000, effective_user="app",
+        )
+        self.assertEqual(decision.argv, ["python", "-c", "pass"])
+        self.assertEqual(
+            decision.classification, "already_running_as_service_user"
+        )
+        self.assertNotIn("runuser", decision.argv)
+
+    def test_root_switches_once_with_runuser(self):
+        decision = run_as_service_user_command(
+            ["python", "-c", "pass"], "app",
+            effective_uid=0, effective_user="root",
+        )
+        self.assertEqual(
+            decision.argv,
+            ["runuser", "-u", "app", "--", "python", "-c", "pass"],
+        )
+        self.assertEqual(
+            decision.classification, "switched_from_root_to_service_user"
+        )
+        self.assertEqual(decision.argv.count("runuser"), 1)
+
+    def test_other_non_privileged_user_fails_closed(self):
+        with self.assertRaisesRegex(DeploymentError, "cannot_switch_user"):
+            run_as_service_user_command(
+                ["python"], "app", effective_uid=1001, effective_user="other"
+            )
+
+    def test_empty_or_invalid_service_user_is_rejected(self):
+        for user in ("", "-app", "bad user", "app;root"):
+            with self.subTest(user=user):
+                with self.assertRaisesRegex(DeploymentError, "service_user_mismatch"):
+                    run_as_service_user_command(
+                        ["python"], user, effective_uid=0, effective_user="root"
+                    )
+
+    def test_runner_does_not_execute_command_twice(self):
+        completed = subprocess.CompletedProcess(["python"], 0, "ok")
+        with (
+            patch("ops.deployment_hardening.os.geteuid", return_value=1000),
+            patch(
+                "ops.deployment_hardening.pwd.getpwuid",
+                return_value=SimpleNamespace(pw_name="app"),
+            ),
+            patch("ops.deployment_hardening.subprocess.run", return_value=completed) as call,
+        ):
+            result = Runner().run(["python", "-c", "pass"], user="app")
+        self.assertIs(result, completed)
+        call.assert_called_once()
+        self.assertEqual(call.call_args.args[0], ["python", "-c", "pass"])
+
+    def test_runuser_failure_is_sanitized_and_classified(self):
+        failed = subprocess.CompletedProcess(
+            ["runuser"], 1, "SECRET_KEY=private\nrunuser failed"
+        )
+        with patch("ops.deployment_hardening.subprocess.run", return_value=failed):
+            with self.assertRaisesRegex(DeploymentError, "command_failed") as caught:
+                Runner().run(
+                    ["python", "-c", "pass"], user="app"
+                )
+        message = str(caught.exception)
+        self.assertIn("runuser failed", message)
+        self.assertNotIn("private", message)
 
 
 class InterpreterDiscoveryTests(unittest.TestCase):
