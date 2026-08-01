@@ -245,4 +245,42 @@ python -m py_compile ops/deployment_hardening.py
 git diff --check
 ```
 
+## Production versus isolated test profiles
+
+Las suites Django que crean una test database no se ejecutan contra
+producción. Se validan previamente en PostgreSQL aislado y durante el
+despliegue se verifica el mismo commit exacto junto con checks no destructivos.
+
+### A. Obligatorio antes del despliegue, en aislamiento
+
+- `manage.py test` y pruebas API que crean/destruyen la Django test database;
+- PostgreSQL, concurrencia, rollback transaccional y escrituras de fixtures;
+- evidencia ligada al SHA objetivo y a la secuencia exacta de commits.
+
+Para TD-02C sobre `1bc524a487811c3a524025ceb323f82e4821e7bc`, la
+evidencia aprobada es: cliente HTTP 8/8, API V2 27/27 en PostgreSQL aislado,
+suite ops 87/87 y repeticiones Linux deterministas. El gate aborta si el SHA o
+el orden `d7de839...` → `1bc524a...` no coincide.
+
+### B. Permitido durante el despliegue productivo
+
+- `py_compile` y la suite `ops`, que usa repositorios temporales;
+- `manage.py check` y `manage.py check --deploy`;
+- ORM read-only, readiness, GET autenticados y smoke tests no destructivos;
+- flags, allowlists y conteos read-only de jobs, BulkSend, ledger y
+  EmailMessage.
+
+### C. Prohibido en producción
+
+- `manage.py test` cuando intenta crear `test_doppler_prod`;
+- pruebas que escriben o hacen `flush` sobre `doppler_prod`;
+- `TransactionTestCase` contra la base real;
+- conceder `CREATEDB`, usar `root`/`postgres`, o crear una base improvisada.
+
+`ops.deployment_test_profile` aplica esta clasificación de forma fail-closed:
+el perfil `production` rechaza suites Django con test database, creación de
+bases y elevación de privilegios; el perfil `isolated` permite esas suites en
+el entorno preparado para ello. Ningún gate de Git, runtime o rollback se
+relaja.
+
 
