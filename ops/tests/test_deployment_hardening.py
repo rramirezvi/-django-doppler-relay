@@ -16,6 +16,8 @@ from ops.deployment_hardening import (
     Runner,
     ServiceMetadata,
     acquire_target_object,
+    bootstrap_module_deployment,
+    build_parser,
     changed_runtime_intersections,
     delete_temporary_target_ref,
     discover_and_validate_nginx,
@@ -26,6 +28,7 @@ from ops.deployment_hardening import (
     parse_environment_files,
     parse_exec_start_path,
     require_fast_forward,
+    require_exact_commit_sequence,
     refresh_deployment_ref,
     require_deployment_ref,
     run_as_service_user_command,
@@ -41,6 +44,30 @@ from ops.deployment_hardening import (
     validate_readiness_layers,
     warning_codes,
 )
+
+
+class BootstrapContractTests(unittest.TestCase):
+    def test_parser_exposes_explicit_bootstrap_module(self):
+        args = build_parser().parse_args([
+            "--service-unit", "django.service", "--old-sha", "1" * 40,
+            "--target-sha", "2" * 40, "--remote", "origin",
+            "--branch", "production", "--bootstrap-module",
+            "ops.td02c_deployment_runner",
+        ])
+        self.assertEqual(args.bootstrap_module, "ops.td02c_deployment_runner")
+
+    def test_bootstrap_rejects_unsafe_module_name_before_discovery(self):
+        with self.assertRaisesRegex(DeploymentError, "Unsafe bootstrap"):
+            bootstrap_module_deployment(
+                Namespace(), Runner(), "../../unversioned"
+            )
+
+    def test_exact_commit_sequence_rejects_additional_missing_and_wrong_order(self):
+        a, b, c = "a" * 40, "b" * 40, "c" * 40
+        require_exact_commit_sequence([a, b], [a, b])
+        for actual, expected in (([a, b, c], [a, b]), ([a], [a, b]), ([b, a], [a, b])):
+            with self.subTest(actual=actual), self.assertRaises(DeploymentError):
+                require_exact_commit_sequence(actual, expected)
 
 
 def isolate_git_environment(testcase, root):

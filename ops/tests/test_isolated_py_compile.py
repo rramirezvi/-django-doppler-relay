@@ -22,6 +22,7 @@ from ops.isolated_py_compile import (
     _validate_workspace,
     _write_probe,
     isolated_py_compile,
+    isolated_py_compile_ephemeral,
     unique_cache_workspace,
     validate_cache_root,
 )
@@ -57,6 +58,39 @@ class IsolatedPyCompileTests(unittest.TestCase):
             service_user=self.user,
             sources=[Path("ops/tool.py")],
             cache_root=self.cache_root,
+        )
+
+    def run_ephemeral_compile(self):
+        return isolated_py_compile_ephemeral(
+            repository=self.repo,
+            python=Path(sys.executable),
+            service_user=self.user,
+            sources=[Path("ops/tool.py")],
+            temporary_parent=self.root,
+        )
+
+    def test_ephemeral_compile_ignores_incompatible_fixed_cache_root(self):
+        obsolete = self.root / "td02c-pycache-root"
+        obsolete.mkdir(mode=0o500)
+        try:
+            self.assertEqual(self.run_ephemeral_compile().returncode, 0)
+            self.assertEqual(
+                [path for path in self.root.iterdir() if path.name.startswith("td02c-pycache-parent-")],
+                [],
+            )
+        finally:
+            obsolete.chmod(0o700)
+
+    def test_ephemeral_parent_is_cleaned_after_compile_exception(self):
+        with patch(
+            "ops.isolated_py_compile.isolated_py_compile",
+            side_effect=RuntimeError("synthetic failure"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "synthetic failure"):
+                self.run_ephemeral_compile()
+        self.assertEqual(
+            [path for path in self.root.iterdir() if path.name.startswith("td02c-pycache-parent-")],
+            [],
         )
 
     def test_nonwritable_checkout_pycache_does_not_block_valid_compile(self):

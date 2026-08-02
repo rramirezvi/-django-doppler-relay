@@ -289,6 +289,70 @@ def isolated_py_compile(
         return result
 
 
+def isolated_py_compile_ephemeral(
+    *,
+    repository: Path,
+    python: Path,
+    service_user: str,
+    sources: Sequence[Path],
+    temporary_parent: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Compile using a unique parent and workspace, both removed afterwards."""
+    if pwd is None:
+        raise PyCompileValidationError("operational py_compile requires POSIX")
+    repository = repository.resolve(strict=True)
+    parent = (temporary_parent or Path(tempfile.gettempdir())).resolve(strict=True)
+    if parent.is_symlink() or not parent.is_dir() or _inside(parent, repository):
+        raise PyCompileValidationError("temporary parent is unsafe")
+    account = _account(service_user)
+    result = _run_as_user(
+        ["mktemp", "-d", "-p", str(parent), "td02c-pycache-parent-XXXXXXXXXX"],
+        cwd=parent,
+        user=service_user,
+    )
+    if result.returncode or len(result.stdout.splitlines()) != 1:
+        raise PyCompileValidationError("could not create unique cache parent")
+    cache_root = Path(result.stdout.strip())
+    identity: tuple[int, int] | None = None
+    try:
+        metadata = cache_root.stat(follow_symlinks=False)
+        if (
+            cache_root.is_symlink()
+            or not cache_root.is_dir()
+            or cache_root.parent.resolve(strict=True) != parent
+            or metadata.st_uid != account.pw_uid
+            or metadata.st_gid != account.pw_gid
+            or stat.S_IMODE(metadata.st_mode) != 0o700
+        ):
+            raise PyCompileValidationError("unique cache parent metadata is unsafe")
+        identity = (metadata.st_dev, metadata.st_ino)
+        return isolated_py_compile(
+            repository=repository,
+            python=python,
+            service_user=service_user,
+            sources=sources,
+            cache_root=cache_root,
+        )
+    finally:
+        if cache_root.exists() or cache_root.is_symlink():
+            if identity is None:
+                raise PyCompileValidationError(
+                    "refusing cleanup without validated cache parent identity"
+                )
+            metadata = cache_root.stat(follow_symlinks=False)
+            if (
+                cache_root.is_symlink()
+                or (metadata.st_dev, metadata.st_ino) != identity
+                or any(cache_root.iterdir())
+            ):
+                raise PyCompileValidationError("unique cache parent cleanup unsafe")
+            cleanup = _run_as_user(
+                ["rmdir", "--", str(cache_root)], cwd=parent, user=service_user
+            )
+            if cleanup.returncode or cache_root.exists():
+                raise PyCompileValidationError("unique cache parent cleanup failed")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--repository", required=True, type=Path)

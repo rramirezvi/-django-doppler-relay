@@ -488,6 +488,15 @@ def require_fast_forward(
         raise DeploymentError("Target is not a fast-forward from old SHA")
 
 
+def require_exact_commit_sequence(
+    approved_commits: list[str], expected_commits: list[str]
+) -> None:
+    if expected_commits and approved_commits != expected_commits:
+        raise DeploymentError(
+            "Approved commit range differs from --expected-commit sequence"
+        )
+
+
 def changed_runtime_intersections(
     changed_files: list[str], runtime_files: list[str]
 ) -> list[str]:
@@ -823,10 +832,13 @@ def wait_for_application_ready(
     )
 
 
-def preflight(args: argparse.Namespace, runner: Runner) -> DeploymentContext:
-    require_commands(
-        "systemctl", "getent", "git", "nginx", "openssl", "curl", "runuser", "sha256sum"
-    )
+def preflight(
+    args: argparse.Namespace, runner: Runner, *, operational_checks: bool = True
+) -> DeploymentContext:
+    commands = ["systemctl", "getent", "git", "runuser", "sha256sum"]
+    if operational_checks:
+        commands.extend(["nginx", "openssl", "curl"])
+    require_commands(*commands)
     service = discover_service(runner, args.service_unit)
     cwd = service.working_directory
     validate_token(args.remote, "Git remote")
@@ -875,10 +887,7 @@ def preflight(args: argparse.Namespace, runner: Runner) -> DeploymentContext:
         resolve_commit(runner, cwd, oid, service.user)
         for oid in getattr(args, "expected_commit", [])
     ]
-    if expected_commits and approved_commits != expected_commits:
-        raise DeploymentError(
-            "Approved commit range differs from --expected-commit sequence"
-        )
+    require_exact_commit_sequence(approved_commits, expected_commits)
 
     changed_files = git_lines(
         runner, cwd, "diff", "--name-only", f"{old_sha}..{target_sha}", user=service.user
@@ -907,14 +916,20 @@ def preflight(args: argparse.Namespace, runner: Runner) -> DeploymentContext:
             "mtime_ns": info.st_mtime_ns,
         }
 
-    _, baseline_warning_codes = run_manage_check(runner, service)
-    nginx_target = discover_and_validate_nginx(runner, service)
-    preflight_readiness = validate_readiness_layers(runner, service, nginx_target)
-    baseline_smoke = {
-        "/": smoke_request(runner, nginx_target, "/"),
-        "/app/": smoke_request(runner, nginx_target, "/app/"),
-        "/admin/login/": preflight_readiness["application"],
-    }
+    if operational_checks:
+        _, baseline_warning_codes = run_manage_check(runner, service)
+        nginx_target = discover_and_validate_nginx(runner, service)
+        preflight_readiness = validate_readiness_layers(runner, service, nginx_target)
+        baseline_smoke = {
+            "/": smoke_request(runner, nginx_target, "/"),
+            "/app/": smoke_request(runner, nginx_target, "/app/"),
+            "/admin/login/": preflight_readiness["application"],
+        }
+    else:
+        baseline_warning_codes = set()
+        nginx_target = NginxTarget("bootstrap.invalid", 443, "", None)
+        preflight_readiness = {}
+        baseline_smoke = {}
     return DeploymentContext(
         service=service,
         nginx=nginx_target,
@@ -1253,6 +1268,72 @@ def deployment_plan(args: argparse.Namespace, context: DeploymentContext) -> dic
     }
 
 
+def bootstrap_module_deployment(
+    args: argparse.Namespace, runner: Runner, module_name: str
+) -> dict[str, object]:
+    """One-time, data-free installation of a versioned operations module.
+
+    This deliberately stops after the exact fast-forward and import check.  It is
+    not a general deployment path and performs no backup, restart, migration,
+    collectstatic, readiness, smoke test, or application write.
+    """
+    if not re.fullmatch(r"ops(?:\.[A-Za-z_][A-Za-z0-9_]*)+", module_name):
+        raise DeploymentError("Unsafe bootstrap module name")
+    service = discover_service(runner, args.service_unit)
+    cwd, user = service.working_directory, service.user
+    before = snapshot_git_state(runner, cwd, args.remote, user)
+    if before.head != args.old_sha or before.branch != args.branch:
+        raise DeploymentError("Bootstrap initial HEAD or branch mismatch")
+    remote = runner.run(
+        ["git", "ls-remote", "--exit-code", args.remote, f"refs/heads/{args.branch}"],
+        cwd=cwd, user=user,
+    ).stdout.split()
+    if not remote or remote[0] != args.target_sha:
+        raise DeploymentError("Bootstrap remote target mismatch")
+    assert_git_state_unchanged(runner, cwd, args.remote, user, before)
+    module_path = module_name.replace(".", "/") + ".py"
+    old_has_module = runner.run(
+        ["git", "cat-file", "-e", f"{args.old_sha}:{module_path}"],
+        cwd=cwd, user=user, check=False,
+    ).returncode == 0
+    if old_has_module:
+        raise DeploymentError("Bootstrap is only allowed for first module installation")
+    refresh_deployment_ref(
+        runner, cwd, remote=args.remote, branch=args.branch,
+        target_sha=args.target_sha, user=user,
+    )
+    context = preflight(args, runner, operational_checks=False)
+    if module_path not in context.changed_files:
+        raise DeploymentError("Bootstrap target does not introduce requested module")
+    mutation_started = False
+    try:
+        mutation_started = True
+        runner.run(["git", "merge", "--ff-only", args.target_sha], cwd=cwd, user=user)
+        head = runner.run(["git", "rev-parse", "HEAD"], cwd=cwd, user=user).stdout.strip()
+        if head != args.target_sha:
+            raise DeploymentError("Bootstrap HEAD mismatch after fast-forward")
+        for name, expected in context.runtime_hashes.items():
+            if sha256_file(safe_repo_path(cwd, name, must_exist=True)) != expected:
+                raise DeploymentError(f"Runtime changed during bootstrap: {name}")
+        expected_uid = pwd.getpwnam(user).pw_uid if pwd is not None else None
+        for name in context.changed_files:
+            path = safe_repo_path(cwd, name)
+            if path.exists() and (
+                path.is_symlink()
+                or (expected_uid is not None and path.stat(follow_symlinks=False).st_uid != expected_uid)
+            ):
+                raise DeploymentError(f"Bootstrap materialized unsafe ownership: {name}")
+        safe_repo_path(cwd, module_path, must_exist=True)
+        runner.run(
+            [str(service.python), "-c", f"import {module_name}"], cwd=cwd, user=user
+        )
+        return {"phase": "bootstrap-complete", "head": head, "module": module_name}
+    except BaseException:
+        if mutation_started:
+            targeted_rollback(args, runner, context, [])
+        raise
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--service-unit", required=True)
@@ -1291,6 +1372,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Apply fast-forward after Preflight. Without this flag, run Preflight only.",
     )
+    parser.add_argument(
+        "--bootstrap-module",
+        help="One-time limited installation of a new versioned ops module.",
+    )
     return parser
 
 
@@ -1300,6 +1385,12 @@ def main(argv: list[str] | None = None) -> int:
     temporary_ref: str | None = None
     acquisition_service: ServiceMetadata | None = None
     try:
+        if args.bootstrap_module:
+            if args.execute or args.fetch_target or args.refresh_deployment_ref:
+                raise DeploymentError("Bootstrap cannot be combined with other mutation modes")
+            report = bootstrap_module_deployment(args, runner, args.bootstrap_module)
+            print(json.dumps(report, default=str, indent=2))
+            return 0
         if args.fetch_target and args.refresh_deployment_ref:
             raise DeploymentError(
                 "Choose either isolated preflight fetch or deployment-ref refresh"

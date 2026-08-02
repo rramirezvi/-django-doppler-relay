@@ -405,3 +405,74 @@ el entorno preparado para ello. Ningún gate de Git, runtime o rollback se
 relaja.
 
 
+## Orquestador único de despliegue TD-02C
+
+`ops.td02c_deployment_runner` es el único propietario del flujo operativo de
+preflight, despliegue y rollback TD-02C. El contrato del wrapper externo es una
+sola invocación desde el `WorkingDirectory` descubierto:
+
+```bash
+.venv/bin/python -m ops.td02c_deployment_runner \
+  --mode preflight-only \
+  --old-sha SHA_INICIAL_COMPLETO \
+  --target-sha SHA_OBJETIVO_COMPLETO \
+  --branch operator-ui-production-test \
+  --expected-commit SHA_OBJETIVO_COMPLETO \
+  --validation-evidence /ruta/externa/evidencia-aislada.json \
+  --evidence-output /ruta/externa/preflight.json
+```
+
+Los modos admitidos son `preflight-only`, `deploy-only` y `rollback`. El
+orquestador llama directamente a `deployment_hardening`,
+`deployment_test_profile`, `isolated_py_compile`, `td02c_settings_gate` y
+`td02c_worker_gate`. La evidencia se escribe en JSON con modo `0600`; sus
+temporales atómicos se eliminan mediante `finally`.
+
+`preflight-only` es estrictamente de lectura para Git: no hace `fetch`, no
+actualiza refs, no escribe `FETCH_HEAD` ni incorpora objetos. Comprueba el
+remoto con `ls-remote` y exige que el objeto aprobado ya esté disponible para
+el análisis local. El refresh explícito de la ref consumida pertenece
+exclusivamente a `deploy-only`. Los tres modos comparten un `flock` exclusivo
+por repositorio, externo al checkout y modo `0600`; una segunda ejecución
+aborta y nunca elimina el lock de un proceso activo. `SIGINT` y `SIGTERM`
+liberan temporales/lock antes del merge y disparan rollback dirigido si el
+merge ya comenzó.
+
+La evidencia debe usar una ruta absoluta externa al checkout, con directorio
+`0700` y archivo `0600`, sin symlinks. Se publica mediante tempfile más rename
+atómico y se vuelve a leer como JSON antes de declarar PASS. Un fallo de
+evidencia posterior al merge obliga a rollback. `check --deploy` acepta
+exclusivamente `W005` y `W021`; cualquier otro warning, error o salida de
+warnings malformada aborta.
+
+Está prohibido reconstruir en Bash el refresh Git, merge, rollback, readiness,
+settings, cambio de usuario o manejo de pycache. También están prohibidos
+`/tmp/td02c-pycache-root`, cualquier cache root fijo, `curl` ad hoc,
+autenticación ad hoc, `runuser` anidado y la ejecución directa de archivos
+`ops/*.py`. `isolated_py_compile_ephemeral` crea como el usuario operativo un
+padre y workspace únicos, prueba escritura/lectura/eliminación, compila y
+elimina ambos tanto en éxito como en error. La misma función se utiliza antes y
+después del merge.
+
+El primer despliegue que incorpora el propio orquestador es un bootstrap
+especial: el módulo aún no existe en el HEAD productivo anterior. Debe revisarse
+y autorizarse expresamente usando únicamente el
+`python -m ops.deployment_hardening` que ya está versionado en el HEAD
+productivo. Ese bootstrap no puede reconstruirse en Bash ni ejecutar el nuevo
+orquestador desde una copia ad hoc. Su única interfaz es:
+
+```bash
+.venv/bin/python -m ops.deployment_hardening \
+  --service-unit django.service --old-sha OLD --target-sha TARGET \
+  --remote origin --branch operator-ui-production-test \
+  --expected-commit TARGET \
+  --bootstrap-module ops.td02c_deployment_runner
+```
+
+El bootstrap valida remotamente sin mutar, refresca de forma controlada, hace
+fast-forward al SHA completo, comprueba HEAD/runtime/ownership e importa el
+módulo; luego se detiene. Rechaza usarlo si el módulo ya existía y no realiza
+backup de datos, migraciones, reinicios, readiness posterior, smoke tests,
+dependencias, `collectstatic`, cambios de `.env` ni canary. Después de
+incorporarlo, todo preflight,
+deploy y rollback TD-02C se realiza exclusivamente con el nuevo módulo.
