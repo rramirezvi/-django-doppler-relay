@@ -194,6 +194,90 @@ class BootstrapPostMergeGateTests(unittest.TestCase):
                     module_name="ops.td02c_deployment_runner",
                 )
 
+    @unittest.skipUnless(os.name == "posix", "POSIX ownership semantics")
+    def test_post_merge_accepts_app_app(self):
+        gid = (self.repo / "added.txt").stat().st_gid
+        with (
+            patch("ops.deployment_hardening.pwd", SimpleNamespace(
+                getpwnam=lambda _name: SimpleNamespace(pw_uid=os.getuid()))),
+            patch("ops.deployment_hardening.grp", SimpleNamespace(
+                getgrnam=lambda name: SimpleNamespace(
+                    gr_gid=gid if name == "app" else gid + 1))),
+        ):
+            self.assertEqual(validate_bootstrap_post_merge(
+                self.runner, self.context,
+                module_name="ops.td02c_deployment_runner",
+            ), self.target)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX ownership semantics")
+    def test_post_merge_accepts_app_www_data(self):
+        gid = (self.repo / "added.txt").stat().st_gid
+        with (
+            patch("ops.deployment_hardening.pwd", SimpleNamespace(
+                getpwnam=lambda _name: SimpleNamespace(pw_uid=os.getuid()))),
+            patch("ops.deployment_hardening.grp", SimpleNamespace(
+                getgrnam=lambda name: SimpleNamespace(
+                    gr_gid=gid if name == "www-data" else gid + 1))),
+        ):
+            self.assertEqual(validate_bootstrap_post_merge(
+                self.runner, self.context,
+                module_name="ops.td02c_deployment_runner",
+            ), self.target)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX ownership semantics")
+    def test_post_merge_rejects_root_owner(self):
+        with (
+            patch("ops.deployment_hardening.pwd", SimpleNamespace(
+                getpwnam=lambda _name: SimpleNamespace(pw_uid=os.getuid() + 1))),
+            patch("ops.deployment_hardening.grp", None),
+        ):
+            with self.assertRaisesRegex(DeploymentError, "unsafe ownership"):
+                validate_bootstrap_post_merge(
+                    self.runner, self.context,
+                    module_name="ops.td02c_deployment_runner",
+                )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX ownership semantics")
+    def test_post_merge_rejects_unknown_group(self):
+        gid = (self.repo / "added.txt").stat().st_gid
+        with (
+            patch("ops.deployment_hardening.pwd", SimpleNamespace(
+                getpwnam=lambda _name: SimpleNamespace(pw_uid=os.getuid()))),
+            patch("ops.deployment_hardening.grp", SimpleNamespace(
+                getgrnam=lambda _name: SimpleNamespace(gr_gid=gid + 1))),
+        ):
+            with self.assertRaisesRegex(DeploymentError, "unsafe ownership"):
+                validate_bootstrap_post_merge(
+                    self.runner, self.context,
+                    module_name="ops.td02c_deployment_runner",
+                )
+
+    def test_post_merge_rejects_symlink(self):
+        path = self.repo / "added.txt"
+        path.unlink()
+        try:
+            path.symlink_to("runtime.txt")
+        except OSError:
+            self.skipTest("symlink creation unavailable")
+        with self.assertRaises(DeploymentError):
+            validate_bootstrap_post_merge(
+                self.runner, self.context,
+                module_name="ops.td02c_deployment_runner",
+            )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX permission semantics")
+    def test_post_merge_rejects_expanded_permissions(self):
+        (self.repo / "added.txt").chmod(0o666)
+        with patch("ops.deployment_hardening.pwd", SimpleNamespace(
+            getpwnam=lambda _name: SimpleNamespace(pw_uid=os.getuid()))), patch(
+            "ops.deployment_hardening.grp", None
+        ):
+            with self.assertRaisesRegex(DeploymentError, "unsafe permissions"):
+                validate_bootstrap_post_merge(
+                    self.runner, self.context,
+                    module_name="ops.td02c_deployment_runner",
+                )
+
     def test_bootstrap_runs_preflight_once_and_installs_module(self):
         args = self._bootstrap_args()
         with (

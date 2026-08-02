@@ -1373,9 +1373,9 @@ def validate_bootstrap_post_merge(
         if actual != context.runtime_metadata.get(name):
             raise DeploymentError(f"Runtime metadata changed during bootstrap: {name}")
     expected_uid = pwd.getpwnam(user).pw_uid if pwd is not None else None
-    expected_gid = (
-        grp.getgrnam(context.service.group).gr_gid
-        if grp is not None and context.service.group else None
+    allowed_gids = (
+        {grp.getgrnam(name).gr_gid for name in ("app", "www-data")}
+        if grp is not None else None
     )
     for name in context.changed_files:
         path = safe_repo_path(cwd, name)
@@ -1385,12 +1385,25 @@ def validate_bootstrap_post_merge(
         ).returncode == 0
         if in_target != path.exists():
             raise DeploymentError(f"Bootstrap path materialization mismatch: {name}")
-        if in_target and (
-            path.is_symlink()
-            or (expected_uid is not None and path.stat(follow_symlinks=False).st_uid != expected_uid)
-            or (expected_gid is not None and path.stat(follow_symlinks=False).st_gid != expected_gid)
-        ):
-            raise DeploymentError(f"Bootstrap materialized unsafe ownership: {name}")
+        if in_target:
+            info = path.stat(follow_symlinks=False)
+            if (
+                path.is_symlink()
+                or (expected_uid is not None and info.st_uid != expected_uid)
+                or (allowed_gids is not None and info.st_gid not in allowed_gids)
+            ):
+                raise DeploymentError(f"Bootstrap materialized unsafe ownership: {name}")
+            tree = runner.run(
+                ["git", "ls-tree", context.target_sha, "--", name],
+                cwd=cwd, user=user,
+            ).stdout.split(None, 1)
+            if len(tree) != 2 or not tree[0].isdigit():
+                raise DeploymentError(f"Bootstrap target metadata missing: {name}")
+            git_executable = bool(int(tree[0], 8) & 0o111)
+            actual_mode = stat.S_IMODE(info.st_mode)
+            expected_mode = 0o755 if git_executable else 0o644
+            if pwd is not None and actual_mode != expected_mode:
+                raise DeploymentError(f"Bootstrap materialized unsafe permissions: {name}")
     module_path = module_name.replace(".", "/") + ".py"
     safe_repo_path(cwd, module_path, must_exist=True)
     runner.run(
