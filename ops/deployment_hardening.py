@@ -21,8 +21,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 try:
+    import grp
     import pwd
 except ImportError:  # pragma: no cover - operational tooling is POSIX-only
+    grp = None  # type: ignore[assignment]
     pwd = None  # type: ignore[assignment]
 
 
@@ -1309,29 +1311,94 @@ def bootstrap_module_deployment(
     try:
         mutation_started = True
         runner.run(["git", "merge", "--ff-only", args.target_sha], cwd=cwd, user=user)
-        head = runner.run(["git", "rev-parse", "HEAD"], cwd=cwd, user=user).stdout.strip()
-        if head != args.target_sha:
-            raise DeploymentError("Bootstrap HEAD mismatch after fast-forward")
-        for name, expected in context.runtime_hashes.items():
-            if sha256_file(safe_repo_path(cwd, name, must_exist=True)) != expected:
-                raise DeploymentError(f"Runtime changed during bootstrap: {name}")
-        expected_uid = pwd.getpwnam(user).pw_uid if pwd is not None else None
-        for name in context.changed_files:
-            path = safe_repo_path(cwd, name)
-            if path.exists() and (
-                path.is_symlink()
-                or (expected_uid is not None and path.stat(follow_symlinks=False).st_uid != expected_uid)
-            ):
-                raise DeploymentError(f"Bootstrap materialized unsafe ownership: {name}")
-        safe_repo_path(cwd, module_path, must_exist=True)
-        runner.run(
-            [str(service.python), "-c", f"import {module_name}"], cwd=cwd, user=user
+        head = validate_bootstrap_post_merge(
+            runner, context, module_name=module_name
         )
         return {"phase": "bootstrap-complete", "head": head, "module": module_name}
     except BaseException:
         if mutation_started:
             targeted_rollback(args, runner, context, [])
         raise
+
+
+def validate_bootstrap_post_merge(
+    runner: Runner,
+    context: DeploymentContext,
+    *,
+    module_name: str,
+) -> str:
+    """Validate the materialized target without re-running old-HEAD preflight."""
+    cwd, user = context.service.working_directory, context.service.user
+    if not user:
+        raise DeploymentError("Post-merge service user is empty")
+    head = runner.run(["git", "rev-parse", "HEAD"], cwd=cwd, user=user).stdout.strip()
+    branch = runner.run(
+        ["git", "branch", "--show-current"], cwd=cwd, user=user
+    ).stdout.strip()
+    if head != context.target_sha:
+        raise DeploymentError("Bootstrap post-merge HEAD is not target")
+    if branch != context.branch:
+        raise DeploymentError("Bootstrap post-merge branch mismatch")
+    if runner.run(["git", "ls-files", "-u"], cwd=cwd, user=user).stdout.strip():
+        raise DeploymentError("Bootstrap post-merge has unmerged paths")
+    if runner.run(
+        ["git", "diff", "--cached", "--quiet"], cwd=cwd, user=user, check=False
+    ).returncode:
+        raise DeploymentError("Bootstrap post-merge has staged changes")
+    for cached in (False, True):
+        command = ["git", "diff", "--quiet"]
+        if cached:
+            command.append("--cached")
+        command.extend([context.target_sha, "--", *context.changed_files])
+        if runner.run(command, cwd=cwd, user=user, check=False).returncode:
+            raise DeploymentError("Bootstrap working tree is partially materialized")
+    current_runtime = git_lines(runner, cwd, "diff", "--name-only", user=user)
+    if current_runtime != context.runtime_files:
+        raise DeploymentError("Bootstrap post-merge runtime file set changed")
+    if git_lines(runner, cwd, "ls-files", "--others", "--exclude-standard", user=user):
+        raise DeploymentError("Bootstrap post-merge has untracked paths")
+    for name, expected in context.runtime_hashes.items():
+        path = safe_repo_path(cwd, name, must_exist=True)
+        if sha256_file(path) != expected:
+            raise DeploymentError(f"Runtime changed during bootstrap: {name}")
+        info = path.stat()
+        actual = {
+            "sha256": expected,
+            "mode": stat.S_IMODE(info.st_mode),
+            "uid": info.st_uid,
+            "gid": info.st_gid,
+            "size": info.st_size,
+            "mtime_ns": info.st_mtime_ns,
+        }
+        if actual != context.runtime_metadata.get(name):
+            raise DeploymentError(f"Runtime metadata changed during bootstrap: {name}")
+    expected_uid = pwd.getpwnam(user).pw_uid if pwd is not None else None
+    expected_gid = (
+        grp.getgrnam(context.service.group).gr_gid
+        if grp is not None and context.service.group else None
+    )
+    for name in context.changed_files:
+        path = safe_repo_path(cwd, name)
+        in_target = runner.run(
+            ["git", "cat-file", "-e", f"{context.target_sha}:{name}"],
+            cwd=cwd, user=user, check=False,
+        ).returncode == 0
+        if in_target != path.exists():
+            raise DeploymentError(f"Bootstrap path materialization mismatch: {name}")
+        if in_target and (
+            path.is_symlink()
+            or (expected_uid is not None and path.stat(follow_symlinks=False).st_uid != expected_uid)
+            or (expected_gid is not None and path.stat(follow_symlinks=False).st_gid != expected_gid)
+        ):
+            raise DeploymentError(f"Bootstrap materialized unsafe ownership: {name}")
+    module_path = module_name.replace(".", "/") + ".py"
+    safe_repo_path(cwd, module_path, must_exist=True)
+    runner.run(
+        [str(context.service.python), "-c", f"import {module_name}; "
+         "from ops.td02c_deployment_runner import _django_state; _django_state()"],
+        cwd=cwd, user=user,
+    )
+    return head
 
 
 def build_parser() -> argparse.ArgumentParser:

@@ -42,6 +42,7 @@ from ops.deployment_hardening import (
     validate_token,
     wait_for_application_ready,
     validate_readiness_layers,
+    validate_bootstrap_post_merge,
     warning_codes,
 )
 
@@ -68,6 +69,168 @@ class BootstrapContractTests(unittest.TestCase):
         for actual, expected in (([a, b, c], [a, b]), ([a], [a, b]), ([b, a], [a, b])):
             with self.subTest(actual=actual), self.assertRaises(DeploymentError):
                 require_exact_commit_sequence(actual, expected)
+
+
+class _BootstrapGitRunner:
+    def run(self, command, *, cwd=None, user=None, check=True, **kwargs):
+        if command and Path(str(command[0])).name.startswith("python"):
+            return subprocess.CompletedProcess(command, 0, "", "")
+        result = subprocess.run(
+            command, cwd=cwd, text=True, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        if check and result.returncode:
+            raise DeploymentError(result.stderr.strip())
+        return result
+
+
+class BootstrapPostMergeGateTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        isolate_git_environment(self, self.root)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "production"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.email", "ops@example.invalid"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Ops Tests"], cwd=self.repo, check=True)
+        (self.repo / "runtime.txt").write_text("runtime-base", encoding="utf-8")
+        (self.repo / "removed.txt").write_text("removed", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "old"], cwd=self.repo, check=True)
+        self.old = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        (self.repo / "ops").mkdir()
+        (self.repo / "ops" / "td02c_deployment_runner.py").write_text("VALUE=1\n", encoding="utf-8")
+        (self.repo / "added.txt").write_text("added", encoding="utf-8")
+        (self.repo / "removed.txt").unlink()
+        subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "target"], cwd=self.repo, check=True)
+        self.target = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        (self.repo / "runtime.txt").write_text("runtime-local", encoding="utf-8")
+        info = (self.repo / "runtime.txt").stat()
+        import hashlib, stat as stat_module
+        digest = hashlib.sha256((self.repo / "runtime.txt").read_bytes()).hexdigest()
+        service = ServiceMetadata(
+            unit="django.service", working_directory=self.repo,
+            exec_start_path=Path("/bin/true"), exec_start_raw="/bin/true",
+            python=Path("/usr/bin/python3"), user="app", group="app",
+            main_pid=1, fragment_path=Path("/tmp/django.service"),
+            environment_files=(),
+        )
+        self.context = DeploymentContext(
+            service=service, nginx=NginxTarget("invalid", 443, "", None),
+            old_sha=self.old, target_sha=self.target, repository=self.repo,
+            branch="production", remote="origin",
+            changed_files=["added.txt", "ops/td02c_deployment_runner.py", "removed.txt"],
+            runtime_files=["runtime.txt"], intersections=[],
+            runtime_hashes={"runtime.txt": digest}, baseline_smoke={},
+            baseline_warning_codes=set(), approved_commits=[self.target],
+            runtime_metadata={"runtime.txt": {
+                "sha256": digest, "mode": stat_module.S_IMODE(info.st_mode),
+                "uid": info.st_uid, "gid": info.st_gid, "size": info.st_size,
+                "mtime_ns": info.st_mtime_ns,
+            }},
+        )
+        self.runner = _BootstrapGitRunner()
+
+    def _bootstrap_args(self):
+        remote = self.root / "remote.git"
+        subprocess.run(["git", "clone", "--bare", "-q", str(self.repo), str(remote)], check=True)
+        subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=self.repo, check=True)
+        subprocess.run(["git", "checkout", "-q", self.old], cwd=self.repo, check=True)
+        subprocess.run(["git", "branch", "-f", "production", self.old], cwd=self.repo, check=True)
+        subprocess.run(["git", "checkout", "-q", "production"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "branch.production.remote", "origin"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "branch.production.merge", "refs/heads/production"], cwd=self.repo, check=True)
+        (self.repo / "runtime.txt").write_text("runtime-local", encoding="utf-8")
+        return Namespace(
+            service_unit="django.service", old_sha=self.old,
+            target_sha=self.target, remote="origin", branch="production",
+            expected_commit=[self.target],
+        )
+
+    def test_post_merge_accepts_target_and_added_removed_paths(self):
+        with patch("ops.deployment_hardening.pwd", None), patch("ops.deployment_hardening.grp", None):
+            result = validate_bootstrap_post_merge(
+                self.runner, self.context, module_name="ops.td02c_deployment_runner"
+            )
+        self.assertEqual(result, self.target)
+
+    def test_post_merge_rejects_old_head(self):
+        subprocess.run(["git", "checkout", "-q", self.old], cwd=self.repo, check=True)
+        with self.assertRaisesRegex(DeploymentError, "HEAD is not target"):
+            validate_bootstrap_post_merge(
+                self.runner, self.context, module_name="ops.td02c_deployment_runner"
+            )
+
+    def test_post_merge_rejects_partial_index(self):
+        (self.repo / "added.txt").write_text("partial", encoding="utf-8")
+        subprocess.run(["git", "add", "added.txt"], cwd=self.repo, check=True)
+        with self.assertRaisesRegex(DeploymentError, "staged changes"):
+            validate_bootstrap_post_merge(
+                self.runner, self.context, module_name="ops.td02c_deployment_runner"
+            )
+
+    def test_post_merge_rejects_runtime_metadata_change(self):
+        os.utime(self.repo / "runtime.txt", ns=(
+            (self.repo / "runtime.txt").stat().st_atime_ns,
+            (self.repo / "runtime.txt").stat().st_mtime_ns + 1_000_000_000,
+        ))
+        with self.assertRaisesRegex(DeploymentError, "Runtime metadata changed"):
+            validate_bootstrap_post_merge(
+                self.runner, self.context, module_name="ops.td02c_deployment_runner"
+            )
+
+    def test_post_merge_rejects_changed_path_wrong_ownership(self):
+        with (
+            patch("ops.deployment_hardening.pwd",
+                  SimpleNamespace(getpwnam=lambda _name: SimpleNamespace(pw_uid=999999))),
+            patch("ops.deployment_hardening.grp",
+                  SimpleNamespace(getgrnam=lambda _name: SimpleNamespace(gr_gid=999999))),
+        ):
+            with self.assertRaisesRegex(DeploymentError, "unsafe ownership"):
+                validate_bootstrap_post_merge(
+                    self.runner, self.context,
+                    module_name="ops.td02c_deployment_runner",
+                )
+
+    def test_bootstrap_runs_preflight_once_and_installs_module(self):
+        args = self._bootstrap_args()
+        with (
+            patch("ops.deployment_hardening.discover_service", return_value=self.context.service),
+            patch("ops.deployment_hardening.require_commands"),
+            patch("ops.deployment_hardening.preflight", wraps=__import__(
+                "ops.deployment_hardening", fromlist=["preflight"]
+            ).preflight) as preflight_call,
+            patch("ops.deployment_hardening.pwd", None),
+            patch("ops.deployment_hardening.grp", None),
+        ):
+            report = bootstrap_module_deployment(
+                args, self.runner, "ops.td02c_deployment_runner"
+            )
+        self.assertEqual(report["head"], self.target)
+        self.assertTrue((self.repo / "ops" / "td02c_deployment_runner.py").is_file())
+        self.assertEqual(preflight_call.call_count, 1)
+
+    def test_post_merge_failure_triggers_targeted_rollback(self):
+        args = self._bootstrap_args()
+        with (
+            patch("ops.deployment_hardening.discover_service", return_value=self.context.service),
+            patch("ops.deployment_hardening.require_commands"),
+            patch("ops.deployment_hardening.validate_bootstrap_post_merge",
+                  side_effect=DeploymentError("synthetic post-merge failure")),
+            patch("ops.deployment_hardening.pwd", None),
+            patch("ops.deployment_hardening.grp", None),
+        ):
+            with self.assertRaisesRegex(DeploymentError, "synthetic post-merge"):
+                bootstrap_module_deployment(
+                    args, self.runner, "ops.td02c_deployment_runner"
+                )
+        head = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True
+        ).strip()
+        self.assertEqual(head, self.old)
+        self.assertEqual((self.repo / "runtime.txt").read_text(encoding="utf-8"), "runtime-local")
 
 
 def isolate_git_environment(testcase, root):

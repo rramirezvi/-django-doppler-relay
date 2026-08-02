@@ -469,9 +469,13 @@ orquestador desde una copia ad hoc. Su única interfaz es:
   --bootstrap-module ops.td02c_deployment_runner
 ```
 
-El bootstrap valida remotamente sin mutar, refresca de forma controlada, hace
-fast-forward al SHA completo, comprueba HEAD/runtime/ownership e importa el
-módulo; luego se detiene. Rechaza usarlo si el módulo ya existía y no realiza
+El bootstrap ejecuta el preflight inicial una sola vez con `HEAD=OLD`, valida
+remotamente sin mutar, refresca de forma controlada y hace fast-forward al SHA
+completo. Después usa un gate post-merge separado que exige `HEAD=TARGET` y
+comprueba rama, índice, paths unmerged, materialización, runtime con metadata,
+ownership, archivos añadidos/eliminados, settings desactivados e importación del
+módulo; nunca vuelve a ejecutar el preflight de `HEAD=OLD`. Luego se detiene.
+Rechaza usarlo si el módulo ya existía y no realiza
 backup de datos, migraciones, reinicios, readiness posterior, smoke tests,
 dependencias, `collectstatic`, cambios de `.env` ni canary. Después de
 incorporarlo, todo preflight,
