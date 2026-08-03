@@ -278,9 +278,18 @@ despliegue se verifica el mismo commit exacto junto con checks no destructivos.
 - evidencia ligada al SHA objetivo y a la secuencia exacta de commits.
 
 Para TD-02C sobre `1bc524a487811c3a524025ceb323f82e4821e7bc`, la
-evidencia aprobada es: cliente HTTP 8/8, API V2 27/27 en PostgreSQL aislado,
+evidencia aprobada fue: cliente HTTP 8/8, API V2 27/27 en PostgreSQL aislado,
 suite ops 87/87 y repeticiones Linux deterministas. El gate aborta si el SHA o
 el orden `d7de839...` → `1bc524a...` no coincide.
+
+`validate_predeployment_evidence` (ops/deployment_test_profile.py) exige pisos
+mínimos, no conteos exactos: `api_v2_passed`, `http_client_passed` y
+`ops_passed` deben ser mayores o iguales a `MINIMUM_API_V2_PASSED`,
+`MINIMUM_HTTP_CLIENT_PASSED` y `MINIMUM_OPS_PASSED`. Estas suites crecen con el
+tiempo por cobertura legítima; cada despliegue posterior debe aportar
+evidencia real igual o superior al conteo real vigente, y el piso solo se
+actualiza cuando el conteo real de la suite correspondiente crece de forma
+estable.
 
 ### B. Permitido durante el despliegue productivo
 

@@ -14,6 +14,15 @@ from collections.abc import Sequence
 
 FULL_COMMIT = re.compile(r"^[0-9a-f]{40,64}$")
 
+# Minimum passed-test floors for predeployment evidence.  These are floors,
+# not exact snapshots: the underlying suites grow over time as legitimate
+# coverage is added, so evidence must meet or exceed the current baseline
+# rather than match a historical count exactly. Bump a floor only when the
+# corresponding suite's real count has grown and stayed there.
+MINIMUM_API_V2_PASSED = 27
+MINIMUM_HTTP_CLIENT_PASSED = 32
+MINIMUM_OPS_PASSED = 257
+
 
 class TestProfile(str, enum.Enum):
     ISOLATED = "isolated"
@@ -85,11 +94,11 @@ def validate_predeployment_evidence(
         raise TestProfileError("Evidence commit sequence does not match target range")
     if not expected_commits or expected_commits[-1] != target_sha:
         raise TestProfileError("Expected commit sequence does not end at target")
-    if evidence.api_v2_passed != 27:
+    if evidence.api_v2_passed < MINIMUM_API_V2_PASSED:
         raise TestProfileError("API V2 isolated evidence is incomplete")
-    if evidence.http_client_passed != 8:
+    if evidence.http_client_passed < MINIMUM_HTTP_CLIENT_PASSED:
         raise TestProfileError("HTTP client evidence is incomplete")
-    if evidence.ops_passed < 87:
+    if evidence.ops_passed < MINIMUM_OPS_PASSED:
         raise TestProfileError("Ops suite evidence is incomplete")
     if not evidence.linux_repetitions_passed:
         raise TestProfileError("Linux deterministic repetitions did not pass")

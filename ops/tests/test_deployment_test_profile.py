@@ -1,6 +1,9 @@
 import unittest
 
 from ops.deployment_test_profile import (
+    MINIMUM_API_V2_PASSED,
+    MINIMUM_HTTP_CLIENT_PASSED,
+    MINIMUM_OPS_PASSED,
     TestProfile,
     TestProfileError,
     ValidationEvidence,
@@ -14,16 +17,18 @@ D7 = "d7de839466e3cf3e1a8455376a48f1292d6d4e08"
 TARGET = "1bc524a487811c3a524025ceb323f82e4821e7bc"
 
 
-def approved_evidence():
-    return ValidationEvidence(
-        target_sha=TARGET,
-        commit_sequence=(D7, TARGET),
-        api_v2_passed=27,
-        http_client_passed=8,
-        ops_passed=87,
-        linux_repetitions_passed=True,
-        postgresql_major=17,
-    )
+def approved_evidence(**overrides):
+    values = {
+        "target_sha": TARGET,
+        "commit_sequence": (D7, TARGET),
+        "api_v2_passed": MINIMUM_API_V2_PASSED,
+        "http_client_passed": MINIMUM_HTTP_CLIENT_PASSED,
+        "ops_passed": MINIMUM_OPS_PASSED,
+        "linux_repetitions_passed": True,
+        "postgresql_major": 17,
+    }
+    values.update(overrides)
+    return ValidationEvidence(**values)
 
 
 class ProductionTestProfileTests(unittest.TestCase):
@@ -95,6 +100,31 @@ class ProductionTestProfileTests(unittest.TestCase):
                 approved_evidence(), target_sha=wrong,
                 expected_commits=(D7, wrong),
             )
+
+    def test_evidence_above_minimum_floors_is_accepted(self):
+        """Floors are minimums, not exact snapshots: suites may grow over time."""
+        validate_predeployment_evidence(
+            approved_evidence(
+                api_v2_passed=MINIMUM_API_V2_PASSED + 5,
+                http_client_passed=MINIMUM_HTTP_CLIENT_PASSED + 5,
+                ops_passed=MINIMUM_OPS_PASSED + 5,
+            ),
+            target_sha=TARGET, expected_commits=(D7, TARGET),
+        )
+
+    def test_evidence_below_minimum_floors_is_rejected(self):
+        cases = {
+            "api_v2_passed": (MINIMUM_API_V2_PASSED - 1, "API V2"),
+            "http_client_passed": (MINIMUM_HTTP_CLIENT_PASSED - 1, "HTTP client"),
+            "ops_passed": (MINIMUM_OPS_PASSED - 1, "Ops suite"),
+        }
+        for field, (value, message) in cases.items():
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(TestProfileError, message):
+                    validate_predeployment_evidence(
+                        approved_evidence(**{field: value}),
+                        target_sha=TARGET, expected_commits=(D7, TARGET),
+                    )
 
 
 if __name__ == "__main__":
