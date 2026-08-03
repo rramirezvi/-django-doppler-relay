@@ -1590,6 +1590,13 @@ def _load_bootstrap_evidence(path: Path | None) -> object:
 
     if path is None or not path.is_absolute() or path.is_symlink() or not path.is_file():
         raise DeploymentError("Bootstrap evidence path is unsafe or missing")
+    info = path.stat(follow_symlinks=False)
+    if os.name == "posix" and stat.S_IMODE(info.st_mode) != 0o600:
+        raise DeploymentError("Bootstrap evidence file has unsafe permissions")
+    if info.st_nlink != 1:
+        raise DeploymentError("Bootstrap evidence file has unexpected hard links")
+    if hasattr(os, "geteuid") and info.st_uid != os.geteuid():
+        raise DeploymentError("Bootstrap evidence file has an unexpected owner")
     data = json.loads(path.read_text(encoding="utf-8"))
     allowed = {field.name for field in dataclasses.fields(BootstrapEvidence)}
     if set(data) != allowed:
@@ -1693,12 +1700,18 @@ def bootstrap_existing_component_deployment(
         target_sha=args.target_sha, user=user,
     )
     context = preflight(args, runner, operational_checks=True)
-    unauthorized = sorted(
-        name for name in context.changed_files if name not in authorized_paths
-    )
+    changed = set(context.changed_files)
+    authorized = set(authorized_paths)
+    unauthorized = sorted(changed - authorized)
     if unauthorized:
         raise DeploymentError(
             "Bootstrap-existing target modifies unauthorized paths: " + ", ".join(unauthorized)
+        )
+    missing = sorted(authorized - changed)
+    if missing:
+        raise DeploymentError(
+            "Bootstrap-existing allowlist expects paths absent from the target range: "
+            + ", ".join(missing)
         )
     if not context.changed_files:
         raise DeploymentError("Bootstrap-existing target introduces no changes")

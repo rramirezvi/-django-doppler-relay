@@ -21,7 +21,15 @@ FULL_COMMIT = re.compile(r"^[0-9a-f]{40,64}$")
 # corresponding suite's real count has grown and stayed there.
 MINIMUM_API_V2_PASSED = 27
 MINIMUM_HTTP_CLIENT_PASSED = 32
-MINIMUM_OPS_PASSED = 257
+MINIMUM_OPS_PASSED = 279
+
+# Bootstrap-only floors: each names one specific suite the cumulative
+# blocked-gate bootstrap (nginx discovery diagnostics, the evidence gate
+# itself, and the bootstrap-existing-component mechanism) must exercise, in
+# addition to the shared floors above.
+MINIMUM_NGINX_DIAGNOSTICS_PASSED = 22
+MINIMUM_DEPLOYMENT_TEST_PROFILE_PASSED = 17
+MINIMUM_DEPLOYMENT_HARDENING_PASSED = 110
 
 
 class TestProfile(str, enum.Enum):
@@ -58,6 +66,9 @@ class BootstrapEvidence:
     authorized_paths: tuple[str, ...]
     api_v2_passed: int
     http_client_passed: int
+    nginx_diagnostics_passed: int
+    deployment_test_profile_passed: int
+    deployment_hardening_passed: int
     ops_passed: int
     linux_repetitions_passed: bool
     postgresql_major: int
@@ -156,6 +167,12 @@ def validate_bootstrap_evidence(
         raise TestProfileError("Bootstrap API V2 isolated evidence is incomplete")
     if evidence.http_client_passed < MINIMUM_HTTP_CLIENT_PASSED:
         raise TestProfileError("Bootstrap HTTP client evidence is incomplete")
+    if evidence.nginx_diagnostics_passed < MINIMUM_NGINX_DIAGNOSTICS_PASSED:
+        raise TestProfileError("Bootstrap Nginx discovery diagnostics evidence is incomplete")
+    if evidence.deployment_test_profile_passed < MINIMUM_DEPLOYMENT_TEST_PROFILE_PASSED:
+        raise TestProfileError("Bootstrap deployment_test_profile evidence is incomplete")
+    if evidence.deployment_hardening_passed < MINIMUM_DEPLOYMENT_HARDENING_PASSED:
+        raise TestProfileError("Bootstrap deployment_hardening evidence is incomplete")
     if evidence.ops_passed < MINIMUM_OPS_PASSED:
         raise TestProfileError("Bootstrap ops suite evidence is incomplete")
     if not evidence.linux_repetitions_passed:

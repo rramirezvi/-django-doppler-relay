@@ -543,17 +543,34 @@ conteo real de una suite), ningún despliegue normal puede instalar el fix,
 porque el gate que lo bloquea sigue siendo el viejo hasta después del merge.
 
 Para ese único escenario, `ops.deployment_hardening` expone un modo separado
-y de alcance cerrado:
+y de alcance cerrado. El bootstrap acumulado que instala el diagnóstico
+Nginx, la corrección del gate de evidencia y el propio mecanismo
+`--bootstrap-existing-component` (rango exacto
+`e47582655d84c1da85880ff8f1b55a731e5be4c5..617e450675776128f37b7d527b9795a3d0c042dc`,
+derivado con `git diff --name-status`, sin intersección con runtime, código
+Django productivo, migraciones, dependencias, estáticos ni `.env`) usa
+exactamente estos ocho paths, ni uno más ni uno menos — la allowlist debe
+coincidir con el rango exacto, no ser un patrón (`ops/**` queda rechazado
+igual que cualquier path fuera de ella):
 
 ```bash
 .venv/bin/python -m ops.deployment_hardening \
-  --service-unit django.service --old-sha OLD --target-sha TARGET \
+  --service-unit django.service \
+  --old-sha e47582655d84c1da85880ff8f1b55a731e5be4c5 \
+  --target-sha 617e450675776128f37b7d527b9795a3d0c042dc \
   --remote origin --branch operator-ui-production-test \
   --worker-unit doppler-background-jobs.service \
-  --expected-commit TARGET \
-  --bootstrap-existing-component ops/deployment_test_profile.py \
-  --bootstrap-existing-component ops/tests/test_deployment_test_profile.py \
+  --expected-commit 70392cf62499e45e995a6342e6aca4b9b729ebc3 \
+  --expected-commit f5d0466d27bebd8b1dbb11397981b5cbba3bff32 \
+  --expected-commit 617e450675776128f37b7d527b9795a3d0c042dc \
   --bootstrap-existing-component ops/README.md \
+  --bootstrap-existing-component ops/deployment_hardening.py \
+  --bootstrap-existing-component ops/deployment_test_profile.py \
+  --bootstrap-existing-component ops/td02c_authenticated_get_runner.py \
+  --bootstrap-existing-component ops/td02c_http_client.py \
+  --bootstrap-existing-component ops/tests/test_deployment_hardening.py \
+  --bootstrap-existing-component ops/tests/test_deployment_test_profile.py \
+  --bootstrap-existing-component ops/tests/test_td02c_authenticated_get_runner.py \
   --bootstrap-evidence /ruta/externa/bootstrap-evidencia.json
 ```
 
@@ -562,13 +579,21 @@ Diferencias respecto a `--bootstrap-module`:
 - No exige que los paths sean nuevos; están pensados para actualizar
   componentes que ya existen en `old_sha`, pero solo los indicados
   explícitamente con `--bootstrap-existing-component` (patrón `ops/...`,
-  repetible). Cualquier archivo en el rango que no esté en esa allowlist
-  cerrada aborta el bootstrap antes de tocar Git.
+  repetible). El conjunto autorizado debe coincidir exactamente con el
+  conjunto real de archivos modificados en el rango: un archivo modificado
+  fuera de la allowlist la rechaza, y un path autorizado que nunca cambió
+  realmente también la rechaza — ni superset ni subset.
 - Nunca importa ni ejecuta `validate_predeployment_evidence`. En su lugar
   exige `--bootstrap-evidence`, un `BootstrapEvidence` (esquema distinto de
-  `ValidationEvidence`: agrega `authorized_paths`, así que un archivo no
-  puede reutilizarse para el otro esquema) atado a `target_sha`, a la
-  secuencia exacta de commits y a la allowlist exacta usada.
+  `ValidationEvidence`: agrega `authorized_paths` y desglosa por suite —
+  `api_v2_passed`, `http_client_passed`, `nginx_diagnostics_passed`,
+  `deployment_test_profile_passed`, `deployment_hardening_passed`,
+  `ops_passed` agregado, `linux_repetitions_passed`, `postgresql_major` — así
+  que un archivo no puede reutilizarse para el otro esquema) atado a
+  `target_sha`, a la secuencia exacta de commits y a la allowlist exacta
+  usada. El archivo de evidencia debe ser externo al checkout, `0600`, sin
+  symlinks, con un único hardlink y propiedad del usuario que ejecuta el
+  bootstrap.
 - Antes del merge corre el mismo `preflight(operational_checks=True)` del
   despliegue normal (nginx, readiness, `manage.py check`) más una
   verificación de jobs/V2/ledger/flags/worker en un proceso Python aparte,
@@ -586,3 +611,30 @@ Diferencias respecto a `--bootstrap-module`:
 Tras instalar el fix, todos los despliegues normales vuelven a exigir
 `ValidationEvidence` estándar a través de `ops.td02c_deployment_runner`; este
 modo no lo sustituye ni lo vuelve reutilizable para despliegues ordinarios.
+
+#### Contrato de ejecución del bootstrap acumulado
+
+Como el `ops.deployment_hardening` instalado en `old_sha` es el que valida
+este mismo bootstrap, la ejecución real usa la versión **target** del módulo
+desde una copia efímera, no el checkout productivo todavía en `old_sha`:
+
+- la copia vive en un directorio externo al checkout, creado por `mktemp -d`
+  como el usuario operativo, modo `0700`, fuera de cualquier ruta fija;
+- su contenido se verifica por SHA256 contra el árbol exacto de
+  `ops.deployment_hardening`/`ops.deployment_test_profile` en el `target_sha`
+  antes de invocarla — nunca se copia a ciegas;
+- se invoca como `python -m ops.deployment_hardening` con `PYTHONPATH`
+  apuntando solo a esa copia efímera para esa invocación puntual; no se
+  exporta ni persiste una variable de entorno global;
+- no contiene credenciales, `.env` ni ningún artefacto de evidencia — el
+  `--bootstrap-evidence` se pasa por ruta externa, igual que en cualquier
+  otro modo;
+- se elimina siempre al finalizar, en éxito o error, verificando que el
+  directorio quede completamente vacío antes de borrarlo;
+- Git corre siempre como el usuario operativo (`app`), nunca como root ni
+  mediante `runuser` anidado.
+
+El único rol permitido para un wrapper Bash externo es transportar esa copia
+y ejecutar la invocación de un solo módulo versionado de arriba; no puede
+reconstruir merge, rollback, readiness, settings, evidencia ni ningún otro
+paso — las mismas restricciones que ya aplican al resto del orquestador.

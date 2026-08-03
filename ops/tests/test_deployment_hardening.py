@@ -511,12 +511,17 @@ class BootstrapExistingComponentTests(unittest.TestCase):
             "authorized_paths": list(self.AUTHORIZED_PATHS),
             "api_v2_passed": 27,
             "http_client_passed": 32,
-            "ops_passed": 257,
+            "nginx_diagnostics_passed": 22,
+            "deployment_test_profile_passed": 17,
+            "deployment_hardening_passed": 110,
+            "ops_passed": 279,
             "linux_repetitions_passed": True,
             "postgresql_major": 17,
         }
         values.update(overrides)
         self.evidence_path.write_text(json.dumps(values), encoding="utf-8")
+        if os.name == "posix":
+            self.evidence_path.chmod(0o600)
         return self.evidence_path
 
     def args(self, **overrides):
@@ -618,8 +623,32 @@ class BootstrapExistingComponentTests(unittest.TestCase):
 
     # 7. target con lógica productiva Django: FAIL
     def test_non_ops_path_can_never_be_authorized(self):
-        with self.assertRaisesRegex(DeploymentError, "Unsafe or duplicated"):
-            self.run_bootstrap(authorized_paths=("relay/models.py",))
+        for candidate in (
+            "relay/models.py",
+            "relay/migrations/0001_initial.py",
+            "config/settings.py",
+            "requirements.txt",
+            ".env",
+            "static/app.css",
+        ):
+            with self.subTest(candidate=candidate):
+                with self.assertRaisesRegex(DeploymentError, "Unsafe or duplicated"):
+                    self.run_bootstrap(authorized_paths=(candidate,))
+
+    # 7b. ausencia de un path esperado: FAIL (allowlist wider than the real
+    # changed-file set -- expecting a path that never actually changed -- is
+    # rejected just as strictly as an unauthorized extra change)
+    def test_allowlist_wider_than_the_changed_set_is_rejected(self):
+        wider = self.AUTHORIZED_PATHS + ("ops/never_changed.py",)
+        self.write_evidence(authorized_paths=list(wider))
+        with self.assertRaisesRegex(DeploymentError, "expects paths absent"):
+            self.run_bootstrap(authorized_paths=wider)
+
+    # 7c. orden de commits incorrecto: FAIL
+    def test_wrong_expected_commit_order_is_rejected(self):
+        self.write_evidence()
+        with self.assertRaises(DeploymentError):
+            self.run_bootstrap(expected_commit=[self.old, self.target])
 
     # 8. fast-forward imposible: FAIL
     def test_impossible_fast_forward_is_rejected(self):
