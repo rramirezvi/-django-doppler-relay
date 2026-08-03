@@ -9,6 +9,7 @@ import os
 import signal
 import stat
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Sequence
 

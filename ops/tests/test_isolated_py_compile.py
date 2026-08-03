@@ -69,6 +69,36 @@ class IsolatedPyCompileTests(unittest.TestCase):
             temporary_parent=self.root,
         )
 
+    def test_ephemeral_compile_uses_real_system_temp_and_cleans_everything(self):
+        temporary_parent = Path(tempfile.gettempdir()).resolve(strict=True)
+        before_workspaces = set(temporary_parent.glob("td02c-pycache-parent-*"))
+        before_status = subprocess.run(
+            ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+            cwd=self.repo, text=True, capture_output=True, check=True,
+        ).stdout
+        before_bytecode = set(self.repo.rglob("*.pyc"))
+
+        result = isolated_py_compile_ephemeral(
+            repository=self.repo,
+            python=Path(sys.executable),
+            service_user=self.user,
+            sources=[Path("ops/tool.py")],
+        )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(
+            set(temporary_parent.glob("td02c-pycache-parent-*")),
+            before_workspaces,
+        )
+        self.assertEqual(set(self.repo.rglob("*.pyc")), before_bytecode)
+        self.assertEqual(
+            subprocess.run(
+                ["git", "status", "--porcelain=v1", "--untracked-files=all"],
+                cwd=self.repo, text=True, capture_output=True, check=True,
+            ).stdout,
+            before_status,
+        )
+
     def test_ephemeral_compile_ignores_incompatible_fixed_cache_root(self):
         obsolete = self.root / "td02c-pycache-root"
         obsolete.mkdir(mode=0o500)
