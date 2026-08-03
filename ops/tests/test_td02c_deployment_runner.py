@@ -32,6 +32,8 @@ from ops.td02c_deployment_runner import (
     TD02CDeploymentError,
     main,
     repository_lock,
+    validate_operational_lock_residue,
+    validate_test_lock_workspace,
     validate_deploy_check_output,
     validate_single_invocation,
 )
@@ -183,6 +185,8 @@ class EndToEndRepositoryFlowTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
+        self.lock_directory = self.root / "test-locks"
+        self.lock_directory.mkdir(mode=0o700)
         self.repo = self.root / "repo"
         self.repo.mkdir()
         self.git("init", "-q", "-b", "production")
@@ -266,7 +270,10 @@ class EndToEndRepositoryFlowTests(unittest.TestCase):
 
     def backend(self, *, fail_phase=""):
         evidence = Evidence(self.evidence_path)
-        backend = ProductionBackend(self.config, evidence, self.HarnessRunner())
+        backend = ProductionBackend(
+            self.config, evidence, self.HarnessRunner(),
+            test_lock_directory=self.lock_directory,
+        )
         def preflight():
             backend.context = self.context
             return self.context
@@ -350,13 +357,100 @@ class EndToEndRepositoryFlowTests(unittest.TestCase):
             self.assertEqual(self.runtime_manifest(), self.runtime_before)
 
     def test_real_lock_rejects_concurrent_holder_and_accepts_stale_metadata(self):
-        with repository_lock(self.repo, "first") as lock_path:
+        with repository_lock(
+            self.repo, "first", test_lock_directory=self.lock_directory
+        ) as lock_path:
+            self.assertEqual(lock_path.parent, self.lock_directory)
+            self.assertTrue(lock_path.name.startswith("td02c-test-lock-"))
             with self.assertRaisesRegex(TD02CDeploymentError, "operation_already_running"):
-                with repository_lock(self.repo, "second"):
+                with repository_lock(
+                    self.repo, "second", test_lock_directory=self.lock_directory
+                ):
                     self.fail("second holder acquired active lock")
-        self.assertTrue(lock_path.exists())
-        with repository_lock(self.repo, "after-release"):
+        self.assertFalse(lock_path.exists())
+        with repository_lock(
+            self.repo, "after-release", test_lock_directory=self.lock_directory
+        ):
             pass
+        self.assertEqual(list(self.lock_directory.iterdir()), [])
+
+    def test_test_lock_cleanup_after_exception(self):
+        with self.assertRaisesRegex(RuntimeError, "synthetic"):
+            with repository_lock(
+                self.repo, "first", test_lock_directory=self.lock_directory
+            ):
+                raise RuntimeError("synthetic")
+        self.assertEqual(list(self.lock_directory.iterdir()), [])
+
+    def test_operational_lock_remains_closed_and_is_accepted(self):
+        operational = self.root / "operational"
+        operational.mkdir(mode=0o700)
+        with patch("ops.td02c_deployment_runner.tempfile.gettempdir", return_value=str(operational)):
+            with repository_lock(self.repo, "deploy-only") as lock_path:
+                with self.assertRaisesRegex(TD02CDeploymentError, "operational_lock_open"):
+                    validate_operational_lock_residue(self.repo)
+            self.assertTrue(lock_path.exists())
+            self.assertEqual(validate_operational_lock_residue(self.repo), lock_path)
+
+    def test_operational_lock_rejects_bad_mode_symlink_and_accumulation(self):
+        for scenario in ("mode", "symlink", "multiple"):
+            with self.subTest(scenario=scenario):
+                operational = self.root / f"operational-{scenario}"
+                operational.mkdir(mode=0o700)
+                with patch(
+                    "ops.td02c_deployment_runner.tempfile.gettempdir",
+                    return_value=str(operational),
+                ):
+                    if scenario == "symlink":
+                        digest = hashlib.sha256(
+                            str(self.repo.resolve()).encode()
+                        ).hexdigest()[:20]
+                        target = operational / "target"
+                        target.write_text("{}", encoding="utf-8")
+                        (operational / f"td02c-deployment-{digest}.lock").symlink_to(target)
+                    else:
+                        with repository_lock(self.repo, "deploy-only") as lock_path:
+                            pass
+                        if scenario == "mode":
+                            lock_path.chmod(0o644)
+                        else:
+                            extra = operational / "td02c-deployment-unexpected.lock"
+                            extra.write_text("{}", encoding="utf-8")
+                            extra.chmod(0o600)
+                    with self.assertRaises(TD02CDeploymentError):
+                        validate_operational_lock_residue(self.repo)
+
+    def test_test_lock_namespace_never_touches_global_operational_prefix(self):
+        global_before = set(Path(tempfile.gettempdir()).glob("td02c-deployment-*.lock"))
+        with repository_lock(
+            self.repo, "first", test_lock_directory=self.lock_directory
+        ):
+            self.assertEqual(
+                set(Path(tempfile.gettempdir()).glob("td02c-deployment-*.lock")),
+                global_before,
+            )
+        self.assertEqual(list(self.lock_directory.iterdir()), [])
+        validate_test_lock_workspace(self.repo, self.lock_directory)
+
+    def test_test_lock_workspace_residual_is_rejected(self):
+        residue = self.lock_directory / "td02c-test-lock-residue.lock"
+        residue.write_text("{}", encoding="utf-8")
+        residue.chmod(0o600)
+        with self.assertRaisesRegex(TD02CDeploymentError, "workspace_residual"):
+            validate_test_lock_workspace(self.repo, self.lock_directory)
+
+    def test_two_private_test_namespaces_do_not_collide(self):
+        second = self.root / "test-locks-second"
+        second.mkdir(mode=0o700)
+        with repository_lock(
+            self.repo, "first", test_lock_directory=self.lock_directory
+        ) as first:
+            with repository_lock(
+                self.repo, "second", test_lock_directory=second
+            ) as other:
+                self.assertNotEqual(first, other)
+        self.assertEqual(list(self.lock_directory.iterdir()), [])
+        self.assertEqual(list(second.iterdir()), [])
 
     def test_two_real_processes_cannot_hold_same_repository_lock(self):
         ready = self.root / "lock-ready"
@@ -364,12 +458,13 @@ class EndToEndRepositoryFlowTests(unittest.TestCase):
             "import pathlib,sys,time; "
             "from ops.td02c_deployment_runner import repository_lock; "
             "repo=pathlib.Path(sys.argv[1]); ready=pathlib.Path(sys.argv[2]); "
-            "ctx=repository_lock(repo,'child'); ctx.__enter__(); "
-            "ready.write_text('ready'); time.sleep(3); ctx.__exit__(None,None,None)"
+            "locks=pathlib.Path(sys.argv[3]); "
+            "ctx=repository_lock(repo,'child',test_lock_directory=locks); ctx.__enter__(); "
+            "ready.write_text('ready'); time.sleep(0.5); ctx.__exit__(None,None,None)"
         )
         project = Path(__file__).resolve().parents[2]
         process = subprocess.Popen(
-            [sys.executable, "-c", code, str(self.repo), str(ready)],
+            [sys.executable, "-c", code, str(self.repo), str(ready), str(self.lock_directory)],
             cwd=project, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
         )
         try:
@@ -378,11 +473,17 @@ class EndToEndRepositoryFlowTests(unittest.TestCase):
                 time.sleep(0.02)
             self.assertTrue(ready.exists(), "child did not acquire lock")
             with self.assertRaisesRegex(TD02CDeploymentError, "operation_already_running"):
-                with repository_lock(self.repo, "parent"):
+                with repository_lock(
+                    self.repo, "parent", test_lock_directory=self.lock_directory
+                ):
                     self.fail("parent acquired active child lock")
         finally:
-            process.terminate()
-            process.wait(timeout=5)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.terminate()
+                process.wait(timeout=5)
+        self.assertEqual(list(self.lock_directory.iterdir()), [])
 
     def test_sigint_and_sigterm_after_merge_trigger_targeted_rollback(self):
         for signum in (signal.SIGINT, signal.SIGTERM):
@@ -410,8 +511,12 @@ class EndToEndRepositoryFlowTests(unittest.TestCase):
                     with self.assertRaises(TD02CDeploymentError):
                         backend.deploy()
                 self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), self.old)
-                with repository_lock(self.repo, "after-signal"):
+                with repository_lock(
+                    self.repo, "after-signal",
+                    test_lock_directory=self.lock_directory,
+                ):
                     pass
+                self.assertEqual(list(self.lock_directory.iterdir()), [])
 
 
 if __name__ == "__main__":

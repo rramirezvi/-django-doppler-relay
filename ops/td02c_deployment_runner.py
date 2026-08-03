@@ -309,35 +309,170 @@ def validate_deploy_check_output(output: str) -> set[str]:
     return codes
 
 
+def _validated_test_lock_directory(repository: Path, directory: Path) -> Path:
+    if not directory.is_absolute() or directory.is_symlink():
+        raise TD02CDeploymentError("preflight", "unsafe_test_lock_directory")
+    directory = directory.resolve(strict=True)
+    repository = repository.resolve(strict=True)
+    info = directory.stat(follow_symlinks=False)
+    if (
+        not directory.is_dir()
+        or directory == repository
+        or repository in directory.parents
+        or stat.S_IMODE(info.st_mode) != 0o700
+        or info.st_uid != os.geteuid()
+        or info.st_gid != os.getegid()
+    ):
+        raise TD02CDeploymentError("preflight", "unsafe_test_lock_directory")
+    return directory
+
+
+def _lock_path(
+    repository: Path, *, test_lock_directory: Path | None = None
+) -> tuple[Path, bool]:
+    digest = hashlib.sha256(str(repository.resolve()).encode()).hexdigest()[:20]
+    if test_lock_directory is None:
+        return (
+            Path(tempfile.gettempdir()) / f"td02c-deployment-{digest}.lock",
+            False,
+        )
+    directory = _validated_test_lock_directory(repository, test_lock_directory)
+    return directory / f"td02c-test-lock-{digest}.lock", True
+
+
+def validate_test_lock_workspace(repository: Path, directory: Path) -> None:
+    directory = _validated_test_lock_directory(repository, directory)
+    if any(directory.iterdir()):
+        raise TD02CDeploymentError("monitor", "test_lock_workspace_residual")
+
+
+def _unlink_test_lock(path: Path, identity: tuple[int, int]) -> None:
+    info = path.stat(follow_symlinks=False)
+    if (
+        path.is_symlink()
+        or not stat.S_ISREG(info.st_mode)
+        or (info.st_dev, info.st_ino) != identity
+        or info.st_nlink != 1
+    ):
+        raise TD02CDeploymentError("cleanup", "test_lock_identity_changed")
+    path.unlink()
+
+
+def _lock_inode_open_elsewhere(info: os.stat_result, own_fd: int) -> bool:
+    proc = Path("/proc")
+    if not proc.is_dir():
+        raise TD02CDeploymentError("monitor", "proc_required_for_lock_audit")
+    own_pid = os.getpid()
+    for process in proc.iterdir():
+        if not process.name.isdigit():
+            continue
+        descriptors = process / "fd"
+        try:
+            entries = list(descriptors.iterdir())
+        except (FileNotFoundError, PermissionError, ProcessLookupError):
+            continue
+        for descriptor in entries:
+            if int(process.name) == own_pid and descriptor.name == str(own_fd):
+                continue
+            try:
+                opened = descriptor.stat()
+            except (FileNotFoundError, PermissionError, ProcessLookupError):
+                continue
+            if (opened.st_dev, opened.st_ino) == (info.st_dev, info.st_ino):
+                return True
+    return False
+
+
 @contextlib.contextmanager
-def repository_lock(repository: Path, operation: str):
+def repository_lock(
+    repository: Path,
+    operation: str,
+    *,
+    test_lock_directory: Path | None = None,
+):
     """Serialize every TD-02C operation using a kernel lock outside checkout."""
     if fcntl is None or os.name != "posix":
         raise TD02CDeploymentError("preflight", "flock_required")
-    digest = hashlib.sha256(str(repository.resolve()).encode()).hexdigest()[:20]
-    path = Path(tempfile.gettempdir()) / f"td02c-deployment-{digest}.lock"
+    path, cleanup_test_lock = _lock_path(
+        repository, test_lock_directory=test_lock_directory
+    )
     flags = os.O_RDWR | os.O_CREAT
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
     fd = os.open(path, flags, 0o600)
+    identity: tuple[int, int] | None = None
+    acquired = False
     try:
         info = os.fstat(fd)
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or stat.S_IMODE(info.st_mode) != 0o600:
             raise TD02CDeploymentError("preflight", "unsafe_operation_lock")
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            acquired = True
         except BlockingIOError as exc:
             raise TD02CDeploymentError("preflight", "operation_already_running") from exc
         payload = json.dumps({"pid": os.getpid(), "operation": operation}) + "\n"
         os.ftruncate(fd, 0)
         os.write(fd, payload.encode())
         os.fsync(fd)
+        identity = (info.st_dev, info.st_ino)
         yield path
     finally:
         try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            if acquired:
+                fcntl.flock(fd, fcntl.LOCK_UN)
         finally:
             os.close(fd)
+        if cleanup_test_lock and identity is not None:
+            _unlink_test_lock(path, identity)
+
+
+def validate_operational_lock_residue(repository: Path) -> Path:
+    """Accept one closed stable operational lock and reject accumulation."""
+    expected, _ = _lock_path(repository)
+    candidates = sorted(expected.parent.glob("td02c-deployment-*.lock"))
+    unexpected = [path for path in candidates if path != expected]
+    if unexpected:
+        raise TD02CDeploymentError("monitor", "unexpected_operational_locks")
+    if not expected.exists():
+        raise TD02CDeploymentError("monitor", "operational_lock_missing")
+    flags = os.O_RDWR
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(expected, flags)
+    except OSError as exc:
+        raise TD02CDeploymentError("monitor", "unsafe_operational_lock") from exc
+    try:
+        info = os.fstat(fd)
+        repo_info = repository.resolve(strict=True).stat()
+        if (
+            expected.is_symlink()
+            or not stat.S_ISREG(info.st_mode)
+            or info.st_nlink != 1
+            or stat.S_IMODE(info.st_mode) != 0o600
+            or info.st_uid != repo_info.st_uid
+            or info.st_gid != repo_info.st_gid
+        ):
+            raise TD02CDeploymentError("monitor", "unsafe_operational_lock")
+        if _lock_inode_open_elsewhere(info, fd):
+            raise TD02CDeploymentError("monitor", "operational_lock_open")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError as exc:
+            raise TD02CDeploymentError("monitor", "operational_lock_active") from exc
+        payload = json.loads(os.read(fd, max(info.st_size, 1)).decode() or "{}")
+        if (
+            set(payload) != {"pid", "operation"}
+            or not isinstance(payload["pid"], int)
+            or payload["pid"] <= 0
+            or payload["operation"] not in {"preflight-only", "deploy-only", "rollback"}
+        ):
+            raise TD02CDeploymentError("monitor", "invalid_operational_lock_metadata")
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+    return expected
 
 
 @contextlib.contextmanager
@@ -355,11 +490,25 @@ def deployment_signals():
 
 
 class ProductionBackend:
-    def __init__(self, config: Config, evidence: Evidence, runner: Runner | None = None):
+    def __init__(
+        self,
+        config: Config,
+        evidence: Evidence,
+        runner: Runner | None = None,
+        *,
+        test_lock_directory: Path | None = None,
+    ):
         self.config = config
         self.evidence = evidence
         self.runner = runner or Runner()
+        self.test_lock_directory = test_lock_directory
         self.context: DeploymentContext | None = None
+
+    def _validate_lock_cleanup(self, repository: Path) -> None:
+        if self.test_lock_directory is None:
+            validate_operational_lock_residue(repository)
+        else:
+            validate_test_lock_workspace(repository, self.test_lock_directory)
 
     def _require_service_identity(self, service: ServiceMetadata) -> None:
         if pwd is None or not hasattr(os, "geteuid"):
@@ -476,15 +625,40 @@ class ProductionBackend:
 
     def preflight(self) -> DeploymentContext:
         service = discover_service(self.runner, self.config.service_unit)
-        with repository_lock(service.working_directory, "preflight-only"):
-            return self._preflight_unlocked()
+        with repository_lock(
+            service.working_directory, "preflight-only",
+            test_lock_directory=self.test_lock_directory,
+        ):
+            context = self._preflight_unlocked()
+        self._validate_lock_cleanup(service.working_directory)
+        return context
 
     def deploy(self) -> None:
         service = discover_service(self.runner, self.config.service_unit)
         self._require_service_identity(service)
-        with repository_lock(service.working_directory, "deploy-only"):
-            with deployment_signals():
-                self._deploy_unlocked(service)
+        try:
+            with repository_lock(
+                service.working_directory, "deploy-only",
+                test_lock_directory=self.test_lock_directory,
+            ):
+                with deployment_signals():
+                    self._deploy_unlocked(service)
+            self._validate_lock_cleanup(service.working_directory)
+        except TD02CDeploymentError:
+            context = self.context
+            if context is not None:
+                head = self.runner.run(
+                    ["git", "rev-parse", "HEAD"], cwd=context.repository,
+                    user=context.service.user,
+                ).stdout.strip()
+                if head != context.old_sha:
+                    with repository_lock(
+                        service.working_directory, "rollback",
+                        test_lock_directory=self.test_lock_directory,
+                    ):
+                        targeted_rollback(_namespace(self.config), self.runner, context, [])
+                        self.evidence.emit("rollback", "PASS", "rollback_complete")
+            raise
 
     def _deploy_unlocked(self, service: ServiceMetadata) -> None:
         refresh_deployment_ref(
@@ -559,10 +733,14 @@ class ProductionBackend:
 
     def rollback(self) -> None:
         service = discover_service(self.runner, self.config.service_unit)
-        with repository_lock(service.working_directory, "rollback"):
+        with repository_lock(
+            service.working_directory, "rollback",
+            test_lock_directory=self.test_lock_directory,
+        ):
             context = context_from_evidence(self.config, self.evidence.output, self.runner)
             targeted_rollback(_namespace(self.config), self.runner, context, [])
             self.evidence.emit("rollback", "PASS", "rollback_complete")
+        self._validate_lock_cleanup(service.working_directory)
 
 
 def context_record(context: DeploymentContext) -> dict[str, Any]:
