@@ -66,6 +66,25 @@ ERROR_CODES = {
     "authenticated_get_failed",
     "cleanup_failed",
     "unknown_failure",
+    # Nginx-discovery diagnostic taxonomy (see CurlOperations.discover_target).
+    "systemctl_failed",
+    "service_metadata_invalid",
+    "working_directory_invalid",
+    "nginx_test_failed",
+    "nginx_dump_failed",
+    "nginx_output_empty",
+    "nginx_output_unparseable",
+    "no_vhost_found",
+    "multiple_vhosts_found",
+    "wildcard_vhost_rejected",
+    "variable_vhost_rejected",
+    "certificate_not_found",
+    "certificate_hostname_mismatch",
+    "local_resolution_invalid",
+    "command_permission_denied",
+    "command_not_found",
+    "subprocess_failed",
+    "unexpected_discovery_error",
 }
 
 
@@ -78,6 +97,7 @@ class StageDiagnostic:
     error_class: str = ""
     http: ResponseMetadata | None = None
     command: str = ""
+    detail: str = ""
 
     def as_safe_dict(self) -> dict[str, object]:
         value: dict[str, object] = {
@@ -103,6 +123,8 @@ class StageDiagnostic:
             }
         if self.command:
             value["command"] = self.command
+        if self.detail:
+            value["detail"] = self.detail
         return value
 
 

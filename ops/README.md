@@ -327,6 +327,49 @@ Todo estado ambiguo termina en `unknown_failure`. La limpieza ocurre en
 `finally` y un fallo al eliminar temporales también aborta. El workspace se
 mantiene fuera del checkout y no se conserva como evidencia.
 
+##### Diagnóstico granular del descubrimiento de Nginx (`nginx_target_discovered`)
+
+`CurlOperations.discover_target()` ya no delega en un único paso opaco: divide
+el descubrimiento en diez subetapas observables, cada una con su propia línea
+JSON sanitizada, antes de que el `stage()` externo registre el resultado final
+de `nginx_target_discovered`. La decisión de vhost sigue siendo exactamente la
+de `discover_nginx_target()` (sin cambios); las subetapas solo añaden
+diagnóstico read-only para diferenciar la causa:
+
+1. `service_metadata_loaded` — valida metadata del servicio ya descubierta y
+   reconfirma con `systemctl is-active` (`service_metadata_invalid`,
+   `systemctl_failed`).
+2. `service_working_directory_validated` — `WorkingDirectory` absoluto y
+   existente (`working_directory_invalid`).
+3. `nginx_config_tested` — `nginx -t` (`nginx_test_failed`,
+   `command_permission_denied`, `command_not_found`, `subprocess_failed`).
+4. `nginx_config_dumped` — `nginx -T` (`nginx_dump_failed`,
+   `nginx_output_empty`, mismas clasificaciones de ejecución).
+5. `vhost_candidates_parsed` — cuenta candidatos de `server_name` con las
+   mismas reglas de coincidencia que `discover_nginx_target` (`no_vhost_found`,
+   `wildcard_vhost_rejected`, `variable_vhost_rejected`,
+   `nginx_output_unparseable`).
+6. `unique_vhost_selected` — delega la decisión final en
+   `discover_nginx_target()` sin modificarla (`multiple_vhosts_found`,
+   `no_vhost_found`).
+7. `certificate_paths_discovered` — existencia del archivo de certificado
+   público (`certificate_not_found`).
+8. `certificate_hostname_validated` — `openssl x509 -checkhost`
+   (`certificate_hostname_mismatch`).
+9. `local_resolution_prepared` — verificación defensiva de que el hostname y
+   el socket seleccionados son seguros para `--resolve` (`local_resolution_invalid`).
+10. `nginx_target_validated` — confirmación final PASS.
+
+Cualquier excepción no clasificada en una subetapa se registra como
+`unexpected_discovery_error` en la subetapa que se estaba ejecutando; el fallo
+sigue siendo fail-closed: no se ejecuta HTTP, TLS, ni creación de sesión, y el
+cleanup de workspace/cookies/credencial ocurre igual que antes. Cada línea
+admite un campo opcional `detail` con un resumen corto y saneado (comando,
+cantidad de candidatos, hostname seleccionado, ruta pública del certificado, o
+la primera línea de stdout/stderr pasada por el mismo `redact_output` que usa
+el orquestador de despliegue). Nunca se registra el volcado completo de
+`nginx -T`, claves privadas, credenciales, cookies ni cuerpos HTTP.
+
 La ejecución productiva se realiza exclusivamente como módulo del paquete
 versionado `ops.td02c_authenticated_get_runner`; un wrapper temporal no puede
 reconstruir cookies, buscar sesiones ORM existentes ni ejecutar `curl` por su

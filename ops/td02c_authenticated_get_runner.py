@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -23,8 +24,10 @@ from ops.deployment_hardening import (
     DeploymentError,
     Runner,
     application_bind_from_exec_start,
-    discover_and_validate_nginx,
+    discover_nginx_target,
     discover_service,
+    extract_blocks,
+    redact_output,
 )
 from ops.td02c_http_client import (
     AuthenticatedGetFailure,
@@ -183,6 +186,101 @@ class DjangoState:
             raise RunnerFailure("session_cleanup_incomplete")
 
 
+_PERMISSION_DENIED_PATTERN = re.compile(r"permission denied", re.IGNORECASE)
+
+_RESOLVABLE_HOSTNAME = re.compile(
+    r"(?=.{1,253}\Z)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)*"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+)
+
+_DISCOVERY_SUBSTAGES = (
+    "service_metadata_loaded",
+    "service_working_directory_validated",
+    "nginx_config_tested",
+    "nginx_config_dumped",
+    "vhost_candidates_parsed",
+    "unique_vhost_selected",
+    "certificate_paths_discovered",
+    "certificate_hostname_validated",
+    "local_resolution_prepared",
+    "nginx_target_validated",
+)
+
+
+class _CommandExecutionError(Exception):
+    """Internal-only: carries a sanitized classification for a failed exec."""
+
+    def __init__(self, classification: str):
+        super().__init__(classification)
+        self.classification = classification
+
+
+@dataclass(frozen=True)
+class _VhostCandidateReport:
+    raw: tuple[str, ...]
+    filtered: tuple[str, ...]
+    has_wildcard: bool
+    has_variable: bool
+
+
+def _sanitize_stream(output: str, limit: int = 200) -> str:
+    """Return one short, redacted line; never the full nginx/openssl output."""
+    line = next((candidate.strip() for candidate in output.splitlines() if candidate.strip()), "")
+    return redact_output(line)[:limit]
+
+
+def _looks_like_permission_error(output: str) -> bool:
+    return bool(_PERMISSION_DENIED_PATTERN.search(output))
+
+
+def _parse_vhost_candidates(config: str, bind_path: str) -> _VhostCandidateReport:
+    """Mirror discover_nginx_target's matching rules for diagnostics only.
+
+    The authoritative decision always comes from the unmodified
+    discover_nginx_target(); this read-only duplicate pass exists solely to
+    differentiate *why* that call failed (no vhost, ambiguous, wildcard,
+    variable) without changing its behavior for any other caller.
+    """
+    upstreams: dict[str, str] = {}
+    for block in extract_blocks(config, "upstream"):
+        name_match = re.match(r"\s*upstream\s+([^\s{]+)", block)
+        if name_match and bind_path in block:
+            upstreams[name_match.group(1)] = bind_path
+
+    raw: list[str] = []
+    for block in extract_blocks(config, "server"):
+        if not re.search(r"\blisten\s+[^;]*443[^;]*\bssl\b", block):
+            continue
+        proxy_targets = re.findall(r"\bproxy_pass\s+([^;]+);", block)
+        direct_match = bind_path in block
+        named_match = any(
+            target.strip().removeprefix("http://").removeprefix("https://") in upstreams
+            for target in proxy_targets
+        )
+        if not direct_match and not named_match:
+            continue
+        for directive in re.findall(r"\bserver_name\s+([^;]+);", block):
+            raw.extend(directive.split())
+
+    filtered = [name for name in raw if name and name != "_" and "*" not in name and "$" not in name]
+    return _VhostCandidateReport(
+        raw=tuple(raw),
+        filtered=tuple(filtered),
+        has_wildcard=any("*" in name for name in raw),
+        has_variable=any("$" in name for name in raw),
+    )
+
+
+def _safe_for_local_resolution(target: NginxTarget) -> bool:
+    if target.port != 443:
+        return False
+    if not target.server_name or not _RESOLVABLE_HOSTNAME.fullmatch(target.server_name):
+        return False
+    if not target.upstream or not Path(target.upstream).is_absolute():
+        return False
+    return True
+
+
 class CurlOperations:
     def __init__(self, *, service_unit: str, credential_file: Path, state: DjangoState, baseline: Baseline, log: SafeDiagnosticLog):
         self.service = discover_service(Runner(), service_unit)
@@ -193,10 +291,205 @@ class CurlOperations:
         self.log = log
         self.session_key = ""
         self.session_identified = False
+        self._current_discovery_substage = _DISCOVERY_SUBSTAGES[0]
+
+    def _emit_substage(
+        self, name: str, started: float, *, classification: str = "", command: str = "", detail: str = ""
+    ) -> None:
+        result = "FAIL" if classification else "PASS"
+        exit_code = 1 if classification else 0
+        self.log.emit(
+            StageDiagnostic(
+                name, result, exit_code, time.monotonic() - started, classification,
+                command=command, detail=detail,
+            )
+        )
+
+    def _run_diagnosed_command(
+        self, argv: list[str], *, timeout: int = 15
+    ) -> subprocess.CompletedProcess[str]:
+        try:
+            return subprocess.run(
+                argv, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                shell=False, check=False, timeout=timeout,
+            )
+        except FileNotFoundError as exc:
+            raise _CommandExecutionError("command_not_found") from exc
+        except PermissionError as exc:
+            raise _CommandExecutionError("command_permission_denied") from exc
+        except subprocess.SubprocessError as exc:
+            raise _CommandExecutionError("subprocess_failed") from exc
 
     def discover_target(self) -> NginxTarget:
-        self.target = discover_and_validate_nginx(Runner(), self.service)
-        return self.target
+        self._current_discovery_substage = _DISCOVERY_SUBSTAGES[0]
+        started = time.monotonic()
+        try:
+            target = self._discover_nginx_target_diagnosed()
+        except AuthenticatedGetFailure:
+            raise
+        except Exception:
+            self._emit_substage(
+                self._current_discovery_substage, started, classification="unexpected_discovery_error"
+            )
+            raise AuthenticatedGetFailure("unexpected_discovery_error") from None
+        self.target = target
+        return target
+
+    def _discover_nginx_target_diagnosed(self) -> NginxTarget:
+        service = self.service
+
+        self._current_discovery_substage = "service_metadata_loaded"
+        started = time.monotonic()
+        if not service.unit or not service.user or not service.exec_start_raw:
+            self._emit_substage("service_metadata_loaded", started, classification="service_metadata_invalid")
+            raise AuthenticatedGetFailure("service_metadata_invalid")
+        command = f"systemctl is-active {service.unit}"
+        try:
+            result = self._run_diagnosed_command(["systemctl", "is-active", service.unit])
+        except _CommandExecutionError as exc:
+            self._emit_substage(
+                "service_metadata_loaded", started, classification=exc.classification, command=command
+            )
+            raise AuthenticatedGetFailure(exc.classification) from None
+        if result.returncode or result.stdout.strip() != "active":
+            detail = _sanitize_stream(result.stdout or result.stderr)
+            self._emit_substage(
+                "service_metadata_loaded", started, classification="systemctl_failed", command=command, detail=detail
+            )
+            raise AuthenticatedGetFailure("systemctl_failed")
+        self._emit_substage("service_metadata_loaded", started, command=command)
+
+        self._current_discovery_substage = "service_working_directory_validated"
+        started = time.monotonic()
+        if not service.working_directory.is_absolute() or not service.working_directory.is_dir():
+            self._emit_substage("service_working_directory_validated", started, classification="working_directory_invalid")
+            raise AuthenticatedGetFailure("working_directory_invalid")
+        self._emit_substage("service_working_directory_validated", started)
+
+        self._current_discovery_substage = "nginx_config_tested"
+        started = time.monotonic()
+        try:
+            result = self._run_diagnosed_command(["nginx", "-t"])
+        except _CommandExecutionError as exc:
+            self._emit_substage("nginx_config_tested", started, classification=exc.classification, command="nginx -t")
+            raise AuthenticatedGetFailure(exc.classification) from None
+        if result.returncode:
+            combined = (result.stdout or "") + (result.stderr or "")
+            classification = "command_permission_denied" if _looks_like_permission_error(combined) else "nginx_test_failed"
+            self._emit_substage(
+                "nginx_config_tested", started, classification=classification, command="nginx -t",
+                detail=_sanitize_stream(combined),
+            )
+            raise AuthenticatedGetFailure(classification, exit_code=result.returncode)
+        self._emit_substage("nginx_config_tested", started, command="nginx -t")
+
+        self._current_discovery_substage = "nginx_config_dumped"
+        started = time.monotonic()
+        try:
+            result = self._run_diagnosed_command(["nginx", "-T"])
+        except _CommandExecutionError as exc:
+            self._emit_substage("nginx_config_dumped", started, classification=exc.classification, command="nginx -T")
+            raise AuthenticatedGetFailure(exc.classification) from None
+        if result.returncode:
+            combined = (result.stdout or "") + (result.stderr or "")
+            classification = "command_permission_denied" if _looks_like_permission_error(combined) else "nginx_dump_failed"
+            self._emit_substage(
+                "nginx_config_dumped", started, classification=classification, command="nginx -T",
+                detail=_sanitize_stream(combined),
+            )
+            raise AuthenticatedGetFailure(classification, exit_code=result.returncode)
+        nginx_config = result.stdout
+        if not nginx_config.strip():
+            self._emit_substage("nginx_config_dumped", started, classification="nginx_output_empty", command="nginx -T")
+            raise AuthenticatedGetFailure("nginx_output_empty")
+        self._emit_substage("nginx_config_dumped", started, command="nginx -T")
+
+        self._current_discovery_substage = "vhost_candidates_parsed"
+        started = time.monotonic()
+        try:
+            bind_path = application_bind_from_exec_start(service.exec_start_raw)
+        except DeploymentError:
+            self._emit_substage("vhost_candidates_parsed", started, classification="service_metadata_invalid")
+            raise AuthenticatedGetFailure("service_metadata_invalid") from None
+        try:
+            candidates = _parse_vhost_candidates(nginx_config, bind_path)
+        except Exception:
+            self._emit_substage("vhost_candidates_parsed", started, classification="nginx_output_unparseable")
+            raise AuthenticatedGetFailure("nginx_output_unparseable") from None
+        if not candidates.raw:
+            self._emit_substage("vhost_candidates_parsed", started, classification="no_vhost_found")
+            raise AuthenticatedGetFailure("no_vhost_found")
+        if not candidates.filtered:
+            classification = (
+                "wildcard_vhost_rejected" if candidates.has_wildcard
+                else "variable_vhost_rejected" if candidates.has_variable
+                else "no_vhost_found"
+            )
+            self._emit_substage("vhost_candidates_parsed", started, classification=classification)
+            raise AuthenticatedGetFailure(classification)
+        self._emit_substage(
+            "vhost_candidates_parsed", started, detail=f"candidates={len(set(candidates.filtered))}"
+        )
+
+        self._current_discovery_substage = "unique_vhost_selected"
+        started = time.monotonic()
+        try:
+            target = discover_nginx_target(nginx_config, bind_path)
+        except DeploymentError:
+            unique_count = len(set(candidates.filtered))
+            classification = "multiple_vhosts_found" if unique_count > 1 else "no_vhost_found"
+            detail = ",".join(sorted(set(candidates.filtered))) if unique_count > 1 else ""
+            self._emit_substage(
+                "unique_vhost_selected", started, classification=classification, detail=detail
+            )
+            raise AuthenticatedGetFailure(classification) from None
+        self._emit_substage("unique_vhost_selected", started, detail=f"hostname={target.server_name}")
+
+        self._current_discovery_substage = "certificate_paths_discovered"
+        started = time.monotonic()
+        if target.certificate is not None and not target.certificate.is_file():
+            self._emit_substage(
+                "certificate_paths_discovered", started, classification="certificate_not_found",
+                detail=f"certificate={target.certificate}",
+            )
+            raise AuthenticatedGetFailure("certificate_not_found")
+        self._emit_substage(
+            "certificate_paths_discovered", started,
+            detail=f"certificate={target.certificate}" if target.certificate else "",
+        )
+
+        self._current_discovery_substage = "certificate_hostname_validated"
+        started = time.monotonic()
+        if target.certificate is not None:
+            command = f"openssl x509 -in {target.certificate} -noout -checkhost {target.server_name}"
+            try:
+                result = self._run_diagnosed_command(
+                    ["openssl", "x509", "-in", str(target.certificate), "-noout", "-checkhost", target.server_name]
+                )
+            except _CommandExecutionError as exc:
+                self._emit_substage(
+                    "certificate_hostname_validated", started, classification=exc.classification, command=command
+                )
+                raise AuthenticatedGetFailure(exc.classification) from None
+            if result.returncode:
+                self._emit_substage(
+                    "certificate_hostname_validated", started, classification="certificate_hostname_mismatch",
+                    command=command,
+                )
+                raise AuthenticatedGetFailure("certificate_hostname_mismatch")
+        self._emit_substage("certificate_hostname_validated", started)
+
+        self._current_discovery_substage = "local_resolution_prepared"
+        started = time.monotonic()
+        if not _safe_for_local_resolution(target):
+            self._emit_substage("local_resolution_prepared", started, classification="local_resolution_invalid")
+            raise AuthenticatedGetFailure("local_resolution_invalid")
+        self._emit_substage("local_resolution_prepared", started)
+
+        self._current_discovery_substage = "nginx_target_validated"
+        started = time.monotonic()
+        self._emit_substage("nginx_target_validated", started, detail=f"hostname={target.server_name}")
+        return target
 
     def prepare_tls(self, target: NginxTarget) -> None:
         bind = Path(application_bind_from_exec_start(self.service.exec_start_raw))
