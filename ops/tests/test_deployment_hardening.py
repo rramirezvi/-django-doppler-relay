@@ -24,6 +24,7 @@ from ops.deployment_hardening import (
     discover_nginx_target,
     discover_service,
     execute_deployment,
+    filesystem_metadata,
     interpreter_from_exec_start,
     parse_environment_files,
     parse_exec_start_path,
@@ -96,12 +97,14 @@ class BootstrapPostMergeGateTests(unittest.TestCase):
         subprocess.run(["git", "config", "user.name", "Ops Tests"], cwd=self.repo, check=True)
         (self.repo / "runtime.txt").write_text("runtime-base", encoding="utf-8")
         (self.repo / "removed.txt").write_text("removed", encoding="utf-8")
+        (self.repo / "existing.txt").write_text("old", encoding="utf-8")
         subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
         subprocess.run(["git", "commit", "-qm", "old"], cwd=self.repo, check=True)
         self.old = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
         (self.repo / "ops").mkdir()
         (self.repo / "ops" / "td02c_deployment_runner.py").write_text("VALUE=1\n", encoding="utf-8")
         (self.repo / "added.txt").write_text("added", encoding="utf-8")
+        (self.repo / "existing.txt").write_text("new", encoding="utf-8")
         (self.repo / "removed.txt").unlink()
         subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True)
         subprocess.run(["git", "commit", "-qm", "target"], cwd=self.repo, check=True)
@@ -121,7 +124,7 @@ class BootstrapPostMergeGateTests(unittest.TestCase):
             service=service, nginx=NginxTarget("invalid", 443, "", None),
             old_sha=self.old, target_sha=self.target, repository=self.repo,
             branch="production", remote="origin",
-            changed_files=["added.txt", "ops/td02c_deployment_runner.py", "removed.txt"],
+            changed_files=["added.txt", "existing.txt", "ops/td02c_deployment_runner.py", "removed.txt"],
             runtime_files=["runtime.txt"], intersections=[],
             runtime_hashes={"runtime.txt": digest}, baseline_smoke={},
             baseline_warning_codes=set(), approved_commits=[self.target],
@@ -130,6 +133,16 @@ class BootstrapPostMergeGateTests(unittest.TestCase):
                 "uid": info.st_uid, "gid": info.st_gid, "size": info.st_size,
                 "mtime_ns": info.st_mtime_ns,
             }},
+            materialized_path_metadata_before={
+                "existing.txt": filesystem_metadata(self.repo / "existing.txt"),
+                "removed.txt": {
+                    **filesystem_metadata(self.repo / "existing.txt"),
+                    "size": len("removed"),
+                },
+            },
+            preexisting_modified_paths=["existing.txt"],
+            new_paths=["added.txt", "ops/td02c_deployment_runner.py"],
+            deleted_paths=["removed.txt"],
         )
         self.runner = _BootstrapGitRunner()
 
@@ -180,6 +193,81 @@ class BootstrapPostMergeGateTests(unittest.TestCase):
             validate_bootstrap_post_merge(
                 self.runner, self.context, module_name="ops.td02c_deployment_runner"
             )
+
+    def test_post_merge_accepts_preexisting_metadata_unchanged(self):
+        with patch("ops.deployment_hardening.pwd", None), patch(
+            "ops.deployment_hardening.grp", None
+        ):
+            self.assertEqual(validate_bootstrap_post_merge(
+                self.runner, self.context,
+                module_name="ops.td02c_deployment_runner",
+            ), self.target)
+
+    def test_post_merge_rejects_missing_preexisting_baseline(self):
+        self.context.materialized_path_metadata_before.pop("existing.txt")
+        with self.assertRaisesRegex(DeploymentError, "pre-merge metadata missing"):
+            validate_bootstrap_post_merge(
+                self.runner, self.context,
+                module_name="ops.td02c_deployment_runner",
+            )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX metadata semantics")
+    def test_post_merge_rejects_preexisting_group_change(self):
+        baseline = self.context.materialized_path_metadata_before["existing.txt"]
+        baseline["gid"] = int(baseline["gid"]) + 1
+        baseline["group"] = "different-approved-group"
+        with self.assertRaisesRegex(DeploymentError, "preexisting metadata changed"):
+            validate_bootstrap_post_merge(
+                self.runner, self.context,
+                module_name="ops.td02c_deployment_runner",
+            )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX metadata semantics")
+    def test_post_merge_rejects_preexisting_owner_change(self):
+        baseline = self.context.materialized_path_metadata_before["existing.txt"]
+        baseline["uid"] = 0 if os.getuid() != 0 else 1
+        baseline["owner"] = "root" if os.getuid() != 0 else "not-root"
+        with self.assertRaisesRegex(DeploymentError, "preexisting metadata changed"):
+            validate_bootstrap_post_merge(
+                self.runner, self.context,
+                module_name="ops.td02c_deployment_runner",
+            )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX metadata semantics")
+    def test_post_merge_rejects_preexisting_mode_change(self):
+        path = self.repo / "existing.txt"
+        path.chmod(0o664)
+        with self.assertRaisesRegex(DeploymentError, "preexisting metadata changed"):
+            validate_bootstrap_post_merge(
+                self.runner, self.context,
+                module_name="ops.td02c_deployment_runner",
+            )
+
+    def test_post_merge_rejects_incomplete_classification(self):
+        self.context.preexisting_modified_paths.clear()
+        with self.assertRaisesRegex(DeploymentError, "classification is missing"):
+            validate_bootstrap_post_merge(
+                self.runner, self.context,
+                module_name="ops.td02c_deployment_runner",
+            )
+
+    def test_post_merge_rejects_deleted_path_left_in_worktree(self):
+        (self.repo / "removed.txt").write_text("residue", encoding="utf-8")
+        with self.assertRaises(DeploymentError):
+            validate_bootstrap_post_merge(
+                self.runner, self.context,
+                module_name="ops.td02c_deployment_runner",
+            )
+
+    def test_baseline_metadata_is_sanitized(self):
+        baseline = self.context.materialized_path_metadata_before["existing.txt"]
+        self.assertEqual(
+            set(baseline),
+            {"exists", "type", "uid", "gid", "owner", "group", "mode",
+             "size", "device", "inode", "symlink"},
+        )
+        self.assertNotIn("content", baseline)
+        self.assertNotIn("sha256", baseline)
 
     def test_post_merge_rejects_changed_path_wrong_ownership(self):
         with (
@@ -293,6 +381,14 @@ class BootstrapPostMergeGateTests(unittest.TestCase):
                 args, self.runner, "ops.td02c_deployment_runner"
             )
         self.assertEqual(report["head"], self.target)
+        self.assertEqual(
+            report["path_classification"]["preexisting_modified"],
+            ["existing.txt"],
+        )
+        self.assertIn("existing.txt", report["materialized_path_metadata_before"])
+        self.assertNotIn(
+            "content", report["materialized_path_metadata_before"]["existing.txt"]
+        )
         self.assertTrue((self.repo / "ops" / "td02c_deployment_runner.py").is_file())
         self.assertEqual(preflight_call.call_count, 1)
 
@@ -986,7 +1082,7 @@ class RollbackRepositoryTests(unittest.TestCase):
 
     def _context(self):
         service = SimpleNamespace(working_directory=self.repo, user="service")
-        return DeploymentContext(
+        context = DeploymentContext(
             service=service, nginx=NginxTarget("x", 443, "/x", None),
             old_sha=self.old, target_sha=self.target, repository=self.repo,
             branch=self._git("branch", "--show-current").stdout.strip(), remote="origin",
@@ -995,6 +1091,13 @@ class RollbackRepositoryTests(unittest.TestCase):
             runtime_hashes={"runtime.txt": self.runtime_hash},
             baseline_smoke={}, baseline_warning_codes=set(),
         )
+        context.materialized_path_metadata_before = {
+            "app.py": filesystem_metadata(self.repo / "app.py")
+        }
+        context.preexisting_modified_paths = ["app.py"]
+        context.new_paths = ["added.txt"]
+        context.deleted_paths = ["deleted.txt"]
+        return context
 
     def test_rollback_restores_head_additions_deletions_and_preserves_runtime_env(self):
         context = self._context()
@@ -1004,6 +1107,17 @@ class RollbackRepositoryTests(unittest.TestCase):
         self.assertEqual((self.repo / "deleted.txt").read_text(), "restore me\n")
         self.assertEqual((self.repo / "runtime.txt").read_text(), "runtime local\n")
         self.assertTrue((self.repo / ".env").exists())
+
+    @unittest.skipUnless(os.name == "posix", "POSIX metadata semantics")
+    def test_rollback_restores_preexisting_mode_exactly(self):
+        context = self._context()
+        expected_mode = context.materialized_path_metadata_before["app.py"]["mode"]
+        (self.repo / "app.py").chmod(0o600)
+        targeted_rollback(Namespace(branch=context.branch), self.runner, context, [])
+        self.assertEqual(
+            __import__("stat").S_IMODE((self.repo / "app.py").stat().st_mode),
+            expected_mode,
+        )
 
     def test_real_dirty_tree_without_range_intersection_is_allowed_by_gate(self):
         runtime = self._git("diff", "--name-only").stdout.splitlines()

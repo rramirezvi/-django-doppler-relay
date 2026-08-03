@@ -171,6 +171,12 @@ class DeploymentContext:
     runtime_metadata: dict[str, dict[str, object]] = dataclasses.field(
         default_factory=dict
     )
+    materialized_path_metadata_before: dict[str, dict[str, object]] = (
+        dataclasses.field(default_factory=dict)
+    )
+    preexisting_modified_paths: list[str] = dataclasses.field(default_factory=list)
+    new_paths: list[str] = dataclasses.field(default_factory=list)
+    deleted_paths: list[str] = dataclasses.field(default_factory=list)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -466,6 +472,64 @@ def safe_repo_path(repository: Path, name: str, *, must_exist: bool = False) -> 
     if candidate.is_symlink():
         raise DeploymentError(f"Symlink is not accepted for protected path: {name!r}")
     return candidate
+
+
+def filesystem_metadata(path: Path) -> dict[str, object]:
+    """Return sanitized lstat metadata without reading file content."""
+    info = path.stat(follow_symlinks=False)
+    owner = str(info.st_uid)
+    group = str(info.st_gid)
+    if pwd is not None and hasattr(pwd, "getpwuid"):
+        try:
+            owner = pwd.getpwuid(info.st_uid).pw_name
+        except KeyError:
+            pass
+    if grp is not None and hasattr(grp, "getgrgid"):
+        try:
+            group = grp.getgrgid(info.st_gid).gr_name
+        except KeyError:
+            pass
+    if stat.S_ISREG(info.st_mode):
+        kind = "file"
+    elif stat.S_ISDIR(info.st_mode):
+        kind = "directory"
+    elif stat.S_ISLNK(info.st_mode):
+        kind = "symlink"
+    else:
+        kind = "other"
+    return {
+        "exists": True,
+        "type": kind,
+        "uid": info.st_uid,
+        "gid": info.st_gid,
+        "owner": owner,
+        "group": group,
+        "mode": stat.S_IMODE(info.st_mode),
+        "size": info.st_size,
+        "device": info.st_dev,
+        "inode": info.st_ino,
+        "symlink": stat.S_ISLNK(info.st_mode),
+    }
+
+
+def git_path_exists(
+    runner: Runner, cwd: Path, commit: str, name: str, user: str
+) -> bool:
+    return runner.run(
+        ["git", "cat-file", "-e", f"{commit}:{name}"],
+        cwd=cwd, user=user, check=False,
+    ).returncode == 0
+
+
+def git_path_mode(
+    runner: Runner, cwd: Path, commit: str, name: str, user: str
+) -> int:
+    fields = runner.run(
+        ["git", "ls-tree", commit, "--", name], cwd=cwd, user=user
+    ).stdout.split(None, 1)
+    if len(fields) != 2 or not fields[0].isdigit():
+        raise DeploymentError(f"Git metadata missing for approved path: {name}")
+    return int(fields[0], 8)
 
 
 def resolve_commit(runner: Runner, cwd: Path, oid: str, user: str) -> str:
@@ -894,6 +958,27 @@ def preflight(
     changed_files = git_lines(
         runner, cwd, "diff", "--name-only", f"{old_sha}..{target_sha}", user=service.user
     )
+    preexisting_modified_paths: list[str] = []
+    new_paths: list[str] = []
+    deleted_paths: list[str] = []
+    materialized_path_metadata_before: dict[str, dict[str, object]] = {}
+    for name in changed_files:
+        in_old = git_path_exists(runner, cwd, old_sha, name, service.user)
+        in_target = git_path_exists(runner, cwd, target_sha, name, service.user)
+        if in_old and in_target:
+            preexisting_modified_paths.append(name)
+        elif not in_old and in_target:
+            new_paths.append(name)
+        elif in_old and not in_target:
+            deleted_paths.append(name)
+        else:
+            raise DeploymentError(f"Ambiguous approved-range path classification: {name}")
+        if in_old:
+            path = safe_repo_path(cwd, name, must_exist=True)
+            metadata = filesystem_metadata(path)
+            if metadata["symlink"]:
+                raise DeploymentError(f"Pre-merge approved path is a symlink: {name}")
+            materialized_path_metadata_before[name] = metadata
     runtime_files = git_lines(runner, cwd, "diff", "--name-only", user=service.user)
     intersections = changed_runtime_intersections(changed_files, runtime_files)
     if intersections:
@@ -949,6 +1034,10 @@ def preflight(
         preflight_readiness=preflight_readiness,
         approved_commits=approved_commits,
         runtime_metadata=runtime_metadata,
+        materialized_path_metadata_before=materialized_path_metadata_before,
+        preexisting_modified_paths=preexisting_modified_paths,
+        new_paths=new_paths,
+        deleted_paths=deleted_paths,
     )
 
 
@@ -1072,6 +1161,24 @@ def targeted_rollback(
         )
     if not paths_match(context.old_sha):
         raise DeploymentError("Rollback did not restore the exact old Git tree")
+    for name, expected in context.materialized_path_metadata_before.items():
+        path = safe_repo_path(cwd, name, must_exist=True)
+        actual = filesystem_metadata(path)
+        if actual["symlink"] or actual["type"] != expected.get("type"):
+            raise DeploymentError(f"Rollback metadata type mismatch: {name}")
+        if actual["mode"] != expected.get("mode"):
+            runner.run(
+                ["chmod", f"{int(expected['mode']):04o}", str(path)], user=user
+            )
+        if actual["gid"] != expected.get("gid"):
+            group_name = str(expected.get("group", ""))
+            if not group_name:
+                raise DeploymentError(f"Rollback metadata group missing: {name}")
+            runner.run(["chgrp", group_name, str(path)], user=user)
+        restored = filesystem_metadata(path)
+        for field in ("type", "uid", "gid", "owner", "group", "mode", "symlink"):
+            if restored.get(field) != expected.get(field):
+                raise DeploymentError(f"Rollback metadata restoration incomplete: {name}")
     for name, expected in context.runtime_hashes.items():
         path = safe_repo_path(cwd, name, must_exist=True)
         if sha256_file(path) != expected:
@@ -1314,7 +1421,19 @@ def bootstrap_module_deployment(
         head = validate_bootstrap_post_merge(
             runner, context, module_name=module_name
         )
-        return {"phase": "bootstrap-complete", "head": head, "module": module_name}
+        return {
+            "phase": "bootstrap-complete",
+            "head": head,
+            "module": module_name,
+            "path_classification": {
+                "preexisting_modified": context.preexisting_modified_paths,
+                "new": context.new_paths,
+                "deleted": context.deleted_paths,
+            },
+            "materialized_path_metadata_before": (
+                context.materialized_path_metadata_before
+            ),
+        }
     except BaseException:
         if mutation_started:
             targeted_rollback(args, runner, context, [])
@@ -1331,6 +1450,8 @@ def validate_bootstrap_post_merge(
     cwd, user = context.service.working_directory, context.service.user
     if not user:
         raise DeploymentError("Post-merge service user is empty")
+    if user != "app":
+        raise DeploymentError("Bootstrap post-merge service user must be app")
     head = runner.run(["git", "rev-parse", "HEAD"], cwd=cwd, user=user).stdout.strip()
     branch = runner.run(
         ["git", "branch", "--show-current"], cwd=cwd, user=user
@@ -1372,38 +1493,69 @@ def validate_bootstrap_post_merge(
         }
         if actual != context.runtime_metadata.get(name):
             raise DeploymentError(f"Runtime metadata changed during bootstrap: {name}")
-    expected_uid = pwd.getpwnam(user).pw_uid if pwd is not None else None
-    allowed_gids = (
-        {grp.getgrnam(name).gr_gid for name in ("app", "www-data")}
-        if grp is not None else None
+    classified = set(
+        context.preexisting_modified_paths + context.new_paths + context.deleted_paths
     )
-    for name in context.changed_files:
+    classification_count = sum(map(len, (
+        context.preexisting_modified_paths, context.new_paths, context.deleted_paths
+    )))
+    if classified != set(context.changed_files) or classification_count != len(classified):
+        raise DeploymentError("Bootstrap path classification is missing or incomplete")
+    for name in context.deleted_paths:
         path = safe_repo_path(cwd, name)
-        in_target = runner.run(
-            ["git", "cat-file", "-e", f"{context.target_sha}:{name}"],
-            cwd=cwd, user=user, check=False,
-        ).returncode == 0
-        if in_target != path.exists():
+        in_target = git_path_exists(runner, cwd, context.target_sha, name, user)
+        if in_target or path.exists() or path.is_symlink():
+            raise DeploymentError(f"Bootstrap deleted path remains materialized: {name}")
+    for name in context.preexisting_modified_paths:
+        path = safe_repo_path(cwd, name, must_exist=True)
+        if not git_path_exists(runner, cwd, context.target_sha, name, user):
             raise DeploymentError(f"Bootstrap path materialization mismatch: {name}")
-        if in_target:
-            info = path.stat(follow_symlinks=False)
-            if (
-                path.is_symlink()
-                or (expected_uid is not None and info.st_uid != expected_uid)
-                or (allowed_gids is not None and info.st_gid not in allowed_gids)
-            ):
-                raise DeploymentError(f"Bootstrap materialized unsafe ownership: {name}")
-            tree = runner.run(
-                ["git", "ls-tree", context.target_sha, "--", name],
-                cwd=cwd, user=user,
-            ).stdout.split(None, 1)
-            if len(tree) != 2 or not tree[0].isdigit():
-                raise DeploymentError(f"Bootstrap target metadata missing: {name}")
-            git_executable = bool(int(tree[0], 8) & 0o111)
-            actual_mode = stat.S_IMODE(info.st_mode)
-            expected_mode = 0o755 if git_executable else 0o644
-            if pwd is not None and actual_mode != expected_mode:
-                raise DeploymentError(f"Bootstrap materialized unsafe permissions: {name}")
+        actual = filesystem_metadata(path)
+        baseline = context.materialized_path_metadata_before.get(name)
+        required = {"exists", "type", "uid", "gid", "owner", "group", "mode", "symlink"}
+        if not baseline or not required.issubset(baseline):
+            raise DeploymentError(f"Bootstrap pre-merge metadata missing: {name}")
+        old_git_mode = git_path_mode(runner, cwd, context.old_sha, name, user)
+        target_git_mode = git_path_mode(runner, cwd, context.target_sha, name, user)
+        expected_mode = int(baseline["mode"])
+        if bool(old_git_mode & 0o111) != bool(target_git_mode & 0o111):
+            expected_mode = (
+                expected_mode | 0o111
+                if target_git_mode & 0o111
+                else expected_mode & ~0o111
+            )
+        for field in ("type", "uid", "gid", "symlink"):
+            if actual.get(field) != baseline.get(field):
+                raise DeploymentError(f"Bootstrap preexisting metadata changed: {name}")
+        if actual["mode"] != expected_mode:
+            raise DeploymentError(f"Bootstrap preexisting metadata changed: {name}")
+    try:
+        expected_uid = pwd.getpwnam("app").pw_uid if pwd is not None else None
+        allowed_gids = (
+            {grp.getgrnam(name).gr_gid for name in ("app", "www-data")}
+            if grp is not None else None
+        )
+    except KeyError as exc:
+        raise DeploymentError("Bootstrap approved service ownership identity is missing") from exc
+    for name in context.new_paths:
+        path = safe_repo_path(cwd, name, must_exist=True)
+        if not git_path_exists(runner, cwd, context.target_sha, name, user):
+            raise DeploymentError(f"Bootstrap path materialization mismatch: {name}")
+        actual = filesystem_metadata(path)
+        info = path.stat(follow_symlinks=False)
+        if (
+            actual["symlink"]
+            or (expected_uid is not None and info.st_uid != expected_uid)
+            or (allowed_gids is not None and info.st_gid not in allowed_gids)
+        ):
+            raise DeploymentError(f"Bootstrap materialized unsafe ownership: {name}")
+        git_executable = bool(
+            git_path_mode(runner, cwd, context.target_sha, name, user) & 0o111
+        )
+        actual_mode = stat.S_IMODE(info.st_mode)
+        expected_mode = 0o755 if git_executable else 0o644
+        if pwd is not None and actual_mode != expected_mode:
+            raise DeploymentError(f"Bootstrap materialized unsafe permissions: {name}")
     module_path = module_name.replace(".", "/") + ".py"
     safe_repo_path(cwd, module_path, must_exist=True)
     runner.run(
