@@ -532,3 +532,57 @@ backup de datos, migraciones, reinicios, readiness posterior, smoke tests,
 dependencias, `collectstatic`, cambios de `.env` ni canary. Después de
 incorporarlo, todo preflight,
 deploy y rollback TD-02C se realiza exclusivamente con el nuevo módulo.
+
+### Bootstrap de componentes existentes bloqueados (`--bootstrap-existing-component`)
+
+`preflight-only`/`deploy-only` validan la evidencia con el código que ya está
+instalado en producción, no con el del `target_sha`: si ese código instalado
+tiene un bug que bloquea su propia corrección (por ejemplo un umbral
+hardcodeado en `validate_predeployment_evidence` que ya no coincide con el
+conteo real de una suite), ningún despliegue normal puede instalar el fix,
+porque el gate que lo bloquea sigue siendo el viejo hasta después del merge.
+
+Para ese único escenario, `ops.deployment_hardening` expone un modo separado
+y de alcance cerrado:
+
+```bash
+.venv/bin/python -m ops.deployment_hardening \
+  --service-unit django.service --old-sha OLD --target-sha TARGET \
+  --remote origin --branch operator-ui-production-test \
+  --worker-unit doppler-background-jobs.service \
+  --expected-commit TARGET \
+  --bootstrap-existing-component ops/deployment_test_profile.py \
+  --bootstrap-existing-component ops/tests/test_deployment_test_profile.py \
+  --bootstrap-existing-component ops/README.md \
+  --bootstrap-evidence /ruta/externa/bootstrap-evidencia.json
+```
+
+Diferencias respecto a `--bootstrap-module`:
+
+- No exige que los paths sean nuevos; están pensados para actualizar
+  componentes que ya existen en `old_sha`, pero solo los indicados
+  explícitamente con `--bootstrap-existing-component` (patrón `ops/...`,
+  repetible). Cualquier archivo en el rango que no esté en esa allowlist
+  cerrada aborta el bootstrap antes de tocar Git.
+- Nunca importa ni ejecuta `validate_predeployment_evidence`. En su lugar
+  exige `--bootstrap-evidence`, un `BootstrapEvidence` (esquema distinto de
+  `ValidationEvidence`: agrega `authorized_paths`, así que un archivo no
+  puede reutilizarse para el otro esquema) atado a `target_sha`, a la
+  secuencia exacta de commits y a la allowlist exacta usada.
+- Antes del merge corre el mismo `preflight(operational_checks=True)` del
+  despliegue normal (nginx, readiness, `manage.py check`) más una
+  verificación de jobs/V2/ledger/flags/worker en un proceso Python aparte,
+  para no crear un import circular con `ops.td02c_deployment_runner`.
+- Después del merge valida materialización, metadata, ownership, permisos,
+  `manage.py check --deploy`, readiness y la suite `ops` permitida —y además
+  prueba en caliente que el gate recién instalado ya no depende de un
+  conteo exacto obsoleto: construye evidencia exactamente en los pisos
+  mínimos vigentes y confirma que `validate_predeployment_evidence` la
+  acepta.
+- No hace backup, restart, migraciones, `collectstatic` ni canary. Un fallo
+  posterior al merge dispara el mismo `targeted_rollback` que el resto del
+  orquestador.
+
+Tras instalar el fix, todos los despliegues normales vuelven a exigir
+`ValidationEvidence` estándar a través de `ops.td02c_deployment_runner`; este
+modo no lo sustituye ni lo vuelve reutilizable para despliegues ordinarios.

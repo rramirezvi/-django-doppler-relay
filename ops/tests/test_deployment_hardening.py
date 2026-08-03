@@ -1,3 +1,6 @@
+import dataclasses
+import inspect
+import json
 import os
 import shutil
 import subprocess
@@ -16,6 +19,7 @@ from ops.deployment_hardening import (
     Runner,
     ServiceMetadata,
     acquire_target_object,
+    bootstrap_existing_component_deployment,
     bootstrap_module_deployment,
     build_parser,
     changed_runtime_intersections,
@@ -43,9 +47,11 @@ from ops.deployment_hardening import (
     validate_token,
     wait_for_application_ready,
     validate_readiness_layers,
+    validate_bootstrap_existing_post_merge,
     validate_bootstrap_post_merge,
     warning_codes,
 )
+from ops.deployment_test_profile import BootstrapEvidence, ValidationEvidence
 
 
 class BootstrapContractTests(unittest.TestCase):
@@ -430,6 +436,236 @@ def isolate_git_environment(testcase, root):
     )
     patcher.start()
     testcase.addCleanup(patcher.stop)
+
+
+RUNTIME_PATHS_FOR_TESTS = ("attachments/templates/.gitkeep",)
+
+
+class BootstrapExistingComponentTests(unittest.TestCase):
+    """Covers ops.deployment_hardening.bootstrap_existing_component_deployment,
+    used only when the currently-installed predeployment evidence gate blocks
+    deploying its own fix (see ops/deployment_test_profile.py)."""
+
+    AUTHORIZED_PATHS = (
+        "ops/deployment_test_profile.py",
+        "ops/tests/test_deployment_test_profile.py",
+        "ops/README.md",
+    )
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        isolate_git_environment(self, self.root)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "production"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.email", "ops@example.invalid"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Ops Tests"], cwd=self.repo, check=True)
+        (self.repo / "ops" / "tests").mkdir(parents=True)
+        (self.repo / "ops" / "deployment_test_profile.py").write_text("GATE = 'old'\n", encoding="utf-8")
+        (self.repo / "ops" / "tests" / "test_deployment_test_profile.py").write_text("# old\n", encoding="utf-8")
+        (self.repo / "ops" / "README.md").write_text("old docs\n", encoding="utf-8")
+        (self.repo / "manage.py").write_text("# test\n", encoding="utf-8")
+        for name in RUNTIME_PATHS_FOR_TESTS:
+            path = self.repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text("baseline\n", encoding="utf-8")
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "old"], cwd=self.repo, check=True)
+        self.old = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+
+        (self.repo / "ops" / "deployment_test_profile.py").write_text("GATE = 'fixed'\n", encoding="utf-8")
+        (self.repo / "ops" / "tests" / "test_deployment_test_profile.py").write_text("# fixed\n", encoding="utf-8")
+        (self.repo / "ops" / "README.md").write_text("fixed docs\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A", "ops"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "target"], cwd=self.repo, check=True)
+        self.target = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+
+        # Clone while "production" still points at target: the bare remote
+        # must have refs/heads/production == target, matching the approved
+        # remote tip a real preflight would see. Only afterwards do we reset
+        # the local checkout back to old_sha, as production actually is.
+        remote = self.root / "remote.git"
+        subprocess.run(["git", "clone", "--bare", "-q", str(self.repo), str(remote)], check=True)
+        subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=self.repo, check=True)
+        subprocess.run(["git", "checkout", "-q", self.old], cwd=self.repo, check=True)
+        subprocess.run(["git", "branch", "-f", "production", self.old], cwd=self.repo, check=True)
+        subprocess.run(["git", "checkout", "-q", "production"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "branch.production.remote", "origin"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "branch.production.merge", "refs/heads/production"], cwd=self.repo, check=True)
+
+        self.service = ServiceMetadata(
+            unit="django.service", working_directory=self.repo,
+            exec_start_path=Path("/bin/true"), exec_start_raw="/bin/true --bind unix:/run/app.sock",
+            python=Path("/usr/bin/python3"), user="app", group="app",
+            main_pid=1, fragment_path=Path("/tmp/django.service"),
+            environment_files=(),
+        )
+        self.runner = _BootstrapGitRunner()
+        self.evidence_path = self.root / "bootstrap-evidence.json"
+
+    def write_evidence(self, **overrides):
+        values = {
+            "target_sha": self.target,
+            "commit_sequence": [self.target],
+            "authorized_paths": list(self.AUTHORIZED_PATHS),
+            "api_v2_passed": 27,
+            "http_client_passed": 32,
+            "ops_passed": 257,
+            "linux_repetitions_passed": True,
+            "postgresql_major": 17,
+        }
+        values.update(overrides)
+        self.evidence_path.write_text(json.dumps(values), encoding="utf-8")
+        return self.evidence_path
+
+    def args(self, **overrides):
+        values = dict(
+            service_unit="django.service", old_sha=self.old, target_sha=self.target,
+            remote="origin", branch="production", expected_commit=[self.target],
+            bootstrap_evidence=self.evidence_path, worker_unit="worker.service",
+            allowed_warning=[],
+        )
+        values.update(overrides)
+        return Namespace(**values)
+
+    def run_bootstrap(self, *, authorized_paths=None, **arg_overrides):
+        # _validate_bootstrap_operational_gates and _validate_new_evidence_gate_operational
+        # are deliberately NOT patched here: both shell out via [python, "-c", ...],
+        # and _BootstrapGitRunner already treats any python-prefixed command as an
+        # instant success, so they are effectively no-ops in this harness. Leaving
+        # them unpatched lets individual tests patch/observe them without a nested
+        # patch on the same target silently shadowing theirs.
+        with (
+            patch("ops.deployment_hardening.discover_service", return_value=self.service),
+            patch("ops.deployment_hardening.require_commands"),
+            patch("ops.deployment_hardening.discover_and_validate_nginx",
+                  return_value=NginxTarget("example.invalid", 443, "/run/app.sock", None)),
+            patch("ops.deployment_hardening.validate_readiness_layers", return_value={"application": {"status": "200"}}),
+            patch("ops.deployment_hardening.smoke_request", return_value={"status": "200"}),
+            patch("ops.deployment_hardening.run_manage_check", return_value=("", set())),
+            # None of these test repos exercise context.new_paths (every
+            # authorized file already exists in old_sha), so bypassing the
+            # real "app" system-account lookup here is safe: it mirrors how
+            # BootstrapPostMergeGateTests patches pwd/grp for the same reason
+            # on machines (including this test host) that have no such user.
+            patch("ops.deployment_hardening.pwd", None),
+            patch("ops.deployment_hardening.grp", None),
+        ):
+            return bootstrap_existing_component_deployment(
+                self.args(**arg_overrides), self.runner,
+                authorized_paths or self.AUTHORIZED_PATHS,
+            )
+
+    def head(self):
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True
+        ).strip()
+
+    # 1. componente existente permitido: PASS
+    def test_authorized_existing_component_bootstrap_succeeds(self):
+        self.write_evidence()
+        report = self.run_bootstrap()
+        self.assertEqual(report["head"], self.target)
+        self.assertEqual(self.head(), self.target)
+        self.assertEqual(
+            sorted(report["path_classification"]["preexisting_modified"]),
+            sorted(self.AUTHORIZED_PATHS),
+        )
+
+    # 2. path adicional no autorizado: FAIL
+    def test_unauthorized_path_in_range_is_rejected(self):
+        (self.repo / "ops" / "extra.py").write_text("x = 1\n", encoding="utf-8")
+        subprocess.run(["git", "checkout", "-q", self.target], cwd=self.repo, check=True)
+        (self.repo / "ops" / "extra.py").write_text("x = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A", "ops"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "--amend", "-qm", "target"], cwd=self.repo, check=True)
+        self.target = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        subprocess.run(["git", "branch", "-f", "production_target", self.target], cwd=self.repo, check=True)
+        subprocess.run(["git", "checkout", "-q", "production"], cwd=self.repo, check=True)
+        remote = self.root / "remote.git"
+        subprocess.run(["git", "push", "-q", "--force", str(remote), f"{self.target}:refs/heads/production"], cwd=self.repo, check=True)
+        self.write_evidence(target_sha=self.target, commit_sequence=[self.target])
+        with self.assertRaisesRegex(DeploymentError, "unauthorized paths"):
+            self.run_bootstrap(target_sha=self.target, expected_commit=[self.target])
+
+    # 3. runtime en el rango: FAIL (propagated from the shared preflight())
+    def test_runtime_intersection_in_range_is_rejected(self):
+        self.write_evidence()
+        with patch("ops.deployment_hardening.preflight",
+                    side_effect=DeploymentError("Target/runtime intersection: attachments/x")):
+            with self.assertRaisesRegex(DeploymentError, "runtime intersection"):
+                self.run_bootstrap()
+
+    # 4. evidencia bootstrap de otro SHA: FAIL
+    def test_evidence_for_another_sha_is_rejected(self):
+        self.write_evidence(target_sha="a" * 40, commit_sequence=["a" * 40])
+        with self.assertRaisesRegex(DeploymentError, "does not match|target"):
+            self.run_bootstrap()
+
+    # 5. evidencia incompleta: FAIL
+    def test_incomplete_evidence_is_rejected(self):
+        self.write_evidence(http_client_passed=8)
+        with self.assertRaisesRegex(DeploymentError, "incomplete"):
+            self.run_bootstrap()
+
+    # 6. intento de usar evidencia bootstrap en despliegue normal: FAIL
+    def test_bootstrap_evidence_schema_is_not_reusable_as_validation_evidence(self):
+        bootstrap_fields = {field.name for field in dataclasses.fields(BootstrapEvidence)}
+        validation_fields = {field.name for field in dataclasses.fields(ValidationEvidence)}
+        self.assertNotEqual(bootstrap_fields, validation_fields)
+        self.assertTrue({"authorized_paths"} <= bootstrap_fields - validation_fields)
+
+    # 7. target con lógica productiva Django: FAIL
+    def test_non_ops_path_can_never_be_authorized(self):
+        with self.assertRaisesRegex(DeploymentError, "Unsafe or duplicated"):
+            self.run_bootstrap(authorized_paths=("relay/models.py",))
+
+    # 8. fast-forward imposible: FAIL
+    def test_impossible_fast_forward_is_rejected(self):
+        self.write_evidence()
+        with patch("ops.deployment_hardening.preflight",
+                    side_effect=DeploymentError("Target is not a fast-forward from old SHA")):
+            with self.assertRaisesRegex(DeploymentError, "fast-forward"):
+                self.run_bootstrap()
+
+    # 9. fallo post-merge activa rollback
+    def test_post_merge_failure_triggers_rollback_to_old_head(self):
+        self.write_evidence()
+        with (
+            patch("ops.deployment_hardening.discover_service", return_value=self.service),
+            patch("ops.deployment_hardening.require_commands"),
+            patch("ops.deployment_hardening.discover_and_validate_nginx",
+                  return_value=NginxTarget("example.invalid", 443, "/run/app.sock", None)),
+            patch("ops.deployment_hardening.validate_readiness_layers", return_value={"application": {"status": "200"}}),
+            patch("ops.deployment_hardening.smoke_request", return_value={"status": "200"}),
+            patch("ops.deployment_hardening.run_manage_check", return_value=("", set())),
+            patch("ops.deployment_hardening._validate_bootstrap_operational_gates"),
+            patch("ops.deployment_hardening.validate_bootstrap_existing_post_merge",
+                  side_effect=DeploymentError("synthetic post-merge failure")),
+        ):
+            with self.assertRaisesRegex(DeploymentError, "synthetic post-merge"):
+                bootstrap_existing_component_deployment(
+                    self.args(), self.runner, self.AUTHORIZED_PATHS,
+                )
+        self.assertEqual(self.head(), self.old)
+
+    # 10. gate nuevo importable y operativo tras bootstrap (wiring proof;
+    # the semantic proof that it accepts floors above the old snapshot lives
+    # in ops/tests/test_deployment_test_profile.py).
+    def test_post_merge_invokes_new_gate_operational_check(self):
+        self.write_evidence()
+        with patch(
+            "ops.deployment_hardening._validate_new_evidence_gate_operational"
+        ) as operational_check:
+            self.run_bootstrap()
+        operational_check.assert_called_once()
+
+    # 11. el gate viejo no se ejecuta en este modo
+    def test_bootstrap_never_references_normal_evidence_gate(self):
+        source = inspect.getsource(bootstrap_existing_component_deployment)
+        self.assertNotIn("validate_predeployment_evidence", source)
+        self.assertNotIn("_load_validation_evidence", source)
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX service-user execution")

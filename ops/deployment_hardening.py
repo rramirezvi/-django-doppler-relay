@@ -1566,6 +1566,308 @@ def validate_bootstrap_post_merge(
     return head
 
 
+_BOOTSTRAP_EXISTING_PATH = re.compile(r"ops/[A-Za-z0-9_][A-Za-z0-9_./-]*")
+
+
+def _validate_bootstrap_existing_paths(authorized_paths: tuple[str, ...]) -> None:
+    if not authorized_paths:
+        raise DeploymentError(
+            "Bootstrap-existing-component requires at least one authorized path"
+        )
+    seen: set[str] = set()
+    for path in authorized_paths:
+        if (
+            not _BOOTSTRAP_EXISTING_PATH.fullmatch(path)
+            or ".." in path.split("/")
+            or path in seen
+        ):
+            raise DeploymentError(f"Unsafe or duplicated bootstrap-existing path: {path!r}")
+        seen.add(path)
+
+
+def _load_bootstrap_evidence(path: Path | None) -> object:
+    from ops.deployment_test_profile import BootstrapEvidence
+
+    if path is None or not path.is_absolute() or path.is_symlink() or not path.is_file():
+        raise DeploymentError("Bootstrap evidence path is unsafe or missing")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    allowed = {field.name for field in dataclasses.fields(BootstrapEvidence)}
+    if set(data) != allowed:
+        raise DeploymentError("Bootstrap evidence schema is invalid")
+    values = dict(data)
+    values["commit_sequence"] = tuple(values["commit_sequence"])
+    values["authorized_paths"] = tuple(values["authorized_paths"])
+    return BootstrapEvidence(**values)
+
+
+def _validate_bootstrap_operational_gates(
+    runner: Runner, service: ServiceMetadata, worker_unit: str
+) -> None:
+    """Read-only jobs/V2/ledger/settings/worker check for bootstrap-existing.
+
+    Runs out-of-process (a fresh ``python -c`` invocation, the same pattern
+    already used by validate_bootstrap_post_merge) so this module never
+    imports ops.td02c_deployment_runner at module load time -- that module
+    already imports this one, and a top-level cross-import would create a
+    circular dependency.
+    """
+    validate_token(worker_unit, "systemd unit")
+    script = (
+        "from ops.td02c_deployment_runner import _django_state, _worker_snapshot; "
+        "from ops.td02c_worker_gate import evaluate_worker_precondition; "
+        "from ops.deployment_hardening import Runner; "
+        "_, jobs, v2, ledger = _django_state(); "
+        "assert (jobs, v2, ledger) == (0, 0, 0), (jobs, v2, ledger); "
+        f"snapshot = _worker_snapshot(Runner(), {worker_unit!r}, jobs); "
+        "result = evaluate_worker_precondition(snapshot); "
+        "assert result.allowed, (result.classification, result.reasons)"
+    )
+    runner.run([str(service.python), "-c", script], cwd=service.working_directory, user=service.user)
+
+
+def _validate_new_evidence_gate_operational(runner: Runner, service: ServiceMetadata) -> None:
+    """Prove the just-installed evidence gate is live, not merely importable.
+
+    Builds evidence exactly at the module's own MINIMUM_* floors and asserts
+    it is accepted.  Every floor here is above the old stale exact-match
+    snapshot (http_client_passed == 8), so this can only pass if the fixed,
+    floor-based gate is the one actually executing after the merge.
+    """
+    dummy_sha = "0" * 40
+    script = (
+        "from ops.deployment_test_profile import ("
+        "ValidationEvidence, validate_predeployment_evidence, "
+        "MINIMUM_API_V2_PASSED, MINIMUM_HTTP_CLIENT_PASSED, MINIMUM_OPS_PASSED); "
+        f"sha = {dummy_sha!r}; "
+        "evidence = ValidationEvidence(target_sha=sha, commit_sequence=(sha,), "
+        "api_v2_passed=MINIMUM_API_V2_PASSED, http_client_passed=MINIMUM_HTTP_CLIENT_PASSED, "
+        "ops_passed=MINIMUM_OPS_PASSED, linux_repetitions_passed=True, postgresql_major=17); "
+        "validate_predeployment_evidence(evidence, target_sha=sha, expected_commits=(sha,))"
+    )
+    runner.run([str(service.python), "-c", script], cwd=service.working_directory, user=service.user)
+
+
+def bootstrap_existing_component_deployment(
+    args: argparse.Namespace, runner: Runner, authorized_paths: tuple[str, ...],
+) -> dict[str, object]:
+    """One-time, narrowly-scoped update for existing operational components
+    whose currently-installed code blocks validating its own fix (for
+    example a predeployment evidence gate with a stale hardcoded threshold).
+
+    Unlike bootstrap_module_deployment (first-time module installation
+    only), this updates files that already exist in old_sha, restricted to
+    an explicit closed allowlist. It never runs the normal predeployment
+    evidence gate from ops.td02c_deployment_runner, which stays the only
+    path for ordinary deployments. This is not a general deployment path:
+    no restart, migration, collectstatic, or application write occurs here.
+    """
+    _validate_bootstrap_existing_paths(authorized_paths)
+    service = discover_service(runner, args.service_unit)
+    cwd, user = service.working_directory, service.user
+    before = snapshot_git_state(runner, cwd, args.remote, user)
+    if before.head != args.old_sha or before.branch != args.branch:
+        raise DeploymentError("Bootstrap-existing initial HEAD or branch mismatch")
+    remote_line = runner.run(
+        ["git", "ls-remote", "--exit-code", args.remote, f"refs/heads/{args.branch}"],
+        cwd=cwd, user=user,
+    ).stdout.strip().split()
+    if len(remote_line) != 2 or remote_line[0].lower() != args.target_sha.lower():
+        raise DeploymentError("Bootstrap-existing remote target mismatch")
+    assert_git_state_unchanged(runner, cwd, args.remote, user, before)
+
+    from ops.deployment_test_profile import TestProfileError, validate_bootstrap_evidence
+
+    evidence = _load_bootstrap_evidence(getattr(args, "bootstrap_evidence", None))
+    try:
+        validate_bootstrap_evidence(
+            evidence,
+            target_sha=args.target_sha,
+            expected_commits=list(getattr(args, "expected_commit", [])),
+            authorized_paths=authorized_paths,
+        )
+    except TestProfileError as exc:
+        raise DeploymentError(str(exc)) from exc
+
+    refresh_deployment_ref(
+        runner, cwd, remote=args.remote, branch=args.branch,
+        target_sha=args.target_sha, user=user,
+    )
+    context = preflight(args, runner, operational_checks=True)
+    unauthorized = sorted(
+        name for name in context.changed_files if name not in authorized_paths
+    )
+    if unauthorized:
+        raise DeploymentError(
+            "Bootstrap-existing target modifies unauthorized paths: " + ", ".join(unauthorized)
+        )
+    if not context.changed_files:
+        raise DeploymentError("Bootstrap-existing target introduces no changes")
+    _validate_bootstrap_operational_gates(runner, service, args.worker_unit)
+
+    mutation_started = False
+    try:
+        mutation_started = True
+        runner.run(["git", "merge", "--ff-only", args.target_sha], cwd=cwd, user=user)
+        head = validate_bootstrap_existing_post_merge(
+            runner, context, authorized_paths=authorized_paths,
+            allowed_warnings=set(getattr(args, "allowed_warning", [])),
+        )
+        return {
+            "phase": "bootstrap-existing-complete",
+            "head": head,
+            "authorized_paths": list(authorized_paths),
+            "path_classification": {
+                "preexisting_modified": context.preexisting_modified_paths,
+                "new": context.new_paths,
+                "deleted": context.deleted_paths,
+            },
+            "materialized_path_metadata_before": (
+                context.materialized_path_metadata_before
+            ),
+        }
+    except BaseException:
+        if mutation_started:
+            targeted_rollback(args, runner, context, [])
+        raise
+
+
+def validate_bootstrap_existing_post_merge(
+    runner: Runner,
+    context: DeploymentContext,
+    *,
+    authorized_paths: tuple[str, ...],
+    allowed_warnings: set[str] = frozenset(),
+) -> str:
+    """Validate the materialized bootstrap-existing target and prove the
+    fixed gate is live, without re-running old-HEAD preflight or the normal
+    predeployment evidence gate."""
+    cwd, user = context.service.working_directory, context.service.user
+    if not user:
+        raise DeploymentError("Bootstrap-existing post-merge service user is empty")
+    if user != "app":
+        raise DeploymentError("Bootstrap-existing post-merge service user must be app")
+    head = runner.run(["git", "rev-parse", "HEAD"], cwd=cwd, user=user).stdout.strip()
+    branch = runner.run(
+        ["git", "branch", "--show-current"], cwd=cwd, user=user
+    ).stdout.strip()
+    if head != context.target_sha:
+        raise DeploymentError("Bootstrap-existing post-merge HEAD is not target")
+    if branch != context.branch:
+        raise DeploymentError("Bootstrap-existing post-merge branch mismatch")
+    if runner.run(["git", "ls-files", "-u"], cwd=cwd, user=user).stdout.strip():
+        raise DeploymentError("Bootstrap-existing post-merge has unmerged paths")
+    if runner.run(
+        ["git", "diff", "--cached", "--quiet"], cwd=cwd, user=user, check=False
+    ).returncode:
+        raise DeploymentError("Bootstrap-existing post-merge has staged changes")
+    for cached in (False, True):
+        command = ["git", "diff", "--quiet"]
+        if cached:
+            command.append("--cached")
+        command.extend([context.target_sha, "--", *context.changed_files])
+        if runner.run(command, cwd=cwd, user=user, check=False).returncode:
+            raise DeploymentError("Bootstrap-existing working tree is partially materialized")
+    current_runtime = git_lines(runner, cwd, "diff", "--name-only", user=user)
+    if current_runtime != context.runtime_files:
+        raise DeploymentError("Bootstrap-existing post-merge runtime file set changed")
+    if git_lines(runner, cwd, "ls-files", "--others", "--exclude-standard", user=user):
+        raise DeploymentError("Bootstrap-existing post-merge has untracked paths")
+    for name, expected in context.runtime_hashes.items():
+        path = safe_repo_path(cwd, name, must_exist=True)
+        if sha256_file(path) != expected:
+            raise DeploymentError(f"Runtime changed during bootstrap-existing: {name}")
+        info = path.stat()
+        actual = {
+            "sha256": expected,
+            "mode": stat.S_IMODE(info.st_mode),
+            "uid": info.st_uid,
+            "gid": info.st_gid,
+            "size": info.st_size,
+            "mtime_ns": info.st_mtime_ns,
+        }
+        if actual != context.runtime_metadata.get(name):
+            raise DeploymentError(f"Runtime metadata changed during bootstrap-existing: {name}")
+    classified = set(
+        context.preexisting_modified_paths + context.new_paths + context.deleted_paths
+    )
+    classification_count = sum(map(len, (
+        context.preexisting_modified_paths, context.new_paths, context.deleted_paths
+    )))
+    if classified != set(context.changed_files) or classification_count != len(classified):
+        raise DeploymentError("Bootstrap-existing path classification is missing or incomplete")
+    for name in context.deleted_paths:
+        path = safe_repo_path(cwd, name)
+        in_target = git_path_exists(runner, cwd, context.target_sha, name, user)
+        if in_target or path.exists() or path.is_symlink():
+            raise DeploymentError(f"Bootstrap-existing deleted path remains materialized: {name}")
+    for name in context.preexisting_modified_paths:
+        path = safe_repo_path(cwd, name, must_exist=True)
+        if not git_path_exists(runner, cwd, context.target_sha, name, user):
+            raise DeploymentError(f"Bootstrap-existing path materialization mismatch: {name}")
+        actual = filesystem_metadata(path)
+        baseline = context.materialized_path_metadata_before.get(name)
+        required = {"exists", "type", "uid", "gid", "owner", "group", "mode", "symlink"}
+        if not baseline or not required.issubset(baseline):
+            raise DeploymentError(f"Bootstrap-existing pre-merge metadata missing: {name}")
+        old_git_mode = git_path_mode(runner, cwd, context.old_sha, name, user)
+        target_git_mode = git_path_mode(runner, cwd, context.target_sha, name, user)
+        expected_mode = int(baseline["mode"])
+        if bool(old_git_mode & 0o111) != bool(target_git_mode & 0o111):
+            expected_mode = (
+                expected_mode | 0o111
+                if target_git_mode & 0o111
+                else expected_mode & ~0o111
+            )
+        for field in ("type", "uid", "gid", "symlink"):
+            if actual.get(field) != baseline.get(field):
+                raise DeploymentError(f"Bootstrap-existing preexisting metadata changed: {name}")
+        if actual["mode"] != expected_mode:
+            raise DeploymentError(f"Bootstrap-existing preexisting metadata changed: {name}")
+    try:
+        expected_uid = pwd.getpwnam("app").pw_uid if pwd is not None else None
+        allowed_gids = (
+            {grp.getgrnam(name).gr_gid for name in ("app", "www-data")}
+            if grp is not None else None
+        )
+    except KeyError as exc:
+        raise DeploymentError(
+            "Bootstrap-existing approved service ownership identity is missing"
+        ) from exc
+    for name in context.new_paths:
+        path = safe_repo_path(cwd, name, must_exist=True)
+        if not git_path_exists(runner, cwd, context.target_sha, name, user):
+            raise DeploymentError(f"Bootstrap-existing path materialization mismatch: {name}")
+        actual = filesystem_metadata(path)
+        info = path.stat(follow_symlinks=False)
+        if (
+            actual["symlink"]
+            or (expected_uid is not None and info.st_uid != expected_uid)
+            or (allowed_gids is not None and info.st_gid not in allowed_gids)
+        ):
+            raise DeploymentError(f"Bootstrap-existing materialized unsafe ownership: {name}")
+        git_executable = bool(
+            git_path_mode(runner, cwd, context.target_sha, name, user) & 0o111
+        )
+        actual_mode = stat.S_IMODE(info.st_mode)
+        expected_mode = 0o755 if git_executable else 0o644
+        if pwd is not None and actual_mode != expected_mode:
+            raise DeploymentError(f"Bootstrap-existing materialized unsafe permissions: {name}")
+    run_manage_check(runner, context.service)
+    deploy_output, _ = run_manage_check(runner, context.service, deploy=True)
+    new_codes = unexpected_warning_codes(deploy_output, allowed_warnings)
+    if new_codes:
+        raise DeploymentError(
+            "Unexpected deploy warning codes: " + ", ".join(sorted(new_codes))
+        )
+    validate_readiness_layers(runner, context.service, context.nginx)
+    runner.run(
+        [str(context.service.python), "-m", "unittest", "discover", "-s", "ops/tests", "-q"],
+        cwd=cwd, user=user,
+    )
+    _validate_new_evidence_gate_operational(runner, context.service)
+    return head
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--service-unit", required=True)
@@ -1608,6 +1910,26 @@ def build_parser() -> argparse.ArgumentParser:
         "--bootstrap-module",
         help="One-time limited installation of a new versioned ops module.",
     )
+    parser.add_argument(
+        "--worker-unit",
+        default="doppler-background-jobs.service",
+        help="Background worker systemd unit checked by bootstrap-existing-component.",
+    )
+    parser.add_argument(
+        "--bootstrap-existing-component",
+        action="append",
+        default=[],
+        help=(
+            "Repeatable closed allowlist of already-existing ops/ paths this "
+            "one-time bootstrap may update, for use only when the currently "
+            "installed evidence gate blocks deploying its own fix."
+        ),
+    )
+    parser.add_argument(
+        "--bootstrap-evidence",
+        type=Path,
+        help="Path to a BootstrapEvidence JSON file bound to --target-sha.",
+    )
     return parser
 
 
@@ -1621,6 +1943,16 @@ def main(argv: list[str] | None = None) -> int:
             if args.execute or args.fetch_target or args.refresh_deployment_ref:
                 raise DeploymentError("Bootstrap cannot be combined with other mutation modes")
             report = bootstrap_module_deployment(args, runner, args.bootstrap_module)
+            print(json.dumps(report, default=str, indent=2))
+            return 0
+        if args.bootstrap_existing_component:
+            if args.execute or args.fetch_target or args.refresh_deployment_ref or args.bootstrap_module:
+                raise DeploymentError(
+                    "Bootstrap-existing-component cannot be combined with other mutation modes"
+                )
+            report = bootstrap_existing_component_deployment(
+                args, runner, tuple(args.bootstrap_existing_component)
+            )
             print(json.dumps(report, default=str, indent=2))
             return 0
         if args.fetch_target and args.refresh_deployment_ref:
