@@ -425,8 +425,47 @@ def discover_nginx_target(config: str, bind_path: str) -> NginxTarget:
     return target
 
 
+_NGINX_CHECK_ALLOWED_CLASSIFICATIONS = frozenset({
+    "nginx_check_direct_passed",
+    "nginx_check_privileged_passed",
+    "nginx_check_permission_denied",
+    "nginx_check_sudoers_missing",
+    "nginx_check_sudoers_invalid",
+    "nginx_check_command_rejected",
+    "nginx_check_config_invalid",
+    "nginx_check_unexpected_error",
+})
+
+
+def run_nginx_config_test(runner: Runner, service: ServiceMetadata) -> str:
+    """Run `nginx -t` through the least-privilege helper, never raw.
+
+    The helper (ops/td02c_nginx_config_check.py) always executes as the
+    service user; it escalates internally through the single narrow
+    sudoers rule only for a certificate-read permission failure, never for
+    a syntax/config error. This function never falls back to a generic
+    root re-exec of anything else.
+    """
+    helper = service.working_directory / "ops" / "td02c_nginx_config_check.py"
+    result = runner.run(
+        [str(service.python), str(helper)],
+        cwd=service.working_directory, user=service.user, check=False,
+    )
+    classification = "nginx_check_unexpected_error"
+    try:
+        payload = json.loads(result.stdout.strip().splitlines()[-1])
+        candidate = payload.get("classification", "")
+        if candidate in _NGINX_CHECK_ALLOWED_CLASSIFICATIONS:
+            classification = candidate
+    except (ValueError, IndexError):
+        pass
+    if result.returncode or not classification.endswith("_passed"):
+        raise DeploymentError(f"{classification}: nginx configuration check failed")
+    return classification
+
+
 def discover_and_validate_nginx(runner: Runner, service: ServiceMetadata) -> NginxTarget:
-    runner.run(["nginx", "-t"])
+    run_nginx_config_test(runner, service)
     nginx_config = runner.run(["nginx", "-T"]).stdout
     bind_path = application_bind_from_exec_start(service.exec_start_raw)
     target = discover_nginx_target(nginx_config, bind_path)
@@ -807,7 +846,7 @@ def validate_readiness_layers(
     if socket_state.returncode:
         raise DeploymentError("Readiness layer failed: application socket is unavailable")
 
-    runner.run(["nginx", "-t"])
+    run_nginx_config_test(runner, service)
     response = smoke_request(runner, target, path)
     if response["status"] != "200":
         raise DeploymentError(

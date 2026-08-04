@@ -82,6 +82,7 @@ PYCOMPILE_SOURCES = (
     Path("ops/deployment_test_profile.py"),
     Path("ops/isolated_py_compile.py"),
     Path("ops/td02c_deployment_runner.py"),
+    Path("ops/td02c_nginx_config_check.py"),
     Path("ops/td02c_settings_gate.py"),
     Path("ops/td02c_worker_gate.py"),
 )

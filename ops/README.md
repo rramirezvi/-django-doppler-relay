@@ -236,6 +236,92 @@ approved HEAD back to OLD, and verifies runtime SHA256, mode, owner, group,
 size, mtime and final Git state. A HEAD outside the approved range fails closed;
 there is no root fallback.
 
+### Chequeo de Nginx de privilegio mínimo (`nginx -t`)
+
+`nginx` corre como root y sirve el sitio sin problema, pero el certificado
+Let's Encrypt real vive bajo `/etc/letsencrypt/archive/<dominio>/`, típicamente
+`0700 root:root`. El usuario operativo (`app`) no puede leerlo, así que un
+`nginx -t` invocado directamente como `app` falla con
+`Permission denied` al intentar cargar el certificado — no es un error de
+sintaxis, es un gap de lectura. Todo el preflight (`discover_and_validate_nginx`,
+`validate_readiness_layers`, usados tanto por `ops.td02c_deployment_runner`
+como por `--bootstrap-existing-component`) dependía de este único comando.
+
+`ops/td02c_nginx_config_check.py` resuelve esto sin ampliar privilegios de
+forma genérica: intenta `nginx -t` sin privilegios primero; solo si falla con
+un patrón de "permission denied" (nunca ante un error de sintaxis, binario
+ausente o configuración inválida) escala a través de una única regla sudoers
+cerrada que permite exactamente un comando fijo como root:
+`/usr/sbin/nginx -t`, con `NOPASSWD` y `NOEXEC` (nginx no puede a su vez
+ejecutar otro programa bajo esa elevación). El resto del preflight, Git y las
+pruebas siguen ejecutándose como `app`; nunca se invoca el orquestador
+completo como root. `ops.deployment_hardening.run_nginx_config_test()`
+reemplaza toda invocación cruda de `nginx -t` por este helper; ninguna
+permanece en el módulo (verificado por prueba de regresión estructural).
+
+El helper nunca acepta argumentos, nunca usa shell, resuelve
+`/usr/sbin/nginx` y `/usr/bin/sudo` por ruta absoluta fija, usa un `PATH`
+mínimo fijo, y clasifica el resultado en un conjunto cerrado:
+
+- `nginx_check_direct_passed` / `nginx_check_privileged_passed`;
+- `nginx_check_permission_denied` (falló incluso con privilegio);
+- `nginx_check_sudoers_missing` (sudo no disponible o sin entrada NOPASSWD);
+- `nginx_check_sudoers_invalid` (el archivo sudoers tiene error de sintaxis);
+- `nginx_check_command_rejected` (sudoers existe pero rechaza el comando exacto);
+- `nginx_check_config_invalid` (error real de configuración, con o sin privilegio);
+- `nginx_check_unexpected_error`.
+
+Solo registra método, exit code, clasificación y un resumen saneado de una
+línea; nunca el volcado completo de `nginx -t`, ni contenido de certificados.
+
+#### Contenido exacto del sudoers propuesto
+
+Archivo `/etc/sudoers.d/td02c-nginx-check` (definido como constante única en
+`ops/td02c_nginx_config_check.py`, `SUDOERS_CONTENT`, para que el código y el
+archivo instalado nunca puedan divergir):
+
+```
+# Managed by ops/td02c_nginx_config_check.py. Do not edit by hand.
+# Grants app the single fixed command needed to test the Nginx
+# configuration as root, and nothing else.
+app ALL=(root) NOPASSWD: NOEXEC: /usr/sbin/nginx -t
+```
+
+Propiedad `root:root`, modo `0440`. No admite variantes: ni `nginx -T`, ni
+`-s reload`, ni otro binario, ni comodines, ni `ALL=(ALL)`.
+
+#### Procedimiento de instalación (no ejecutado en esta tarea)
+
+```bash
+cat > /root/td02c-nginx-check.sudoers <<'EOF'
+# Managed by ops/td02c_nginx_config_check.py. Do not edit by hand.
+# Grants app the single fixed command needed to test the Nginx
+# configuration as root, and nothing else.
+app ALL=(root) NOPASSWD: NOEXEC: /usr/sbin/nginx -t
+EOF
+visudo -cf /root/td02c-nginx-check.sudoers
+install -o root -g root -m 0440 /root/td02c-nginx-check.sudoers \
+  /etc/sudoers.d/td02c-nginx-check
+rm -f /root/td02c-nginx-check.sudoers
+sudo -n -u app /usr/bin/sudo -n /usr/sbin/nginx -t
+```
+
+`visudo -cf` valida sintaxis antes de instalar; nunca se edita
+`/etc/sudoers.d/td02c-nginx-check` in situ. El último comando confirma, como
+`app`, que la regla ya autoriza exactamente el comando esperado.
+
+#### Rollback
+
+```bash
+rm -f /etc/sudoers.d/td02c-nginx-check
+sudo -n -u app /usr/sbin/nginx -t   # vuelve a fallar con Permission denied: esperado
+```
+
+Quitar el archivo no requiere reiniciar ningún servicio ni afecta a Nginx en
+ejecución; el preflight vuelve a fallar de forma fail-closed en
+`nginx_check_sudoers_missing` en vez de tener éxito, exactamente el
+comportamiento previo a esta corrección.
+
 ## Worker restarts
 
 Workers are not restarted automatically. Inspect their effective `ExecStart`

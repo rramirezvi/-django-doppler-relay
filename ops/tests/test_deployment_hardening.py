@@ -37,6 +37,7 @@ from ops.deployment_hardening import (
     refresh_deployment_ref,
     require_deployment_ref,
     run_as_service_user_command,
+    run_nginx_config_test,
     resolve_commit,
     safe_repo_path,
     smoke_request,
@@ -971,6 +972,94 @@ class CommandMapRunner:
         return self.handler(list(args), kwargs)
 
 
+def nginx_check_pass_json(classification="nginx_check_direct_passed", method="direct"):
+    return json.dumps({
+        "phase": "nginx_config_check", "classification": classification,
+        "method": method, "exit_code": 0, "result": "PASS",
+    })
+
+
+def is_nginx_check_invocation(args):
+    return bool(args) and args[-1].endswith("td02c_nginx_config_check.py")
+
+
+class NginxConfigTestIntegrationTests(unittest.TestCase):
+    """ops.deployment_hardening.run_nginx_config_test: the wrapper that
+    replaced every raw `nginx -t` call inside preflight/readiness."""
+
+    def service(self):
+        return SimpleNamespace(
+            unit="django.service", user="app",
+            working_directory=Path("/opt/app/django-doppler-relay"),
+            python=Path("/opt/app/django-doppler-relay/.venv/bin/python"),
+        )
+
+    def test_privileged_pass_is_accepted(self):
+        service = self.service()
+        runner = CommandMapRunner(
+            lambda args, kwargs: subprocess.CompletedProcess(
+                args, 0, nginx_check_pass_json("nginx_check_privileged_passed", "privileged"), ""
+            )
+        )
+        classification = run_nginx_config_test(runner, service)
+        self.assertEqual(classification, "nginx_check_privileged_passed")
+
+    def test_failure_classification_is_raised_verbatim(self):
+        service = self.service()
+        payload = json.dumps({
+            "phase": "nginx_config_check", "classification": "nginx_check_sudoers_missing",
+            "method": "direct", "exit_code": 1, "result": "FAIL",
+        })
+        runner = CommandMapRunner(
+            lambda args, kwargs: subprocess.CompletedProcess(args, 1, payload, "")
+        )
+        with self.assertRaisesRegex(DeploymentError, "nginx_check_sudoers_missing"):
+            run_nginx_config_test(runner, service)
+
+    def test_malformed_output_falls_back_to_unexpected_error(self):
+        service = self.service()
+        runner = CommandMapRunner(
+            lambda args, kwargs: subprocess.CompletedProcess(args, 1, "not json at all", "")
+        )
+        with self.assertRaisesRegex(DeploymentError, "nginx_check_unexpected_error"):
+            run_nginx_config_test(runner, service)
+
+    def test_unrecognized_classification_is_rejected(self):
+        service = self.service()
+        payload = json.dumps({"classification": "totally_made_up", "result": "PASS"})
+        runner = CommandMapRunner(
+            lambda args, kwargs: subprocess.CompletedProcess(args, 0, payload, "")
+        )
+        with self.assertRaisesRegex(DeploymentError, "nginx_check_unexpected_error"):
+            run_nginx_config_test(runner, service)
+
+    def test_helper_is_invoked_as_service_user_under_working_directory(self):
+        service = self.service()
+        runner = CommandMapRunner(
+            lambda args, kwargs: subprocess.CompletedProcess(args, 0, nginx_check_pass_json(), "")
+        )
+        run_nginx_config_test(runner, service)
+        (call,) = runner.calls
+        self.assertEqual(call[0], str(service.python))
+        self.assertTrue(call[1].endswith("ops/td02c_nginx_config_check.py") or call[1].endswith("ops\\td02c_nginx_config_check.py"))
+
+    def test_helper_runs_as_app_not_root(self):
+        service = self.service()
+        seen_kwargs = {}
+        def handler(args, kwargs):
+            seen_kwargs.update(kwargs)
+            return subprocess.CompletedProcess(args, 0, nginx_check_pass_json(), "")
+        run_nginx_config_test(CommandMapRunner(handler), service)
+        self.assertEqual(seen_kwargs.get("user"), "app")
+
+    def test_no_raw_nginx_dash_t_call_remains_in_the_module(self):
+        """Structural regression guard: nginx -t must only ever be invoked
+        through the least-privilege helper, never directly by this module."""
+        source = inspect.getsource(__import__("ops.deployment_hardening", fromlist=["x"]))
+        self.assertNotIn('["nginx", "-t"]', source)
+        self.assertNotIn("run_as_service_user_command(['nginx', '-t']", source)
+
+
 class OperationalDiscoveryTests(unittest.TestCase):
     def _systemd_output(self, root: Path, *, active="active", user="svc", group="svc"):
         return "\n".join(
@@ -1057,11 +1146,16 @@ class OperationalDiscoveryTests(unittest.TestCase):
                 discover_service(runner, "django.service")
 
     def test_nginx_t_failure_is_fatal(self):
+        service = SimpleNamespace(
+            exec_start_raw="", user="app",
+            working_directory=Path("/opt/app/django-doppler-relay"),
+            python=Path("python3"),
+        )
         runner = CommandMapRunner(
             lambda args, kwargs: (_ for _ in ()).throw(DeploymentError("nginx -t failed"))
         )
         with self.assertRaisesRegex(DeploymentError, "nginx -t failed"):
-            discover_and_validate_nginx(runner, SimpleNamespace(exec_start_raw=""))
+            discover_and_validate_nginx(runner, service)
 
     def test_certificate_hostname_failure_is_fatal(self):
         config = """
@@ -1070,13 +1164,16 @@ class OperationalDiscoveryTests(unittest.TestCase):
         proxy_pass http://unix:/run/app.sock; }
         """
         def handler(args, kwargs):
-            if args == ["nginx", "-t"]:
-                return subprocess.CompletedProcess(args, 0, "", "")
+            if args[-1].endswith("td02c_nginx_config_check.py"):
+                return subprocess.CompletedProcess(args, 0, nginx_check_pass_json(), "")
             if args == ["nginx", "-T"]:
                 return subprocess.CompletedProcess(args, 0, config, "")
             raise DeploymentError("certificate does not cover host")
         service = SimpleNamespace(
-            exec_start_raw="{ path=/x ; argv[]=/x --bind unix:/run/app.sock app:wsgi ; }"
+            exec_start_raw="{ path=/x ; argv[]=/x --bind unix:/run/app.sock app:wsgi ; }",
+            user="app",
+            working_directory=Path("/opt/app/django-doppler-relay"),
+            python=Path("python3"),
         )
         with self.assertRaisesRegex(DeploymentError, "certificate"):
             discover_and_validate_nginx(CommandMapRunner(handler), service)
@@ -1140,14 +1237,20 @@ class SmokeTests(unittest.TestCase):
         self.assertNotIn("redirect_url", " ".join(command))
 
     def test_preflight_readiness_reports_each_layer(self):
-        service = SimpleNamespace(unit="django.service", user="app")
+        service = SimpleNamespace(
+            unit="django.service", user="app",
+            working_directory=Path("/opt/app/django-doppler-relay"),
+            python=Path("python3"),
+        )
         socket_path = str(Path.cwd().anchor + "run/app.sock")
         target = NginxTarget("app.example.com", 443, socket_path, None)
         def handler(args, kwargs):
             if args[:2] == ["systemctl", "is-active"]:
                 return subprocess.CompletedProcess(args, 0, "active\n", "")
-            if args[:2] == ["test", "-S"] or args == ["nginx", "-t"]:
+            if args[:2] == ["test", "-S"]:
                 return subprocess.CompletedProcess(args, 0, "", "")
+            if is_nginx_check_invocation(args):
+                return subprocess.CompletedProcess(args, 0, nginx_check_pass_json(), "")
             if args[0] == "curl":
                 return subprocess.CompletedProcess(args, 0, "__DEPLOY_SMOKE__200", "")
             raise AssertionError(args)
@@ -1199,15 +1302,21 @@ class SmokeTests(unittest.TestCase):
         def handler(args, kwargs):
             if args[:2] == ["systemctl", "is-active"]:
                 return subprocess.CompletedProcess(args, 0, "active\n", "")
-            if args[:2] == ["test", "-S"] or args == ["nginx", "-t"]:
+            if args[:2] == ["test", "-S"]:
                 return subprocess.CompletedProcess(args, 0, "", "")
+            if is_nginx_check_invocation(args):
+                return subprocess.CompletedProcess(args, 0, nginx_check_pass_json(), "")
             if args[0] == "curl":
                 return subprocess.CompletedProcess(args, 0, "__DEPLOY_SMOKE__503", "")
             raise AssertionError(args)
         with self.assertRaisesRegex(DeploymentError, "returned HTTP 503"):
             validate_readiness_layers(
                 CommandMapRunner(handler),
-                SimpleNamespace(unit="django.service", user="app"),
+                SimpleNamespace(
+                    unit="django.service", user="app",
+                    working_directory=Path("/opt/app/django-doppler-relay"),
+                    python=Path("python3"),
+                ),
                 NginxTarget(
                     "app.example.com", 443,
                     str(Path.cwd().anchor + "run/app.sock"), None,
