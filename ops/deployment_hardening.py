@@ -440,13 +440,22 @@ _NGINX_CHECK_ALLOWED_CLASSIFICATIONS = frozenset({
 def run_nginx_config_test(runner: Runner, service: ServiceMetadata) -> str:
     """Run `nginx -t` through the least-privilege helper, never raw.
 
-    The helper (ops/td02c_nginx_config_check.py) always executes as the
-    service user; it escalates internally through the single narrow
-    sudoers rule only for a certificate-read permission failure, never for
-    a syntax/config error. This function never falls back to a generic
-    root re-exec of anything else.
+    The helper is resolved next to *this* module (``Path(__file__).parent``),
+    not under ``service.working_directory``: during
+    bootstrap_existing_component_deployment this code itself runs from an
+    ephemeral copy of the target version, and the real checkout being
+    validated has not been fast-forwarded yet, so it may not contain the
+    helper at all. Using the running module's own directory means the
+    helper that actually executes is always the one shipped with whichever
+    ops.deployment_hardening is currently loaded.
+
+    The helper always executes as the service user; it escalates
+    internally through the single narrow sudoers rule only for a
+    certificate-read permission failure, never for a syntax/config error.
+    This function never falls back to a generic root re-exec of anything
+    else.
     """
-    helper = service.working_directory / "ops" / "td02c_nginx_config_check.py"
+    helper = Path(__file__).resolve().parent / "td02c_nginx_config_check.py"
     result = runner.run(
         [str(service.python), str(helper)],
         cwd=service.working_directory, user=service.user, check=False,
@@ -1706,6 +1715,15 @@ def bootstrap_existing_component_deployment(
     evidence gate from ops.td02c_deployment_runner, which stays the only
     path for ordinary deployments. This is not a general deployment path:
     no restart, migration, collectstatic, or application write occurs here.
+
+    ``--bootstrap-skip-operational-checks`` exists only for installing a
+    component that the operational checks themselves depend on (for
+    example this very nginx-check mechanism, before its sudoers rule can
+    exist): it skips nginx discovery, readiness, and baseline smoke in
+    preflight and post-merge, but never the Git/evidence/allowlist gates,
+    never the jobs/V2/ledger/settings/worker check, and never `manage.py
+    check` or the permitted test suites. The default keeps full operational
+    checks, matching every other bootstrap-existing-component target.
     """
     _validate_bootstrap_existing_paths(authorized_paths)
     service = discover_service(runner, args.service_unit)
@@ -1738,7 +1756,8 @@ def bootstrap_existing_component_deployment(
         runner, cwd, remote=args.remote, branch=args.branch,
         target_sha=args.target_sha, user=user,
     )
-    context = preflight(args, runner, operational_checks=True)
+    skip_operational_checks = bool(getattr(args, "bootstrap_skip_operational_checks", False))
+    context = preflight(args, runner, operational_checks=not skip_operational_checks)
     changed = set(context.changed_files)
     authorized = set(authorized_paths)
     unauthorized = sorted(changed - authorized)
@@ -1763,6 +1782,7 @@ def bootstrap_existing_component_deployment(
         head = validate_bootstrap_existing_post_merge(
             runner, context, authorized_paths=authorized_paths,
             allowed_warnings=set(getattr(args, "allowed_warning", [])),
+            skip_operational_checks=skip_operational_checks,
         )
         return {
             "phase": "bootstrap-existing-complete",
@@ -1789,6 +1809,7 @@ def validate_bootstrap_existing_post_merge(
     *,
     authorized_paths: tuple[str, ...],
     allowed_warnings: set[str] = frozenset(),
+    skip_operational_checks: bool = False,
 ) -> str:
     """Validate the materialized bootstrap-existing target and prove the
     fixed gate is live, without re-running old-HEAD preflight or the normal
@@ -1911,7 +1932,8 @@ def validate_bootstrap_existing_post_merge(
         raise DeploymentError(
             "Unexpected deploy warning codes: " + ", ".join(sorted(new_codes))
         )
-    validate_readiness_layers(runner, context.service, context.nginx)
+    if not skip_operational_checks:
+        validate_readiness_layers(runner, context.service, context.nginx)
     runner.run(
         [str(context.service.python), "-m", "unittest", "discover", "-s", "ops/tests", "-q"],
         cwd=cwd, user=user,
@@ -1981,6 +2003,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--bootstrap-evidence",
         type=Path,
         help="Path to a BootstrapEvidence JSON file bound to --target-sha.",
+    )
+    parser.add_argument(
+        "--bootstrap-skip-operational-checks",
+        action="store_true",
+        help=(
+            "Skip nginx discovery, readiness, and baseline smoke in "
+            "bootstrap-existing-component's pre- and post-merge validation. "
+            "Only for installing a component the operational checks "
+            "themselves depend on (for example the nginx-check mechanism "
+            "before its sudoers rule exists). Never skips Git/evidence/"
+            "allowlist gates, the jobs/V2/ledger/settings/worker check, "
+            "manage.py check, or the permitted test suites."
+        ),
     )
     return parser
 

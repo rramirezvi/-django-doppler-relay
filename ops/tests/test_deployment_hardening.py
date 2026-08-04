@@ -697,6 +697,78 @@ class BootstrapExistingComponentTests(unittest.TestCase):
         self.assertNotIn("validate_predeployment_evidence", source)
         self.assertNotIn("_load_validation_evidence", source)
 
+    # --- --bootstrap-skip-operational-checks: installs the nginx-check
+    # mechanism itself, before its sudoers rule can exist -----------------
+
+    def test_skip_operational_checks_succeeds_without_touching_nginx(self):
+        """Paso A: nginx is completely unreachable (raises if ever called),
+        yet the bootstrap still completes because the flag is set."""
+        self.write_evidence()
+        with (
+            patch("ops.deployment_hardening.discover_service", return_value=self.service),
+            patch("ops.deployment_hardening.require_commands"),
+            patch("ops.deployment_hardening.discover_and_validate_nginx",
+                  side_effect=AssertionError("nginx must never be touched during Paso A")),
+            patch("ops.deployment_hardening.validate_readiness_layers",
+                  side_effect=AssertionError("readiness must never run during Paso A")),
+            patch("ops.deployment_hardening.run_manage_check", return_value=("", set())),
+            patch("ops.deployment_hardening.pwd", None),
+            patch("ops.deployment_hardening.grp", None),
+        ):
+            report = bootstrap_existing_component_deployment(
+                self.args(bootstrap_skip_operational_checks=True),
+                self.runner, self.AUTHORIZED_PATHS,
+            )
+        self.assertEqual(report["head"], self.target)
+        self.assertEqual(self.head(), self.target)
+
+    def test_skip_operational_checks_still_runs_jobs_and_worker_gate(self):
+        """The Django jobs/V2/ledger/settings/worker check has no nginx
+        dependency and must keep running even with the flag set."""
+        self.write_evidence()
+        with (
+            patch("ops.deployment_hardening.discover_service", return_value=self.service),
+            patch("ops.deployment_hardening.require_commands"),
+            patch("ops.deployment_hardening.discover_and_validate_nginx",
+                  side_effect=AssertionError("nginx must never be touched")),
+            patch("ops.deployment_hardening.validate_readiness_layers",
+                  side_effect=AssertionError("readiness must never run")),
+            patch("ops.deployment_hardening.run_manage_check", return_value=("", set())),
+            patch("ops.deployment_hardening.pwd", None),
+            patch("ops.deployment_hardening.grp", None),
+            patch("ops.deployment_hardening._validate_bootstrap_operational_gates") as gates,
+        ):
+            bootstrap_existing_component_deployment(
+                self.args(bootstrap_skip_operational_checks=True),
+                self.runner, self.AUTHORIZED_PATHS,
+            )
+        gates.assert_called_once()
+
+    def test_default_still_requires_full_operational_checks(self):
+        """Without the flag, a broken nginx still aborts the bootstrap --
+        the default behaviour for every other target is unchanged."""
+        self.write_evidence()
+        with patch("ops.deployment_hardening.discover_service", return_value=self.service), \
+             patch("ops.deployment_hardening.require_commands"), \
+             patch("ops.deployment_hardening.discover_and_validate_nginx",
+                   side_effect=DeploymentError("nginx_check_sudoers_missing: nginx configuration check failed")):
+            with self.assertRaisesRegex(DeploymentError, "nginx_check_sudoers_missing"):
+                bootstrap_existing_component_deployment(
+                    self.args(), self.runner, self.AUTHORIZED_PATHS,
+                )
+        self.assertEqual(self.head(), self.old)
+
+    def test_skip_operational_checks_flag_defaults_to_false(self):
+        args = self.args()
+        self.assertFalse(getattr(args, "bootstrap_skip_operational_checks", False))
+        parsed = build_parser().parse_args([
+            "--service-unit", "django.service", "--old-sha", self.old,
+            "--target-sha", self.target, "--remote", "origin", "--branch", "production",
+            "--bootstrap-existing-component", "ops/x.py",
+            "--bootstrap-evidence", str(self.evidence_path),
+        ])
+        self.assertFalse(parsed.bootstrap_skip_operational_checks)
+
 
 @unittest.skipUnless(os.name == "posix", "POSIX service-user execution")
 class ServiceUserExecutionTests(unittest.TestCase):
@@ -1042,6 +1114,27 @@ class NginxConfigTestIntegrationTests(unittest.TestCase):
         (call,) = runner.calls
         self.assertEqual(call[0], str(service.python))
         self.assertTrue(call[1].endswith("ops/td02c_nginx_config_check.py") or call[1].endswith("ops\\td02c_nginx_config_check.py"))
+
+    def test_helper_is_resolved_next_to_the_running_module_not_the_checkout(self):
+        """Regression guard: during bootstrap_existing_component_deployment
+        this code runs from an ephemeral copy, so the real checkout being
+        validated (service.working_directory) may not have the helper yet.
+        The helper path must never depend on service.working_directory."""
+        import ops.deployment_hardening as module
+
+        service = SimpleNamespace(
+            unit="django.service", user="app",
+            working_directory=Path("/opt/app/django-doppler-relay-DOES-NOT-EXIST"),
+            python=Path("/opt/app/django-doppler-relay/.venv/bin/python"),
+        )
+        runner = CommandMapRunner(
+            lambda args, kwargs: subprocess.CompletedProcess(args, 0, nginx_check_pass_json(), "")
+        )
+        run_nginx_config_test(runner, service)
+        (call,) = runner.calls
+        helper_path = Path(call[1])
+        self.assertEqual(helper_path.parent, Path(module.__file__).resolve().parent)
+        self.assertNotIn("DOES-NOT-EXIST", call[1])
 
     def test_helper_runs_as_app_not_root(self):
         service = self.service()

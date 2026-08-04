@@ -322,6 +322,63 @@ ejecución; el preflight vuelve a fallar de forma fail-closed en
 `nginx_check_sudoers_missing` en vez de tener éxito, exactamente el
 comportamiento previo a esta corrección.
 
+#### Secuencia de despliegue en dos pasos
+
+Instalar el propio mecanismo de `nginx -t` con privilegio mínimo tiene una
+paradoja de arranque adicional: el preflight de `--bootstrap-existing-component`
+también depende de `nginx -t`/`nginx -T`, y sin la regla sudoers instalada
+ambos siguen fallando por el mismo permiso — incluso para el bootstrap que
+instala la corrección. `--bootstrap-skip-operational-checks` existe
+exclusivamente para este caso: omite descubrimiento de Nginx, readiness y
+smoke test tanto en el preflight previo al merge como en la validación
+posterior, pero nunca omite Git, la evidencia, la allowlist, el chequeo de
+jobs/V2/ledger/settings/worker, `manage.py check` ni la suite de pruebas
+permitida. Por eso el despliegue real de este target se hace en dos pasos
+separados, con autorización propia cada uno:
+
+**Paso A — bootstrap acumulado de código, sin sudoers todavía**
+
+```bash
+.venv/bin/python -m ops.deployment_hardening \
+  --service-unit django.service \
+  --old-sha e47582655d84c1da85880ff8f1b55a731e5be4c5 \
+  --target-sha TARGET \
+  --remote origin --branch operator-ui-production-test \
+  --worker-unit doppler-background-jobs.service \
+  --expected-commit ... \
+  --bootstrap-existing-component ops/README.md \
+  --bootstrap-existing-component ops/deployment_hardening.py \
+  --bootstrap-existing-component ops/deployment_test_profile.py \
+  --bootstrap-existing-component ops/td02c_authenticated_get_runner.py \
+  --bootstrap-existing-component ops/td02c_deployment_runner.py \
+  --bootstrap-existing-component ops/td02c_http_client.py \
+  --bootstrap-existing-component ops/td02c_nginx_config_check.py \
+  --bootstrap-existing-component ops/tests/test_deployment_hardening.py \
+  --bootstrap-existing-component ops/tests/test_deployment_test_profile.py \
+  --bootstrap-existing-component ops/tests/test_td02c_authenticated_get_runner.py \
+  --bootstrap-existing-component ops/tests/test_td02c_nginx_config_check.py \
+  --bootstrap-evidence /ruta/externa/bootstrap-evidencia.json \
+  --bootstrap-skip-operational-checks
+```
+
+Al terminar: HEAD en `TARGET`, jobs/V2/ledger/flags/worker verificados,
+`manage.py check` y la suite `ops` completa en PASS, ningún servicio
+reiniciado, Nginx sin tocar. La regla sudoers todavía no existe.
+
+**Paso B — instalación controlada de sudoers (autorización separada)**
+
+Sigue exactamente el procedimiento de instalación documentado arriba:
+`visudo -cf` sobre un archivo nuevo, `install -m 0440 -o root -g root`,
+verificación con `sudo -n -u app sudo -n /usr/sbin/nginx -t`, y confirmación
+explícita de que `-T`, `-s reload`, un shell y cualquier otro binario siguen
+rechazados.
+
+**Después de ambos pasos**, y solo entonces, correr el preflight normal
+completo (sin el flag de omisión) con `ops.td02c_deployment_runner
+--mode preflight-only`, y confirmar que la evidencia registra
+`nginx_check_privileged_passed`. El runner autenticado y el canary siguen
+requiriendo autorización aparte.
+
 ## Worker restarts
 
 Workers are not restarted automatically. Inspect their effective `ExecStart`
