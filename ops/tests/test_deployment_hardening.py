@@ -3,6 +3,7 @@ import inspect
 import json
 import os
 import shutil
+import stat
 import subprocess
 import tempfile
 import unittest
@@ -11,6 +12,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+try:
+    import pwd
+except ImportError:  # pragma: no cover - these tests are POSIX-only
+    pwd = None  # type: ignore[assignment]
+
 from ops.deployment_hardening import (
     DeploymentContext,
     DeploymentError,
@@ -18,6 +24,7 @@ from ops.deployment_hardening import (
     NginxTarget,
     Runner,
     ServiceMetadata,
+    _resolve_git_binary,
     acquire_target_object,
     bootstrap_existing_component_deployment,
     bootstrap_module_deployment,
@@ -38,8 +45,10 @@ from ops.deployment_hardening import (
     refresh_deployment_ref,
     require_deployment_ref,
     run_as_service_user_command,
+    run_git_materializing,
     run_nginx_config_test,
     resolve_commit,
+    ServiceUserCommand,
     safe_repo_path,
     smoke_request,
     snapshot_git_state,
@@ -948,6 +957,230 @@ class BootstrapExistingComponentTests(unittest.TestCase):
         ])
         self.assertFalse(parsed.bootstrap_skip_operational_checks)
 
+    # End-to-end reproduction of the real production finding: under the
+    # real Runner (not _BootstrapGitRunner) and a parent umask of 0002 --
+    # exactly the app account's real login umask on the droplet -- the
+    # full bootstrap-existing-component flow must still land
+    # ops/README.md at 0644, and the post-merge metadata gate must accept
+    # it, with no chmod correction anywhere in this test.
+    @unittest.skipUnless(os.name == "posix", "POSIX umask semantics")
+    def test_real_merge_under_umask_0002_preserves_expected_mode_end_to_end(self):
+        self.write_evidence()
+        original_umask = os.umask(0o002)
+        self.addCleanup(os.umask, original_umask)
+
+        class RealGitNoOpPythonRunner(Runner):
+            """Real Runner for Git -- so deterministic_umask genuinely
+            applies -- but no-ops any python-prefixed command (test
+            suites, operational/evidence gate checks), mirroring
+            _BootstrapGitRunner's shortcut without losing real Git
+            materialization behaviour."""
+
+            def run(self, args, **kwargs):
+                if args and Path(str(args[0])).name.startswith("python"):
+                    return subprocess.CompletedProcess(args, 0, "", "")
+                return super().run(args, **kwargs)
+
+        real_runner = RealGitNoOpPythonRunner()
+        with (
+            patch("ops.deployment_hardening.discover_service", return_value=self.service),
+            patch("ops.deployment_hardening.require_commands"),
+            patch("ops.deployment_hardening.discover_and_validate_nginx",
+                  side_effect=AssertionError("nginx must never be touched during Paso A")),
+            patch("ops.deployment_hardening.validate_readiness_layers",
+                  side_effect=AssertionError("readiness must never run during Paso A")),
+            patch("ops.deployment_hardening.run_manage_check", return_value=("", set())),
+            patch("ops.deployment_hardening._validate_bootstrap_operational_gates"),
+            patch("ops.deployment_hardening._validate_new_evidence_gate_operational"),
+        ):
+            report = bootstrap_existing_component_deployment(
+                self.args(bootstrap_skip_operational_checks=True),
+                real_runner, self.AUTHORIZED_PATHS,
+            )
+        self.assertEqual(report["head"], self.target)
+        self.assertEqual(
+            stat.S_IMODE((self.repo / "ops" / "README.md").stat().st_mode), 0o644,
+        )
+        current = os.umask(0)
+        os.umask(current)
+        self.assertEqual(current, 0o002)
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX umask semantics")
+class DeterministicUmaskGitTests(unittest.TestCase):
+    """Real, non-mocked coverage for run_git_materializing: proves that
+    Git merge/restore under this module always produces exactly the mode
+    Git's own index records, deterministically, regardless of the parent
+    process's ambient umask -- reproducing the exact production finding
+    (umask 0002 on the app account materializing ops/README.md at 0664
+    instead of the baseline 0644) and proving it fixed."""
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+        isolate_git_environment(self, self.root)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        subprocess.run(["git", "init", "-q", "-b", "production"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.email", "ops@example.invalid"], cwd=self.repo, check=True)
+        subprocess.run(["git", "config", "user.name", "Ops Tests"], cwd=self.repo, check=True)
+        (self.repo / "normal.txt").write_text("old\n", encoding="utf-8")
+        (self.repo / "normal.txt").chmod(0o644)
+        (self.repo / "script.sh").write_text("#!/bin/sh\necho old\n", encoding="utf-8")
+        (self.repo / "script.sh").chmod(0o755)
+        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "old"], cwd=self.repo, check=True)
+        self.old = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True
+        ).strip()
+
+        (self.repo / "normal.txt").write_text("new\n", encoding="utf-8")
+        (self.repo / "script.sh").write_text("#!/bin/sh\necho new\n", encoding="utf-8")
+        (self.repo / "new_file.txt").write_text("brand new\n", encoding="utf-8")
+        (self.repo / "new_file.txt").chmod(0o644)
+        subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "target"], cwd=self.repo, check=True)
+        self.target = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True
+        ).strip()
+
+        subprocess.run(["git", "checkout", "-q", self.old], cwd=self.repo, check=True)
+
+        self.runner = Runner()
+        self.user = pwd.getpwuid(os.geteuid()).pw_name if pwd is not None else None
+        self.original_umask = os.umask(0o002)
+        self.addCleanup(os.umask, self.original_umask)
+
+    def _merge(self):
+        run_git_materializing(
+            self.runner, ["git", "merge", "--ff-only", self.target],
+            cwd=self.repo, user=self.user,
+        )
+
+    def _mode(self, name):
+        return stat.S_IMODE((self.repo / name).stat().st_mode)
+
+    def _current_umask(self):
+        current = os.umask(0)
+        os.umask(current)
+        return current
+
+    # 1/2: merge crea archivo normal en 0644 y ejecutable en 0755, bajo
+    # un proceso padre con umask 0002.
+    def test_merge_creates_normal_file_at_0644_under_umask_0002(self):
+        self.assertEqual(self._current_umask(), 0o002)
+        self._merge()
+        self.assertEqual(self._mode("normal.txt"), 0o644)
+
+    def test_merge_creates_executable_at_0755_under_umask_0002(self):
+        self._merge()
+        self.assertEqual(self._mode("script.sh"), 0o755)
+
+    # 4: archivo preexistente modificado conserva 0644.
+    def test_preexisting_modified_file_keeps_0644(self):
+        baseline = filesystem_metadata(self.repo / "normal.txt")
+        self._merge()
+        actual = filesystem_metadata(self.repo / "normal.txt")
+        self.assertEqual(actual["mode"], baseline["mode"])
+        self.assertEqual(actual["mode"], 0o644)
+
+    # 5: archivo nuevo queda 0644.
+    def test_new_file_from_merge_is_0644(self):
+        self._merge()
+        self.assertEqual(self._mode("new_file.txt"), 0o644)
+
+    # 7: el proceso padre continúa con umask 0002 después.
+    def test_parent_umask_is_unaffected_after_merge(self):
+        self._merge()
+        self.assertEqual(self._current_umask(), 0o002)
+
+    # 6: rollback restaura 0644 (y 0755 para el ejecutable) bajo el mismo
+    # umask 0002, sin ningún chmod correctivo -- solo el ejecutor
+    # determinista.
+    def test_rollback_restores_baseline_modes_under_umask_0002(self):
+        self._merge()
+        run_git_materializing(
+            self.runner,
+            ["git", "restore", "--source", self.old, "--staged", "--worktree",
+             "--", "normal.txt", "script.sh"],
+            cwd=self.repo, user=self.user,
+        )
+        self.assertEqual(self._mode("normal.txt"), 0o644)
+        self.assertEqual(self._mode("script.sh"), 0o755)
+        self.assertEqual(self._current_umask(), 0o002)
+
+    # 8: operaciones read-only jamás requieren (ni aceptan) el ejecutor
+    # determinista -- deben usar Runner.run directamente.
+    def test_read_only_git_subcommands_are_rejected_by_materializing_helper(self):
+        for bad_argv in (
+            ["git", "rev-parse", "HEAD"],
+            ["git", "status"],
+            ["git", "diff"],
+            ["git", "cat-file", "-e", self.target],
+            ["git", "ls-tree", self.target],
+            ["git", "ls-remote", "origin"],
+        ):
+            with self.subTest(argv=bad_argv):
+                with self.assertRaisesRegex(
+                    DeploymentError, "Unsafe materializing Git invocation"
+                ):
+                    run_git_materializing(self.runner, bad_argv, cwd=self.repo, user=self.user)
+
+    def test_resolved_git_binary_is_absolute_and_executable(self):
+        resolved = _resolve_git_binary()
+        self.assertTrue(Path(resolved).is_absolute())
+        self.assertTrue(os.access(resolved, os.X_OK))
+
+    # 9/12: Git sigue ejecutándose como el usuario de servicio; nunca hay
+    # fallback root -- un wrapper runuser (root cambiando a app) rechaza
+    # el umask determinista en vez de aceptarlo sin garantía.
+    def test_deterministic_umask_rejects_root_runuser_wrapper(self):
+        with patch(
+            "ops.deployment_hardening.run_as_service_user_command",
+            return_value=ServiceUserCommand(
+                ["runuser", "-u", "app", "--", "git", "merge", "--ff-only", self.target],
+                "switched_from_root_to_service_user",
+            ),
+        ):
+            with self.assertRaisesRegex(
+                DeploymentError, "deterministic_umask requires executing directly"
+            ):
+                run_git_materializing(
+                    self.runner, ["git", "merge", "--ff-only", self.target],
+                    cwd=self.repo, user="app",
+                )
+
+    # 10: nunca shell=True.
+    def test_no_shell_true_in_runner_source(self):
+        source = inspect.getsource(Runner.run)
+        self.assertNotIn("shell=True", source)
+
+    # 13: fallo Git conserva exit code y diagnóstico.
+    def test_failed_merge_preserves_exit_code_and_diagnostic(self):
+        (self.repo / "normal.txt").write_text("locally diverged\n", encoding="utf-8")
+        subprocess.run(["git", "add", "normal.txt"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "local divergence"], cwd=self.repo, check=True)
+        with self.assertRaisesRegex(DeploymentError, "command_failed"):
+            self._merge()
+
+    # 14: tras una interrupción a mitad del proceso (simulada como una
+    # falla real de Git), el rollback posterior sigue produciendo los
+    # modos correctos bajo umask 0002.
+    def test_rollback_after_failed_merge_still_yields_correct_modes(self):
+        (self.repo / "normal.txt").write_text("locally diverged\n", encoding="utf-8")
+        subprocess.run(["git", "add", "normal.txt"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "local divergence"], cwd=self.repo, check=True)
+        with self.assertRaises(DeploymentError):
+            self._merge()
+        run_git_materializing(
+            self.runner,
+            ["git", "restore", "--source", self.old, "--staged", "--worktree",
+             "--", "normal.txt"],
+            cwd=self.repo, user=self.user,
+        )
+        self.assertEqual(self._mode("normal.txt"), 0o644)
+        self.assertEqual(self._current_umask(), 0o002)
+
 
 @unittest.skipUnless(os.name == "posix", "POSIX service-user execution")
 class ServiceUserExecutionTests(unittest.TestCase):
@@ -1796,7 +2029,14 @@ class RollbackRepositoryTests(unittest.TestCase):
         seen = []
         class UserRecordingRunner(LocalRunner):
             def run(inner, args, **kwargs):
-                if args[:2] in (["git", "restore"], ["git", "update-ref"]):
+                # run_git_materializing resolves Git to an absolute path for
+                # restore, so match on the subcommand, not a literal "git"
+                # at args[0]; update-ref is untouched and stays literal.
+                subcommand = args[1] if len(args) >= 2 else None
+                if (
+                    len(args) >= 2 and Path(str(args[0])).name == "git"
+                    and subcommand in ("restore", "update-ref")
+                ):
                     seen.append((list(args), kwargs.get("user")))
                 return super().run(args, **kwargs)
         targeted_rollback(
@@ -1866,7 +2106,13 @@ class RollbackRepositoryTests(unittest.TestCase):
                 self.interrupted = False
             def run(inner_self, args, **kwargs):
                 result = super(InterruptingRunner, inner_self).run(args, **kwargs)
-                if args[:2] == ["git", "restore"] and not inner_self.interrupted:
+                # run_git_materializing resolves Git to an absolute path for
+                # merge/restore, so match on the subcommand, not a literal
+                # "git" at args[0].
+                if (
+                    len(args) >= 2 and Path(str(args[0])).name == "git"
+                    and args[1] == "restore" and not inner_self.interrupted
+                ):
                     inner_self.interrupted = True
                     raise DeploymentError("simulated interruption after git restore")
                 return result
@@ -2015,7 +2261,13 @@ class RollbackRepositoryTests(unittest.TestCase):
         class RuntimeMutatingRunner(LocalRunner):
             def run(inner, args, **kwargs):
                 result = super().run(args, **kwargs)
-                if args[:3] == ["git", "merge", "--ff-only"]:
+                # run_git_materializing resolves Git to an absolute path for
+                # merge/restore, so match on the subcommand, not a literal
+                # "git" at args[0].
+                if (
+                    len(args) >= 3 and Path(str(args[0])).name == "git"
+                    and args[1:3] == ["merge", "--ff-only"]
+                ):
                     (repo / "runtime.txt").write_text(
                         "runtime changed during merge\n", encoding="utf-8"
                     )

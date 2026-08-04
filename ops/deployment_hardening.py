@@ -87,6 +87,36 @@ def redact_output(value: str) -> str:
     return redacted[-8000:]
 
 
+def _apply_deterministic_umask() -> None:
+    """``preexec_fn`` for a forked Git child, never the parent process.
+
+    Runs strictly after ``fork()`` and before ``execve()``, in the child
+    only: it changes that one process's umask to 0022, deterministically,
+    regardless of whatever umask the parent inherited from its shell, SSH
+    session, PAM, or systemd. The parent process (and everything else
+    running as the app account) is never touched. Safe here specifically
+    because this CLI is single-threaded and never starts threads before
+    forking a subprocess -- ``fork()`` after threads exist is unsafe, but
+    that never happens in this module.
+    """
+    os.umask(0o022)
+
+
+def _resolve_git_binary() -> str:
+    """Resolve and validate Git as an absolute, executable path -- never a
+    bare command name resolved through an inherited PATH -- for use only
+    by the Git subcommands that materialize worktree content."""
+    resolved = shutil.which("git")
+    if not resolved or not Path(resolved).is_absolute():
+        raise DeploymentError("Could not resolve an absolute Git binary path")
+    if not os.access(resolved, os.X_OK):
+        raise DeploymentError(f"Resolved Git binary is not executable: {resolved}")
+    return resolved
+
+
+_MATERIALIZING_GIT_SUBCOMMANDS = frozenset({"merge", "restore"})
+
+
 class Runner:
     def run(
         self,
@@ -97,11 +127,22 @@ class Runner:
         check: bool = True,
         input_text: str | None = None,
         timeout: int = 120,
+        deterministic_umask: bool = False,
     ) -> subprocess.CompletedProcess[str]:
         command = list(args)
         if user:
             decision = run_as_service_user_command(command, user)
             command = decision.argv
+            if deterministic_umask and decision.classification != "already_running_as_service_user":
+                raise DeploymentError(
+                    "deterministic_umask requires executing directly as the "
+                    "service user: a runuser wrapper's own PAM session can "
+                    "reset the child's umask after this process's preexec_fn "
+                    "runs, so the guarantee cannot be kept through a root "
+                    "fallback"
+                )
+        if deterministic_umask and os.name != "posix":
+            raise DeploymentError("deterministic_umask requires POSIX")
         result = subprocess.run(
             command,
             cwd=cwd,
@@ -112,6 +153,7 @@ class Runner:
             check=False,
             shell=False,
             timeout=timeout,
+            preexec_fn=_apply_deterministic_umask if deterministic_umask else None,
         )
         if check and result.returncode:
             rendered = shlex.join(command)
@@ -121,6 +163,34 @@ class Runner:
                 f"{redact_output(result.stdout)}"
             )
         return result
+
+
+def run_git_materializing(
+    runner: Runner,
+    argv: list[str],
+    *,
+    cwd: Path,
+    user: str,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    """Run the one class of Git subcommand that creates or replaces
+    worktree content (merge --ff-only, restore) with an explicit,
+    deterministic umask of 0022 -- never inherited from the shell, SSH,
+    PAM, or systemd. Resolves Git to an absolute, validated path rather
+    than a bare command name, keeps argv a list (never shell=True), and
+    keeps Git running as the service user with no root fallback.
+
+    Read-only Git subcommands (rev-parse, status, diff, cat-file,
+    ls-tree, ls-remote) must never be routed through here -- call
+    Runner.run directly for those, matching the existing convention
+    everywhere else in this module.
+    """
+    if len(argv) < 2 or argv[0] != "git" or argv[1] not in _MATERIALIZING_GIT_SUBCOMMANDS:
+        raise DeploymentError(f"Unsafe materializing Git invocation: {argv!r}")
+    command = [_resolve_git_binary(), *argv[1:]]
+    return runner.run(
+        command, cwd=cwd, user=user, check=check, deterministic_umask=True,
+    )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1297,7 +1367,8 @@ def targeted_rollback(
             if in_old or in_index:
                 restorable_paths.append(name)
         if restorable_paths:
-            runner.run(
+            run_git_materializing(
+                runner,
                 [
                     "git", "restore", "--source", context.old_sha,
                     "--staged", "--worktree", "--", *restorable_paths,
@@ -1371,8 +1442,8 @@ def execute_deployment(
             runner, cwd, remote=context.remote, branch=context.branch,
             target_sha=context.target_sha, user=context.service.user,
         )
-        runner.run(
-            ["git", "merge", "--ff-only", context.target_sha],
+        run_git_materializing(
+            runner, ["git", "merge", "--ff-only", context.target_sha],
             cwd=cwd, user=context.service.user,
         )
         head = runner.run(
@@ -1568,7 +1639,9 @@ def bootstrap_module_deployment(
     mutation_started = False
     try:
         mutation_started = True
-        runner.run(["git", "merge", "--ff-only", args.target_sha], cwd=cwd, user=user)
+        run_git_materializing(
+            runner, ["git", "merge", "--ff-only", args.target_sha], cwd=cwd, user=user,
+        )
         head = validate_bootstrap_post_merge(
             runner, context, module_name=module_name
         )
@@ -1884,7 +1957,9 @@ def bootstrap_existing_component_deployment(
     mutation_started = False
     try:
         mutation_started = True
-        runner.run(["git", "merge", "--ff-only", args.target_sha], cwd=cwd, user=user)
+        run_git_materializing(
+            runner, ["git", "merge", "--ff-only", args.target_sha], cwd=cwd, user=user,
+        )
         head = validate_bootstrap_existing_post_merge(
             runner, context, authorized_paths=authorized_paths,
             allowed_warnings=set(getattr(args, "allowed_warning", [])),
