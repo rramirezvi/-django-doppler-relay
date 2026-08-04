@@ -705,6 +705,93 @@ def refresh_deployment_ref(
     return ref
 
 
+def validate_target_ref(value: str) -> str:
+    """Require a fully qualified, non-symbolic, non-remote-tracking,
+    non-wildcard Git ref -- the explicit authority bootstrap-existing-
+    component resolves --target-sha against, deliberately never the tip of
+    the productive branch."""
+    if not value or value in ("HEAD", "FETCH_HEAD") or value.startswith("refs/remotes/"):
+        raise DeploymentError(f"Unsafe target ref: {value!r}")
+    if not re.fullmatch(r"refs/[A-Za-z0-9](?:[A-Za-z0-9._/-]*[A-Za-z0-9])?", value):
+        raise DeploymentError(f"Unsafe target ref: {value!r}")
+    if ".." in value or value.endswith(".lock") or "/.git/" in value:
+        raise DeploymentError(f"Unsafe target ref: {value!r}")
+    return value
+
+
+def verify_remote_target_ref(
+    runner: Runner,
+    cwd: Path,
+    *,
+    remote: str,
+    target_ref: str,
+    target_sha: str,
+    user: str,
+) -> None:
+    """Require target_ref to resolve to exactly one remote object, matching
+    target_sha exactly. Never accepts ancestry, a wildcard match, or more
+    than one line back from ls-remote."""
+    validate_target_ref(target_ref)
+    result = runner.run(
+        ["git", "ls-remote", "--exit-code", remote, target_ref], cwd=cwd, user=user,
+    )
+    lines = [line for line in result.stdout.strip().splitlines() if line.strip()]
+    if len(lines) != 1:
+        raise DeploymentError(f"Target ref is missing or ambiguous on remote: {target_ref}")
+    fields = lines[0].split()
+    if len(fields) != 2 or fields[1] != target_ref:
+        raise DeploymentError(f"Target ref did not resolve to itself exactly: {target_ref}")
+    if fields[0].lower() != target_sha.lower():
+        raise DeploymentError(
+            f"Target ref does not resolve to the approved target SHA: {target_ref}"
+        )
+
+
+def fetch_bootstrap_target_ref(
+    runner: Runner,
+    cwd: Path,
+    *,
+    remote: str,
+    target_ref: str,
+    target_sha: str,
+    user: str,
+) -> str:
+    """Fetch an explicit, hash-pinned deployment target ref into an
+    isolated local ref -- never the productive branch tip -- reverifying
+    the remote object identity both before and after the fetch, so a
+    target-ref move mid-flow is never silently accepted. The productive
+    branch's own remote-tracking ref is never read, written, or used as an
+    implicit fallback here."""
+    validate_token(remote, "Git remote")
+    before = snapshot_git_state(runner, cwd, remote, user)
+    verify_remote_target_ref(
+        runner, cwd, remote=remote, target_ref=target_ref, target_sha=target_sha, user=user,
+    )
+    local_ref = temporary_target_ref(target_sha)
+    runner.run(
+        [
+            "git", "fetch", "--no-tags", "--no-prune", "--no-write-fetch-head",
+            "--refmap=", remote, f"{target_ref}:{local_ref}",
+        ],
+        cwd=cwd, user=user,
+    )
+    resolved = runner.run(
+        ["git", "rev-parse", "--verify", f"{local_ref}^{{commit}}"], cwd=cwd, user=user,
+    ).stdout.strip().lower()
+    if resolved != target_sha.lower():
+        raise DeploymentError("Fetched bootstrap target ref is not the approved target")
+    verify_remote_target_ref(
+        runner, cwd, remote=remote, target_ref=target_ref, target_sha=target_sha, user=user,
+    )
+    after = snapshot_git_state(runner, cwd, remote, user)
+    for field in ("head", "branch", "status", "unstaged_diff", "staged_diff"):
+        if getattr(after, field) != getattr(before, field):
+            raise DeploymentError(
+                "Controlled bootstrap target-ref fetch changed active Git state: " + field
+            )
+    return local_ref
+
+
 def require_deployment_ref(
     runner: Runner,
     cwd: Path,
@@ -947,8 +1034,18 @@ def wait_for_application_ready(
 
 
 def preflight(
-    args: argparse.Namespace, runner: Runner, *, operational_checks: bool = True
+    args: argparse.Namespace,
+    runner: Runner,
+    *,
+    operational_checks: bool = True,
+    target_ref: str | None = None,
 ) -> DeploymentContext:
+    """``target_ref`` is bootstrap-existing-component's explicit, hash-pinned
+    deployment authority (see ``fetch_bootstrap_target_ref``): when given,
+    --target-sha is resolved and fetched against that ref instead of the tip
+    of --branch, and the branch tip is never consulted or used as a
+    fallback. Every other caller passes ``target_ref=None`` and keeps the
+    exact behaviour this function always had."""
     commands = ["systemctl", "getent", "git", "runuser", "sha256sum"]
     if operational_checks:
         commands.extend(["nginx", "openssl", "curl"])
@@ -967,12 +1064,17 @@ def preflight(
         ["git", "branch", "--show-current"], cwd=cwd, user=service.user
     ).stdout.strip()
     head = runner.run(["git", "rev-parse", "HEAD"], cwd=cwd, user=service.user).stdout.strip()
-    old_sha = resolve_commit(runner, cwd, args.old_sha, service.user)
-    target_sha = resolve_commit(runner, cwd, args.target_sha, service.user)
     if branch != args.branch or head != args.old_sha:
         raise DeploymentError(
             f"Git gate failed: branch={branch!r}, head={head!r}"
         )
+    if target_ref is not None:
+        fetch_bootstrap_target_ref(
+            runner, cwd, remote=args.remote, target_ref=target_ref,
+            target_sha=args.target_sha, user=service.user,
+        )
+    old_sha = resolve_commit(runner, cwd, args.old_sha, service.user)
+    target_sha = resolve_commit(runner, cwd, args.target_sha, service.user)
     remotes = git_lines(runner, cwd, "remote", user=service.user)
     if args.remote not in remotes:
         raise DeploymentError("Configured remote does not exist in production repository")
@@ -986,12 +1088,13 @@ def preflight(
     ).stdout.strip()
     if upstream_remote != args.remote or upstream_merge != f"refs/heads/{branch}":
         raise DeploymentError("Approved remote/branch does not match the checked-out upstream")
-    remote_line = runner.run(
-        ["git", "ls-remote", "--exit-code", args.remote, f"refs/heads/{branch}"],
-        cwd=cwd, user=service.user,
-    ).stdout.strip().split()
-    if len(remote_line) != 2 or remote_line[0].lower() != target_sha:
-        raise DeploymentError("Remote target does not match approved target SHA")
+    if target_ref is None:
+        remote_line = runner.run(
+            ["git", "ls-remote", "--exit-code", args.remote, f"refs/heads/{branch}"],
+            cwd=cwd, user=service.user,
+        ).stdout.strip().split()
+        if len(remote_line) != 2 or remote_line[0].lower() != target_sha:
+            raise DeploymentError("Remote target does not match approved target SHA")
     require_fast_forward(runner, cwd, old_sha, target_sha, service.user)
     approved_commits = git_lines(
         runner, cwd, "rev-list", "--reverse", f"{old_sha}..{target_sha}",
@@ -1724,19 +1827,24 @@ def bootstrap_existing_component_deployment(
     never the jobs/V2/ledger/settings/worker check, and never `manage.py
     check` or the permitted test suites. The default keeps full operational
     checks, matching every other bootstrap-existing-component target.
+
+    ``--target-ref`` is the explicit, hash-pinned deployment authority: an
+    immutable remote ref (never the tip of --branch, never refs/remotes/*,
+    never HEAD/FETCH_HEAD, never a wildcard) that must resolve to exactly
+    --target-sha. This lets --branch keep advancing past the evidenced
+    target (for example to carry ahead operational tooling this bootstrap
+    itself depends on) without the branch tip ever being read, trusted, or
+    used as an implicit fallback for what --target-sha is allowed to be.
     """
     _validate_bootstrap_existing_paths(authorized_paths)
+    target_ref = getattr(args, "target_ref", None)
+    if not target_ref:
+        raise DeploymentError("Bootstrap-existing target-ref is required")
     service = discover_service(runner, args.service_unit)
     cwd, user = service.working_directory, service.user
     before = snapshot_git_state(runner, cwd, args.remote, user)
     if before.head != args.old_sha or before.branch != args.branch:
         raise DeploymentError("Bootstrap-existing initial HEAD or branch mismatch")
-    remote_line = runner.run(
-        ["git", "ls-remote", "--exit-code", args.remote, f"refs/heads/{args.branch}"],
-        cwd=cwd, user=user,
-    ).stdout.strip().split()
-    if len(remote_line) != 2 or remote_line[0].lower() != args.target_sha.lower():
-        raise DeploymentError("Bootstrap-existing remote target mismatch")
     assert_git_state_unchanged(runner, cwd, args.remote, user, before)
 
     from ops.deployment_test_profile import TestProfileError, validate_bootstrap_evidence
@@ -1752,12 +1860,10 @@ def bootstrap_existing_component_deployment(
     except TestProfileError as exc:
         raise DeploymentError(str(exc)) from exc
 
-    refresh_deployment_ref(
-        runner, cwd, remote=args.remote, branch=args.branch,
-        target_sha=args.target_sha, user=user,
-    )
     skip_operational_checks = bool(getattr(args, "bootstrap_skip_operational_checks", False))
-    context = preflight(args, runner, operational_checks=not skip_operational_checks)
+    context = preflight(
+        args, runner, operational_checks=not skip_operational_checks, target_ref=target_ref,
+    )
     changed = set(context.changed_files)
     authorized = set(authorized_paths)
     unauthorized = sorted(changed - authorized)
@@ -2015,6 +2121,20 @@ def build_parser() -> argparse.ArgumentParser:
             "before its sudoers rule exists). Never skips Git/evidence/"
             "allowlist gates, the jobs/V2/ledger/settings/worker check, "
             "manage.py check, or the permitted test suites."
+        ),
+    )
+    parser.add_argument(
+        "--target-ref",
+        help=(
+            "Fully qualified remote ref (for example "
+            "refs/heads/td02c-bootstrap-<target-sha>) that "
+            "bootstrap-existing-component must resolve exactly to "
+            "--target-sha, instead of the tip of --branch. Required for "
+            "--bootstrap-existing-component: --branch identifies the local "
+            "productive branch being updated, while --target-ref is the "
+            "immutable authority for what --target-sha is allowed to be. "
+            "Never a branch tip, never refs/remotes/*, never HEAD or "
+            "FETCH_HEAD, never a wildcard."
         ),
     )
     return parser

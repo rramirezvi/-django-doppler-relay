@@ -28,6 +28,7 @@ from ops.deployment_hardening import (
     discover_nginx_target,
     discover_service,
     execute_deployment,
+    fetch_bootstrap_target_ref,
     filesystem_metadata,
     interpreter_from_exec_start,
     parse_environment_files,
@@ -45,7 +46,9 @@ from ops.deployment_hardening import (
     targeted_rollback,
     temporary_target_ref,
     unexpected_warning_codes,
+    validate_target_ref,
     validate_token,
+    verify_remote_target_ref,
     wait_for_application_ready,
     validate_readiness_layers,
     validate_bootstrap_existing_post_merge,
@@ -70,6 +73,32 @@ class BootstrapContractTests(unittest.TestCase):
             bootstrap_module_deployment(
                 Namespace(), Runner(), "../../unversioned"
             )
+
+    def test_parser_exposes_explicit_target_ref(self):
+        args = build_parser().parse_args([
+            "--service-unit", "django.service", "--old-sha", "1" * 40,
+            "--target-sha", "2" * 40, "--remote", "origin",
+            "--branch", "production", "--target-ref",
+            "refs/heads/td02c-bootstrap-" + "2" * 40,
+        ])
+        self.assertEqual(args.target_ref, "refs/heads/td02c-bootstrap-" + "2" * 40)
+
+    def test_parser_target_ref_defaults_to_none(self):
+        args = build_parser().parse_args([
+            "--service-unit", "django.service", "--old-sha", "1" * 40,
+            "--target-sha", "2" * 40, "--remote", "origin", "--branch", "production",
+        ])
+        self.assertIsNone(args.target_ref)
+
+    def test_validate_target_ref_rejects_lock_suffix_and_git_dir_traversal(self):
+        for bad_ref in ("refs/heads/x.lock", "refs/heads/x/.git/config"):
+            with self.subTest(bad_ref=bad_ref):
+                with self.assertRaisesRegex(DeploymentError, "Unsafe target ref"):
+                    validate_target_ref(bad_ref)
+
+    def test_validate_target_ref_accepts_well_formed_ref(self):
+        ref = "refs/heads/td02c-bootstrap-" + "a" * 40
+        self.assertEqual(validate_target_ref(ref), ref)
 
     def test_exact_commit_sequence_rejects_additional_missing_and_wrong_order(self):
         a, b, c = "a" * 40, "b" * 40, "c" * 40
@@ -482,13 +511,29 @@ class BootstrapExistingComponentTests(unittest.TestCase):
         subprocess.run(["git", "commit", "-qm", "target"], cwd=self.repo, check=True)
         self.target = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
 
-        # Clone while "production" still points at target: the bare remote
-        # must have refs/heads/production == target, matching the approved
-        # remote tip a real preflight would see. Only afterwards do we reset
-        # the local checkout back to old_sha, as production actually is.
+        # A later, descendant commit that must never affect target-sha
+        # resolution: mirrors production's real state, where a tooling
+        # commit (this very --target-ref feature) legitimately sits on the
+        # branch ahead of the evidenced target.
+        (self.repo / "ops" / "support_tool.py").write_text("TOOL = 1\n", encoding="utf-8")
+        subprocess.run(["git", "add", "-A", "ops"], cwd=self.repo, check=True)
+        subprocess.run(["git", "commit", "-qm", "support"], cwd=self.repo, check=True)
+        self.support = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        self.target_ref_name = f"refs/heads/td02c-bootstrap-{self.target}"
+
+        # Clone while "production" points at the descendant support commit:
+        # the bare remote's refs/heads/production == support, exactly like
+        # origin/operator-ui-production-test being ahead of the evidenced
+        # target in real life. The dedicated target-ref is pushed
+        # separately, pointing exactly at target, and never moves again.
+        # Only afterwards do we reset the local checkout back to old_sha.
         remote = self.root / "remote.git"
         subprocess.run(["git", "clone", "--bare", "-q", str(self.repo), str(remote)], check=True)
         subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=self.repo, check=True)
+        subprocess.run(
+            ["git", "push", "-q", "origin", f"{self.target}:{self.target_ref_name}"],
+            cwd=self.repo, check=True,
+        )
         subprocess.run(["git", "checkout", "-q", self.old], cwd=self.repo, check=True)
         subprocess.run(["git", "branch", "-f", "production", self.old], cwd=self.repo, check=True)
         subprocess.run(["git", "checkout", "-q", "production"], cwd=self.repo, check=True)
@@ -530,7 +575,7 @@ class BootstrapExistingComponentTests(unittest.TestCase):
             service_unit="django.service", old_sha=self.old, target_sha=self.target,
             remote="origin", branch="production", expected_commit=[self.target],
             bootstrap_evidence=self.evidence_path, worker_unit="worker.service",
-            allowed_warning=[],
+            allowed_warning=[], target_ref=self.target_ref_name,
         )
         values.update(overrides)
         return Namespace(**values)
@@ -568,12 +613,17 @@ class BootstrapExistingComponentTests(unittest.TestCase):
             ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True
         ).strip()
 
-    # 1. componente existente permitido: PASS
+    # 1. componente existente permitido, con la rama principal ya adelantada
+    # a un commit de soporte posterior al target evidenciado: PASS. HEAD
+    # productivo termina exactamente en target, nunca en el commit de
+    # soporte, y su contenido nunca se materializa en el checkout.
     def test_authorized_existing_component_bootstrap_succeeds(self):
         self.write_evidence()
         report = self.run_bootstrap()
         self.assertEqual(report["head"], self.target)
         self.assertEqual(self.head(), self.target)
+        self.assertNotEqual(self.head(), self.support)
+        self.assertFalse((self.repo / "ops" / "support_tool.py").exists())
         self.assertEqual(
             sorted(report["path_classification"]["preexisting_modified"]),
             sorted(self.AUTHORIZED_PATHS),
@@ -587,13 +637,17 @@ class BootstrapExistingComponentTests(unittest.TestCase):
         subprocess.run(["git", "add", "-A", "ops"], cwd=self.repo, check=True)
         subprocess.run(["git", "commit", "--amend", "-qm", "target"], cwd=self.repo, check=True)
         self.target = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
-        subprocess.run(["git", "branch", "-f", "production_target", self.target], cwd=self.repo, check=True)
         subprocess.run(["git", "checkout", "-q", "production"], cwd=self.repo, check=True)
-        remote = self.root / "remote.git"
-        subprocess.run(["git", "push", "-q", "--force", str(remote), f"{self.target}:refs/heads/production"], cwd=self.repo, check=True)
+        new_target_ref = f"refs/heads/td02c-bootstrap-{self.target}"
+        subprocess.run(
+            ["git", "push", "-q", "origin", f"{self.target}:{new_target_ref}"],
+            cwd=self.repo, check=True,
+        )
         self.write_evidence(target_sha=self.target, commit_sequence=[self.target])
         with self.assertRaisesRegex(DeploymentError, "unauthorized paths"):
-            self.run_bootstrap(target_sha=self.target, expected_commit=[self.target])
+            self.run_bootstrap(
+                target_sha=self.target, expected_commit=[self.target], target_ref=new_target_ref,
+            )
 
     # 3. runtime en el rango: FAIL (propagated from the shared preflight())
     def test_runtime_intersection_in_range_is_rejected(self):
@@ -696,6 +750,131 @@ class BootstrapExistingComponentTests(unittest.TestCase):
         source = inspect.getsource(bootstrap_existing_component_deployment)
         self.assertNotIn("validate_predeployment_evidence", source)
         self.assertNotIn("_load_validation_evidence", source)
+
+    # --- --target-ref: explicit, hash-pinned deployment authority,
+    # separate from the productive branch tip -----------------------------
+
+    # 12. target-ref ausente: FAIL
+    def test_target_ref_absent_is_rejected(self):
+        self.write_evidence()
+        with self.assertRaisesRegex(DeploymentError, "target-ref is required"):
+            self.run_bootstrap(target_ref=None)
+
+    # 13. target-ref apunta a un SHA distinto del target (el commit de
+    # soporte, análogo a d990c95 apuntando más allá de f973216): FAIL
+    def test_target_ref_pointing_to_a_different_sha_is_rejected(self):
+        self.write_evidence()
+        wrong_ref = f"refs/heads/td02c-bootstrap-wrong-{self.support}"
+        subprocess.run(
+            ["git", "push", "-q", "origin", f"{self.support}:{wrong_ref}"],
+            cwd=self.repo, check=True,
+        )
+        with self.assertRaisesRegex(
+            DeploymentError, "does not resolve to the approved target SHA"
+        ):
+            self.run_bootstrap(target_ref=wrong_ref)
+
+    # 13b. target-ref apunta a un ancestro distinto del target (old_sha, no
+    # el commit de soporte): FAIL, mismo chequeo de igualdad exacta.
+    def test_target_ref_pointing_to_a_distinct_ancestor_is_rejected(self):
+        self.write_evidence()
+        ancestor_ref = f"refs/heads/td02c-bootstrap-ancestor-{self.old}"
+        subprocess.run(
+            ["git", "push", "-q", "origin", f"{self.old}:{ancestor_ref}"],
+            cwd=self.repo, check=True,
+        )
+        with self.assertRaisesRegex(
+            DeploymentError, "does not resolve to the approved target SHA"
+        ):
+            self.run_bootstrap(target_ref=ancestor_ref)
+
+    # 14. ref simbólica, remota, o de otra forma insegura: FAIL
+    def test_target_ref_symbolic_or_unsafe_is_rejected(self):
+        self.write_evidence()
+        for bad_ref in (
+            "HEAD",
+            "FETCH_HEAD",
+            "production",
+            "refs/remotes/origin/production",
+            "refs/heads/*",
+            "refs/heads/../escape",
+        ):
+            with self.subTest(bad_ref=bad_ref):
+                with self.assertRaisesRegex(DeploymentError, "Unsafe target ref"):
+                    self.run_bootstrap(target_ref=bad_ref)
+
+    # 15. la rama principal nunca es fallback implícito: aunque su tip en
+    # el remoto sea inválido/desactualizado, el bootstrap igual PASA usando
+    # exclusivamente target-ref.
+    def test_branch_tip_is_never_consulted_for_target_sha(self):
+        self.write_evidence()
+        subprocess.run(
+            ["git", "push", "-q", "--force", "origin", f"{self.old}:refs/heads/production"],
+            cwd=self.repo, check=True,
+        )
+        report = self.run_bootstrap()
+        self.assertEqual(report["head"], self.target)
+
+    # 16. target-ref ambigua (ls-remote devuelve más de una línea): FAIL
+    def test_verify_remote_target_ref_rejects_ambiguous_ls_remote_output(self):
+        sha_a, sha_b = "a" * 40, "b" * 40
+
+        class AmbiguousRunner:
+            def run(self, command, *, cwd=None, user=None, check=True, **kwargs):
+                if command[:2] == ["git", "ls-remote"]:
+                    return subprocess.CompletedProcess(
+                        command, 0,
+                        f"{sha_a}\trefs/heads/x\n{sha_b}\trefs/heads/x\n", "",
+                    )
+                raise AssertionError(f"unexpected command: {command}")
+
+        with self.assertRaisesRegex(DeploymentError, "missing or ambiguous"):
+            verify_remote_target_ref(
+                AmbiguousRunner(), self.repo, remote="origin",
+                target_ref="refs/heads/x", target_sha=sha_a, user="app",
+            )
+
+    # 17. target-ref cambia entre la primera verificación y la re-verificación
+    # posterior al fetch: FAIL. Nunca se acepta silenciosamente un ref que
+    # se movió a mitad de camino.
+    def test_target_ref_change_mid_fetch_is_rejected(self):
+        real_runner = self.runner
+        support, target_ref_name = self.support, self.target_ref_name
+        calls = {"ls_remote": 0}
+
+        class FlippingRunner:
+            def run(self, command, *, cwd=None, user=None, check=True, **kwargs):
+                if command[:2] == ["git", "ls-remote"]:
+                    calls["ls_remote"] += 1
+                    if calls["ls_remote"] == 1:
+                        return real_runner.run(command, cwd=cwd, user=user, check=check, **kwargs)
+                    return subprocess.CompletedProcess(
+                        command, 0, f"{support}\t{target_ref_name}\n", "",
+                    )
+                return real_runner.run(command, cwd=cwd, user=user, check=check, **kwargs)
+
+        with self.assertRaisesRegex(
+            DeploymentError, "does not resolve to the approved target SHA"
+        ):
+            fetch_bootstrap_target_ref(
+                FlippingRunner(), self.repo, remote="origin",
+                target_ref=self.target_ref_name, target_sha=self.target, user="app",
+            )
+
+    # 18. target-ref exacta y correcta, resuelta directamente: PASS
+    def test_verify_remote_target_ref_accepts_exact_match(self):
+        verify_remote_target_ref(
+            self.runner, self.repo, remote="origin",
+            target_ref=self.target_ref_name, target_sha=self.target, user="app",
+        )
+
+    # 19. secuencia de commits incorrecta con target-ref por lo demás
+    # válida sigue rechazando: FAIL (ya cubierto en #7c, se repite aquí para
+    # dejar explícita la interacción con target-ref por defecto)
+    def test_wrong_commit_sequence_with_valid_target_ref_is_still_rejected(self):
+        self.write_evidence()
+        with self.assertRaises(DeploymentError):
+            self.run_bootstrap(expected_commit=[self.old, self.target])
 
     # --- --bootstrap-skip-operational-checks: installs the nginx-check
     # mechanism itself, before its sudoers rule can exist -----------------
