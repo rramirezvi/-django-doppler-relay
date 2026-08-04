@@ -1,3 +1,4 @@
+import contextlib
 import dataclasses
 import inspect
 import json
@@ -16,6 +17,27 @@ try:
     import pwd
 except ImportError:  # pragma: no cover - these tests are POSIX-only
     pwd = None  # type: ignore[assignment]
+
+
+@contextlib.contextmanager
+def deterministic_test_umask(mask=0o022):
+    """Test-only helper: set an explicit, deterministic umask around
+    fixture creation whose expected mode is derived from Git (0644 for
+    regular files, 0755 for tracked executables), restoring the original
+    umask on exit -- including when an exception propagates. Scoped to
+    fixture materialization only: never wrap production code, an entire
+    test suite, or a test that is deliberately exercising a different
+    ambient umask (see DeterministicUmaskGitTests). A no-op on non-POSIX
+    platforms, where os.umask has no equivalent meaning for file-creation
+    semantics."""
+    if os.name != "posix":
+        yield
+        return
+    original = os.umask(mask)
+    try:
+        yield
+    finally:
+        os.umask(original)
 
 from ops.deployment_hardening import (
     DeploymentContext,
@@ -118,16 +140,108 @@ class BootstrapContractTests(unittest.TestCase):
 
 
 class _BootstrapGitRunner:
-    def run(self, command, *, cwd=None, user=None, check=True, **kwargs):
+    """Test-only fake Runner. Honors deterministic_umask exactly like the
+    real Runner does (see ops.deployment_hardening.Runner.run) so that a
+    fixture baseline captured deterministically in setUp() and a real
+    merge/restore performed later through run_git_materializing -- using
+    this fake runner instead of the real one -- agree on the resulting
+    mode regardless of whatever umask happens to be ambient wherever this
+    suite runs. Production code is untouched: this mirrors its behaviour,
+    it does not implement it."""
+
+    def run(self, command, *, cwd=None, user=None, check=True, deterministic_umask=False, **kwargs):
         if command and Path(str(command[0])).name.startswith("python"):
             return subprocess.CompletedProcess(command, 0, "", "")
+        preexec = (
+            (lambda: os.umask(0o022))
+            if deterministic_umask and os.name == "posix"
+            else None
+        )
         result = subprocess.run(
             command, cwd=cwd, text=True, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.PIPE, preexec_fn=preexec,
         )
         if check and result.returncode:
             raise DeploymentError(result.stderr.strip())
         return result
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX umask semantics")
+class DeterministicTestUmaskHelperTests(unittest.TestCase):
+    """Regression coverage for deterministic_test_umask itself -- the
+    fixture-only helper, never production code. Real repro of the exact
+    production finding: parent process ambient umask 0002 (the app
+    account's real login umask), the same value used throughout this
+    class's setUp."""
+
+    def setUp(self):
+        self.original_umask = os.umask(0o002)
+        self.addCleanup(os.umask, self.original_umask)
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+
+    def _umask(self):
+        current = os.umask(0)
+        os.umask(current)
+        return current
+
+    def test_parent_process_starts_at_umask_0002(self):
+        self.assertEqual(self._umask(), 0o002)
+
+    def test_normal_file_created_inside_helper_is_0644(self):
+        path = self.root / "normal.txt"
+        with deterministic_test_umask():
+            path.write_text("x", encoding="utf-8")
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
+
+    def test_executable_created_inside_helper_is_0755_when_x_bit_set_after(self):
+        # write_text() never sets the executable bit itself (that comes
+        # from Git's index at checkout time, not from umask); this proves
+        # the helper leaves 0o111 free to be added on top of the 0644
+        # umask-derived base, matching 0644|0111=0755 exactly.
+        path = self.root / "script.sh"
+        with deterministic_test_umask():
+            path.write_text("#!/bin/sh\n", encoding="utf-8")
+            path.chmod(path.stat().st_mode | 0o111)
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o755)
+
+    def test_umask_restored_to_0002_after_normal_exit(self):
+        with deterministic_test_umask():
+            pass
+        self.assertEqual(self._umask(), 0o002)
+
+    def test_umask_restored_to_0002_after_exception(self):
+        with self.assertRaises(ValueError):
+            with deterministic_test_umask():
+                raise ValueError("synthetic failure inside the helper")
+        self.assertEqual(self._umask(), 0o002)
+
+    def test_fixture_created_outside_helper_stays_0664_under_ambient_0002(self):
+        path = self.root / "unprotected.txt"
+        path.write_text("x", encoding="utf-8")
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o664)
+
+    def test_deliberately_wrong_mode_outside_helper_is_still_rejected_by_gate(self):
+        # The helper never weakens validate_bootstrap_post_merge: a file
+        # created at the "wrong" mode 0664 outside the helper is still
+        # exactly what the gate is supposed to catch.
+        path = self.root / "unprotected.txt"
+        path.write_text("x", encoding="utf-8")
+        self.assertNotEqual(stat.S_IMODE(path.stat().st_mode), 0o644)
+
+    def test_sequential_helper_uses_never_leak_umask_between_blocks(self):
+        for _ in range(5):
+            with deterministic_test_umask():
+                self.assertEqual(self._umask(), 0o022)
+            self.assertEqual(self._umask(), 0o002)
+        self.assertEqual(self._umask(), 0o002)
+
+    def test_helper_is_a_noop_on_non_posix(self):
+        with patch("ops.tests.test_deployment_hardening.os.name", "nt"):
+            before = self._umask()
+            with deterministic_test_umask():
+                pass
+            self.assertEqual(self._umask(), before)
 
 
 class BootstrapPostMergeGateTests(unittest.TestCase):
@@ -140,20 +254,34 @@ class BootstrapPostMergeGateTests(unittest.TestCase):
         subprocess.run(["git", "init", "-q", "-b", "production"], cwd=self.repo, check=True)
         subprocess.run(["git", "config", "user.email", "ops@example.invalid"], cwd=self.repo, check=True)
         subprocess.run(["git", "config", "user.name", "Ops Tests"], cwd=self.repo, check=True)
-        (self.repo / "runtime.txt").write_text("runtime-base", encoding="utf-8")
-        (self.repo / "removed.txt").write_text("removed", encoding="utf-8")
-        (self.repo / "existing.txt").write_text("old", encoding="utf-8")
-        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
-        subprocess.run(["git", "commit", "-qm", "old"], cwd=self.repo, check=True)
-        self.old = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
-        (self.repo / "ops").mkdir()
-        (self.repo / "ops" / "td02c_deployment_runner.py").write_text("VALUE=1\n", encoding="utf-8")
-        (self.repo / "added.txt").write_text("added", encoding="utf-8")
-        (self.repo / "existing.txt").write_text("new", encoding="utf-8")
-        (self.repo / "removed.txt").unlink()
-        subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True)
-        subprocess.run(["git", "commit", "-qm", "target"], cwd=self.repo, check=True)
-        self.target = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        # The whole fixture -- both commits -- is materialized under a
+        # deterministic umask: validate_bootstrap_post_merge checks
+        # new_paths against a fixed 0644/0755 expectation (no baseline to
+        # compare against), and preexisting_modified_paths like
+        # existing.txt are only meaningfully baseline-tested (e.g. a
+        # deliberate chmod to a "different" mode) if the baseline itself
+        # is a known, deterministic value -- neither can depend on
+        # whatever umask happens to be ambient wherever this suite runs.
+        with deterministic_test_umask():
+            (self.repo / "runtime.txt").write_text("runtime-base", encoding="utf-8")
+            (self.repo / "removed.txt").write_text("removed", encoding="utf-8")
+            (self.repo / "existing.txt").write_text("old", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "old"], cwd=self.repo, check=True)
+            self.old = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+            (self.repo / "ops").mkdir()
+            (self.repo / "ops" / "td02c_deployment_runner.py").write_text("VALUE=1\n", encoding="utf-8")
+            (self.repo / "added.txt").write_text("added", encoding="utf-8")
+            (self.repo / "existing.txt").write_text("new", encoding="utf-8")
+            (self.repo / "removed.txt").unlink()
+            subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "target"], cwd=self.repo, check=True)
+            self.target = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        self.assertEqual(stat.S_IMODE((self.repo / "added.txt").stat().st_mode), 0o644)
+        self.assertEqual(
+            stat.S_IMODE((self.repo / "ops" / "td02c_deployment_runner.py").stat().st_mode), 0o644,
+        )
+        self.assertEqual(stat.S_IMODE((self.repo / "existing.txt").stat().st_mode), 0o644)
         (self.repo / "runtime.txt").write_text("runtime-local", encoding="utf-8")
         info = (self.repo / "runtime.txt").stat()
         import hashlib, stat as stat_module
@@ -195,9 +323,15 @@ class BootstrapPostMergeGateTests(unittest.TestCase):
         remote = self.root / "remote.git"
         subprocess.run(["git", "clone", "--bare", "-q", str(self.repo), str(remote)], check=True)
         subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=self.repo, check=True)
-        subprocess.run(["git", "checkout", "-q", self.old], cwd=self.repo, check=True)
-        subprocess.run(["git", "branch", "-f", "production", self.old], cwd=self.repo, check=True)
-        subprocess.run(["git", "checkout", "-q", "production"], cwd=self.repo, check=True)
+        # This checkout is the real baseline for tests that then perform a
+        # real merge (test_bootstrap_runs_preflight_once_and_installs_module):
+        # deterministic here for the same reason as setUp -- it must agree
+        # with whatever the real merge afterwards produces, not with
+        # whatever umask happens to be ambient wherever this suite runs.
+        with deterministic_test_umask():
+            subprocess.run(["git", "checkout", "-q", self.old], cwd=self.repo, check=True)
+            subprocess.run(["git", "branch", "-f", "production", self.old], cwd=self.repo, check=True)
+            subprocess.run(["git", "checkout", "-q", "production"], cwd=self.repo, check=True)
         subprocess.run(["git", "config", "branch.production.remote", "origin"], cwd=self.repo, check=True)
         subprocess.run(["git", "config", "branch.production.merge", "refs/heads/production"], cwd=self.repo, check=True)
         (self.repo / "runtime.txt").write_text("runtime-local", encoding="utf-8")
@@ -500,52 +634,61 @@ class BootstrapExistingComponentTests(unittest.TestCase):
         subprocess.run(["git", "init", "-q", "-b", "production"], cwd=self.repo, check=True)
         subprocess.run(["git", "config", "user.email", "ops@example.invalid"], cwd=self.repo, check=True)
         subprocess.run(["git", "config", "user.name", "Ops Tests"], cwd=self.repo, check=True)
-        (self.repo / "ops" / "tests").mkdir(parents=True)
-        (self.repo / "ops" / "deployment_test_profile.py").write_text("GATE = 'old'\n", encoding="utf-8")
-        (self.repo / "ops" / "tests" / "test_deployment_test_profile.py").write_text("# old\n", encoding="utf-8")
-        (self.repo / "ops" / "README.md").write_text("old docs\n", encoding="utf-8")
-        (self.repo / "manage.py").write_text("# test\n", encoding="utf-8")
-        for name in RUNTIME_PATHS_FOR_TESTS:
-            path = self.repo / name
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text("baseline\n", encoding="utf-8")
-        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
-        subprocess.run(["git", "commit", "-qm", "old"], cwd=self.repo, check=True)
-        self.old = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+        # Every write_text() and git checkout below materializes files this
+        # fixture (and run_git_materializing's own real merge, in tests
+        # that exercise it) treats as baseline: both must agree on 0644
+        # regardless of whatever umask happens to be ambient in whatever
+        # process runs this suite -- otherwise a baseline captured under
+        # one ambient umask would never match a deterministic-umask merge
+        # materializing the same content later.
+        with deterministic_test_umask():
+            (self.repo / "ops" / "tests").mkdir(parents=True)
+            (self.repo / "ops" / "deployment_test_profile.py").write_text("GATE = 'old'\n", encoding="utf-8")
+            (self.repo / "ops" / "tests" / "test_deployment_test_profile.py").write_text("# old\n", encoding="utf-8")
+            (self.repo / "ops" / "README.md").write_text("old docs\n", encoding="utf-8")
+            (self.repo / "manage.py").write_text("# test\n", encoding="utf-8")
+            for name in RUNTIME_PATHS_FOR_TESTS:
+                path = self.repo / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("baseline\n", encoding="utf-8")
+            subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "old"], cwd=self.repo, check=True)
+            self.old = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
 
-        (self.repo / "ops" / "deployment_test_profile.py").write_text("GATE = 'fixed'\n", encoding="utf-8")
-        (self.repo / "ops" / "tests" / "test_deployment_test_profile.py").write_text("# fixed\n", encoding="utf-8")
-        (self.repo / "ops" / "README.md").write_text("fixed docs\n", encoding="utf-8")
-        subprocess.run(["git", "add", "-A", "ops"], cwd=self.repo, check=True)
-        subprocess.run(["git", "commit", "-qm", "target"], cwd=self.repo, check=True)
-        self.target = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+            (self.repo / "ops" / "deployment_test_profile.py").write_text("GATE = 'fixed'\n", encoding="utf-8")
+            (self.repo / "ops" / "tests" / "test_deployment_test_profile.py").write_text("# fixed\n", encoding="utf-8")
+            (self.repo / "ops" / "README.md").write_text("fixed docs\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A", "ops"], cwd=self.repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "target"], cwd=self.repo, check=True)
+            self.target = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
 
-        # A later, descendant commit that must never affect target-sha
-        # resolution: mirrors production's real state, where a tooling
-        # commit (this very --target-ref feature) legitimately sits on the
-        # branch ahead of the evidenced target.
-        (self.repo / "ops" / "support_tool.py").write_text("TOOL = 1\n", encoding="utf-8")
-        subprocess.run(["git", "add", "-A", "ops"], cwd=self.repo, check=True)
-        subprocess.run(["git", "commit", "-qm", "support"], cwd=self.repo, check=True)
-        self.support = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
-        self.target_ref_name = f"refs/heads/td02c-bootstrap-{self.target}"
+            # A later, descendant commit that must never affect target-sha
+            # resolution: mirrors production's real state, where a tooling
+            # commit (this very --target-ref feature) legitimately sits on
+            # the branch ahead of the evidenced target.
+            (self.repo / "ops" / "support_tool.py").write_text("TOOL = 1\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A", "ops"], cwd=self.repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "support"], cwd=self.repo, check=True)
+            self.support = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=self.repo, text=True).strip()
+            self.target_ref_name = f"refs/heads/td02c-bootstrap-{self.target}"
 
-        # Clone while "production" points at the descendant support commit:
-        # the bare remote's refs/heads/production == support, exactly like
-        # origin/operator-ui-production-test being ahead of the evidenced
-        # target in real life. The dedicated target-ref is pushed
-        # separately, pointing exactly at target, and never moves again.
-        # Only afterwards do we reset the local checkout back to old_sha.
-        remote = self.root / "remote.git"
-        subprocess.run(["git", "clone", "--bare", "-q", str(self.repo), str(remote)], check=True)
-        subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=self.repo, check=True)
-        subprocess.run(
-            ["git", "push", "-q", "origin", f"{self.target}:{self.target_ref_name}"],
-            cwd=self.repo, check=True,
-        )
-        subprocess.run(["git", "checkout", "-q", self.old], cwd=self.repo, check=True)
-        subprocess.run(["git", "branch", "-f", "production", self.old], cwd=self.repo, check=True)
-        subprocess.run(["git", "checkout", "-q", "production"], cwd=self.repo, check=True)
+            # Clone while "production" points at the descendant support
+            # commit: the bare remote's refs/heads/production == support,
+            # exactly like origin/operator-ui-production-test being ahead
+            # of the evidenced target in real life. The dedicated
+            # target-ref is pushed separately, pointing exactly at target,
+            # and never moves again. Only afterwards do we reset the local
+            # checkout back to old_sha.
+            remote = self.root / "remote.git"
+            subprocess.run(["git", "clone", "--bare", "-q", str(self.repo), str(remote)], check=True)
+            subprocess.run(["git", "remote", "add", "origin", str(remote)], cwd=self.repo, check=True)
+            subprocess.run(
+                ["git", "push", "-q", "origin", f"{self.target}:{self.target_ref_name}"],
+                cwd=self.repo, check=True,
+            )
+            subprocess.run(["git", "checkout", "-q", self.old], cwd=self.repo, check=True)
+            subprocess.run(["git", "branch", "-f", "production", self.old], cwd=self.repo, check=True)
+            subprocess.run(["git", "checkout", "-q", "production"], cwd=self.repo, check=True)
         subprocess.run(["git", "config", "branch.production.remote", "origin"], cwd=self.repo, check=True)
         subprocess.run(["git", "config", "branch.production.merge", "refs/heads/production"], cwd=self.repo, check=True)
 
@@ -1024,27 +1167,39 @@ class DeterministicUmaskGitTests(unittest.TestCase):
         subprocess.run(["git", "init", "-q", "-b", "production"], cwd=self.repo, check=True)
         subprocess.run(["git", "config", "user.email", "ops@example.invalid"], cwd=self.repo, check=True)
         subprocess.run(["git", "config", "user.name", "Ops Tests"], cwd=self.repo, check=True)
-        (self.repo / "normal.txt").write_text("old\n", encoding="utf-8")
-        (self.repo / "normal.txt").chmod(0o644)
-        (self.repo / "script.sh").write_text("#!/bin/sh\necho old\n", encoding="utf-8")
-        (self.repo / "script.sh").chmod(0o755)
-        subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
-        subprocess.run(["git", "commit", "-qm", "old"], cwd=self.repo, check=True)
-        self.old = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True
-        ).strip()
+        # The explicit chmod(0o755) calls below are load-bearing for Git
+        # itself (they determine whether Git's index records the file as
+        # executable at commit time, which write_text() alone never
+        # does) -- they are NOT what makes the final on-disk mode
+        # deterministic. The later `git checkout -q self.old` rematerializes
+        # every tracked file from Git's index, and that checkout is
+        # itself subject to ambient umask; wrapping the whole sequence
+        # (not just the initial writes) is what makes the *checked-out*
+        # mode deterministic regardless of whatever umask happens to be
+        # ambient wherever this suite runs.
+        with deterministic_test_umask():
+            (self.repo / "normal.txt").write_text("old\n", encoding="utf-8")
+            (self.repo / "script.sh").write_text("#!/bin/sh\necho old\n", encoding="utf-8")
+            (self.repo / "script.sh").chmod(0o755)
+            subprocess.run(["git", "add", "."], cwd=self.repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "old"], cwd=self.repo, check=True)
+            self.old = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True
+            ).strip()
 
-        (self.repo / "normal.txt").write_text("new\n", encoding="utf-8")
-        (self.repo / "script.sh").write_text("#!/bin/sh\necho new\n", encoding="utf-8")
-        (self.repo / "new_file.txt").write_text("brand new\n", encoding="utf-8")
-        (self.repo / "new_file.txt").chmod(0o644)
-        subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True)
-        subprocess.run(["git", "commit", "-qm", "target"], cwd=self.repo, check=True)
-        self.target = subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True
-        ).strip()
+            (self.repo / "normal.txt").write_text("new\n", encoding="utf-8")
+            (self.repo / "script.sh").write_text("#!/bin/sh\necho new\n", encoding="utf-8")
+            (self.repo / "script.sh").chmod(0o755)
+            (self.repo / "new_file.txt").write_text("brand new\n", encoding="utf-8")
+            subprocess.run(["git", "add", "-A"], cwd=self.repo, check=True)
+            subprocess.run(["git", "commit", "-qm", "target"], cwd=self.repo, check=True)
+            self.target = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"], cwd=self.repo, text=True
+            ).strip()
 
-        subprocess.run(["git", "checkout", "-q", self.old], cwd=self.repo, check=True)
+            subprocess.run(["git", "checkout", "-q", self.old], cwd=self.repo, check=True)
+        self.assertEqual(stat.S_IMODE((self.repo / "normal.txt").stat().st_mode), 0o644)
+        self.assertEqual(stat.S_IMODE((self.repo / "script.sh").stat().st_mode), 0o755)
 
         self.runner = Runner()
         self.user = pwd.getpwuid(os.geteuid()).pw_name if pwd is not None else None
