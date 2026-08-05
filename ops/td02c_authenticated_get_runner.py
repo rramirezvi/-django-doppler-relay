@@ -72,6 +72,34 @@ def validate_module_entrypoint(service_unit: str) -> None:
         raise RunnerFailure("effective_user_mismatch")
 
 
+def resolve_authorized_user(user_id: int, username: str, *, lookup, can_operate_bulk_sends):
+    """Pure, injectable authorization check, extracted from DjangoState so it
+    is unit-testable with plain Python fakes.
+
+    ops/tests/*.py must import cleanly under bare `python -m unittest
+    discover` (no DJANGO_SETTINGS_MODULE, no configured apps) -- that is
+    exactly how the production bootstrap gate runs the permitted suite.
+    A module-level Django ORM import anywhere in this test file breaks
+    that for every test in it, not just the ones exercising it, so the
+    validation logic itself must not require Django to be importable to
+    be tested.
+
+    ``lookup(user_id, username)`` must return the matching user object or
+    None (never raise) if no user has exactly that id and username.
+    ``can_operate_bulk_sends`` is the real permission check from
+    relay.services.operator_permissions; it alone decides which
+    permission(s) satisfy the gate, never reimplemented here.
+    """
+    if not username or not username.strip():
+        raise RunnerFailure("authorized_user_invalid")
+    user = lookup(user_id, username)
+    if user is None:
+        raise RunnerFailure("authorized_user_invalid")
+    if not user.is_active or not user.is_staff or not can_operate_bulk_sends(user):
+        raise RunnerFailure("authorized_user_invalid")
+    return user
+
+
 @dataclass(frozen=True)
 class Baseline:
     total_sessions: int
@@ -145,14 +173,16 @@ class DjangoState:
         self.EmailMessage = EmailMessage
         self.user_id = user_id
         User = get_user_model()
-        if not username or not username.strip():
-            raise RunnerFailure("authorized_user_invalid")
-        try:
-            self.user = User.objects.get(pk=user_id, username=username)
-        except User.DoesNotExist:
-            raise RunnerFailure("authorized_user_invalid") from None
-        if not self.user.is_active or not self.user.is_staff or not can_operate_bulk_sends(self.user):
-            raise RunnerFailure("authorized_user_invalid")
+
+        def _lookup(uid, uname):
+            try:
+                return User.objects.get(pk=uid, username=uname)
+            except User.DoesNotExist:
+                return None
+
+        self.user = resolve_authorized_user(
+            user_id, username, lookup=_lookup, can_operate_bulk_sends=can_operate_bulk_sends
+        )
 
     def user_session_keys(self) -> frozenset[str]:
         keys = set()

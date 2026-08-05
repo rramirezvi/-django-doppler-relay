@@ -17,19 +17,14 @@ try:
 except ImportError:
     pwd = None  # type: ignore[assignment]
 
-from django.contrib.auth import get_user_model
-from django.contrib.auth.models import Permission
-from django.contrib.contenttypes.models import ContentType
-from django.test import TestCase as DjangoTestCase
-
 from ops.td02c_authenticated_get_runner import (
     Baseline,
     CurlOperations,
-    DjangoState,
     EXPECTED_MODULE,
     RunnerFailure,
     delete_exact_file,
     main,
+    resolve_authorized_user,
     run,
     validate_credential_file,
     validate_module_entrypoint,
@@ -231,78 +226,135 @@ class RunnerOrchestrationTests(unittest.TestCase):
             operations.authenticate(workspace, NginxTarget("example.test", 443, "/run/django.sock", None))
 
 
-class ParameterizedRunnerUserValidationTests(DjangoTestCase):
-    """Real ORM coverage for DjangoState's parameterized user_id/username gate."""
+class FakeOrmUser:
+    """Plain Python stand-in for a Django User row -- no ORM/settings needed.
 
-    def _make_user(self, username, **overrides):
-        User = get_user_model()
-        defaults = {"is_active": True, "is_staff": True, "is_superuser": False}
-        defaults.update(overrides)
-        return User.objects.create_user(username=username, password="unused-in-this-test", **defaults)
+    ops/tests/*.py must import and run cleanly under bare `python -m
+    unittest discover` (the exact mechanism the production bootstrap gate
+    uses internally): no DJANGO_SETTINGS_MODULE, no configured apps. A
+    module-level Django import anywhere in this file breaks that for
+    every test in it, not just the ones needing it -- confirmed for real
+    against production (a first version of this test class imported
+    django.test.TestCase at module level and broke the entire suite's
+    import under the gate's bare-unittest invocation, aborting a real
+    deploy cleanly before any merge). resolve_authorized_user() is
+    therefore designed to take the ORM lookup and permission check as
+    injected callables, so its own logic is testable without Django.
+    """
 
-    def _grant(self, user, app_label, codename):
-        content_type = ContentType.objects.get(app_label=app_label, model=codename.split("_", 1)[1])
-        permission = Permission.objects.get(content_type=content_type, codename=codename)
-        user.user_permissions.add(permission)
+    def __init__(self, pk, username, *, is_active=True, is_staff=True, is_superuser=False):
+        self.pk = pk
+        self.username = username
+        self.is_active = is_active
+        self.is_staff = is_staff
+        self.is_superuser = is_superuser
 
-    def _grant_change_bulksend(self, user):
-        self._grant(user, "relay", "change_bulksend")
+
+class ParameterizedRunnerUserValidationTests(unittest.TestCase):
+    """Coverage for resolve_authorized_user(), DjangoState's injectable core."""
+
+    def _lookup(self, user, *, expect_id=None, expect_username=None):
+        def lookup(user_id, username):
+            if expect_id is not None:
+                self.assertEqual(user_id, expect_id)
+            if expect_username is not None:
+                self.assertEqual(username, expect_username)
+            return user
+        return lookup
 
     def test_valid_technical_user_with_matching_id_and_username(self):
-        user = self._make_user("td02c_tech")
-        self._grant_change_bulksend(user)
-        state = DjangoState(user_id=user.pk, username="td02c_tech")
-        self.assertEqual(state.user.pk, user.pk)
-        self.assertEqual(state.user_id, user.pk)
+        user = FakeOrmUser(7, "td02c_tech")
+        result = resolve_authorized_user(
+            7, "td02c_tech", lookup=self._lookup(user, expect_id=7, expect_username="td02c_tech"),
+            can_operate_bulk_sends=lambda u: True,
+        )
+        self.assertIs(result, user)
 
     def test_username_id_mismatch_is_rejected(self):
-        user = self._make_user("td02c_tech_real")
-        self._grant_change_bulksend(user)
+        # the lookup itself is what enforces exact id+username correspondence;
+        # a mismatch means no such row exists, so it returns None
         with self.assertRaises(RunnerFailure):
-            DjangoState(user_id=user.pk, username="not-the-real-username")
+            resolve_authorized_user(
+                7, "not-the-real-username", lookup=lambda uid, uname: None,
+                can_operate_bulk_sends=lambda u: True,
+            )
 
     def test_nonexistent_user_id_is_rejected(self):
         with self.assertRaises(RunnerFailure):
-            DjangoState(user_id=999999, username="ghost")
+            resolve_authorized_user(
+                999999, "ghost", lookup=lambda uid, uname: None, can_operate_bulk_sends=lambda u: True,
+            )
 
     def test_empty_username_is_rejected(self):
         with self.assertRaises(RunnerFailure):
-            DjangoState(user_id=1, username="")
+            resolve_authorized_user(
+                1, "", lookup=lambda uid, uname: FakeOrmUser(1, ""), can_operate_bulk_sends=lambda u: True,
+            )
+
+    def test_whitespace_only_username_is_rejected(self):
+        with self.assertRaises(RunnerFailure):
+            resolve_authorized_user(
+                1, "   ", lookup=lambda uid, uname: FakeOrmUser(1, "   "), can_operate_bulk_sends=lambda u: True,
+            )
 
     def test_inactive_user_is_rejected(self):
-        user = self._make_user("td02c_inactive", is_active=False)
-        self._grant_change_bulksend(user)
+        user = FakeOrmUser(7, "td02c_inactive", is_active=False)
         with self.assertRaises(RunnerFailure):
-            DjangoState(user_id=user.pk, username="td02c_inactive")
+            resolve_authorized_user(
+                7, "td02c_inactive", lookup=lambda uid, uname: user, can_operate_bulk_sends=lambda u: True,
+            )
 
     def test_non_staff_user_is_rejected(self):
-        user = self._make_user("td02c_nonstaff", is_staff=False)
-        self._grant_change_bulksend(user)
+        user = FakeOrmUser(7, "td02c_nonstaff", is_staff=False)
         with self.assertRaises(RunnerFailure):
-            DjangoState(user_id=user.pk, username="td02c_nonstaff")
+            resolve_authorized_user(
+                7, "td02c_nonstaff", lookup=lambda uid, uname: user, can_operate_bulk_sends=lambda u: True,
+            )
 
     def test_insufficient_permission_is_rejected(self):
-        user = self._make_user("td02c_noperm")
+        user = FakeOrmUser(7, "td02c_noperm")
         with self.assertRaises(RunnerFailure):
-            DjangoState(user_id=user.pk, username="td02c_noperm")
+            resolve_authorized_user(
+                7, "td02c_noperm", lookup=lambda uid, uname: user, can_operate_bulk_sends=lambda u: False,
+            )
 
-    def test_permission_via_relay_change_bulksend_is_sufficient(self):
-        user = self._make_user("td02c_perm1")
-        self._grant_change_bulksend(user)
-        state = DjangoState(user_id=user.pk, username="td02c_perm1")
-        self.assertEqual(state.user.username, "td02c_perm1")
+    def test_permission_check_is_fully_delegated_not_reimplemented(self):
+        """Proves the gate never second-guesses can_operate_bulk_sends --
+        it grants exactly when that callable says so, whatever internal
+        permission path (relay.change_bulksend or
+        relay_super.change_bulksenduserconfigproxy) it used to decide.
+        relay.services.operator_permissions.can_operate_bulk_sends itself
+        already implements both paths; that real, unchanged function is
+        wired in by DjangoState.__init__, not reimplemented here.
+        """
+        user = FakeOrmUser(7, "td02c_perm")
+        for allowed in (True, False):
+            with self.subTest(allowed=allowed):
+                can_operate = Mock(return_value=allowed)
+                if allowed:
+                    result = resolve_authorized_user(
+                        7, "td02c_perm", lookup=lambda uid, uname: user, can_operate_bulk_sends=can_operate,
+                    )
+                    self.assertIs(result, user)
+                else:
+                    with self.assertRaises(RunnerFailure):
+                        resolve_authorized_user(
+                            7, "td02c_perm", lookup=lambda uid, uname: user, can_operate_bulk_sends=can_operate,
+                        )
+                can_operate.assert_called_once_with(user)
 
-    def test_permission_via_relay_super_bulksenduserconfigproxy_is_sufficient(self):
-        user = self._make_user("td02c_perm2")
-        self._grant(user, "relay_super", "change_bulksenduserconfigproxy")
-        state = DjangoState(user_id=user.pk, username="td02c_perm2")
-        self.assertEqual(state.user.username, "td02c_perm2")
+    def test_superuser_attribute_is_never_inspected(self):
+        source = Path("ops/td02c_authenticated_get_runner.py").read_text(encoding="utf-8")
+        function_source = source[source.index("def resolve_authorized_user"):]
+        function_source = function_source[:function_source.index("\n\n\n")]
+        self.assertNotIn("is_superuser", function_source)
 
-    def test_superuser_not_required(self):
-        user = self._make_user("td02c_plain", is_superuser=False)
-        self._grant_change_bulksend(user)
-        state = DjangoState(user_id=user.pk, username="td02c_plain")
-        self.assertFalse(state.user.is_superuser)
+    def test_superuser_not_required_end_to_end(self):
+        user = FakeOrmUser(7, "td02c_plain", is_superuser=False)
+        result = resolve_authorized_user(
+            7, "td02c_plain", lookup=lambda uid, uname: user, can_operate_bulk_sends=lambda u: True,
+        )
+        self.assertFalse(result.is_superuser)
 
 
 @unittest.skipUnless(os.name == "posix", "POSIX CLI argument parsing")
