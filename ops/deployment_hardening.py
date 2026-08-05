@@ -543,19 +543,106 @@ def run_nginx_config_test(runner: Runner, service: ServiceMetadata) -> str:
     return classification
 
 
+NGINX_DISCOVERY_SCHEMA = "td02c.nginx-discovery/v1"
+NGINX_DISCOVERY_INSTALLED_PATH = "/usr/local/libexec/td02c-nginx-discovery"
+NGINX_DISCOVERY_SUDO_BINARY = "/usr/bin/sudo"
+
+_NGINX_DISCOVERY_BASE_FIELDS = frozenset({"schema", "phase", "classification", "result", "exit_code"})
+_NGINX_DISCOVERY_SUCCESS_FIELDS = _NGINX_DISCOVERY_BASE_FIELDS | frozenset({
+    "server_name", "port", "proxy_or_socket_target",
+    "certificate_path", "certificate_key_path_present", "nginx_test_passed",
+})
+_NGINX_DISCOVERY_FAILURE_FIELDS = _NGINX_DISCOVERY_BASE_FIELDS | frozenset({"detail"})
+
+# Defense in depth: even though the helper is designed to never emit
+# these, the caller independently scans its raw output before trusting
+# anything parsed from it.
+_NGINX_DISCOVERY_SENSITIVE_OUTPUT_PATTERN = re.compile(
+    r"BEGIN (RSA |EC )?PRIVATE KEY|BEGIN CERTIFICATE|ssl_certificate_key|"
+    r"\bAuthorization\s*:|\bCookie\s*:|\bSet-Cookie\s*:",
+    re.IGNORECASE,
+)
+_NGINX_DISCOVERY_NOT_ALLOWED_PATTERN = re.compile(
+    r"is not allowed to (run|execute)|sorry,? user", re.IGNORECASE
+)
+_NGINX_DISCOVERY_NO_PASSWORD_PATTERN = re.compile(
+    r"a password is required|no tty present|sudoers? entry", re.IGNORECASE
+)
+_NGINX_DISCOVERY_HELPER_MISSING_PATTERN = re.compile(
+    r"no such file|command not found", re.IGNORECASE
+)
+
+
+def run_nginx_discovery(runner: Runner, service: ServiceMetadata) -> NginxTarget:
+    """Run the privileged, output-sanitizing Nginx discovery helper --
+    never raw `nginx -T` as the unprivileged service user, and no
+    fallback to a reduced-privilege attempt. `-T` needs the same
+    certificate-read access as `-t`, so there is no unprivileged path
+    worth trying first; this goes straight through the closed sudoers
+    rule that authorizes exactly the helper's fixed installed path with
+    zero arguments. The helper's raw output is scanned for sensitive
+    content before anything parsed from it is trusted, its schema is
+    validated against an exact allowed field set (never merely a
+    superset check), and its own classification must be exactly
+    "nginx_discovery_privileged_passed" -- any other value, or any
+    inability to parse or validate the output, fails closed.
+    """
+    result = runner.run(
+        [NGINX_DISCOVERY_SUDO_BINARY, "-n", NGINX_DISCOVERY_INSTALLED_PATH],
+        cwd=service.working_directory, user=service.user, check=False,
+    )
+    output = result.stdout.strip()
+
+    if _NGINX_DISCOVERY_SENSITIVE_OUTPUT_PATTERN.search(output):
+        raise DeploymentError(
+            "nginx_discovery_sensitive_output_detected: "
+            "discovery helper output contained unexpected sensitive content"
+        )
+
+    payload: object = None
+    if output:
+        try:
+            payload = json.loads(output.splitlines()[-1])
+        except ValueError:
+            payload = None
+
+    if not isinstance(payload, dict):
+        if _NGINX_DISCOVERY_NOT_ALLOWED_PATTERN.search(output):
+            raise DeploymentError("nginx_discovery_command_rejected: sudo refused the discovery helper")
+        if _NGINX_DISCOVERY_HELPER_MISSING_PATTERN.search(output):
+            raise DeploymentError("nginx_discovery_helper_missing: discovery helper is not installed")
+        if _NGINX_DISCOVERY_NO_PASSWORD_PATTERN.search(output):
+            raise DeploymentError("nginx_discovery_sudoers_missing: discovery sudoers rule is not installed")
+        raise DeploymentError("nginx_discovery_invalid_json: discovery helper did not return valid JSON")
+
+    if payload.get("schema") != NGINX_DISCOVERY_SCHEMA:
+        raise DeploymentError("nginx_discovery_schema_mismatch: unexpected schema version")
+
+    classification = payload.get("classification")
+    success = classification == "nginx_discovery_privileged_passed"
+    allowed_keys = _NGINX_DISCOVERY_SUCCESS_FIELDS if success else _NGINX_DISCOVERY_FAILURE_FIELDS
+    if set(payload) - allowed_keys:
+        raise DeploymentError("nginx_discovery_schema_mismatch: unexpected fields in discovery output")
+
+    if not success or result.returncode:
+        raise DeploymentError(f"{classification or 'nginx_discovery_unexpected_error'}: nginx discovery failed")
+
+    required = _NGINX_DISCOVERY_SUCCESS_FIELDS - {"detail"}
+    if not required.issubset(payload):
+        raise DeploymentError("nginx_discovery_schema_mismatch: missing required fields")
+
+    certificate_path = payload.get("certificate_path")
+    return NginxTarget(
+        server_name=payload["server_name"],
+        port=int(payload["port"]),
+        upstream=payload["proxy_or_socket_target"],
+        certificate=Path(certificate_path) if certificate_path else None,
+    )
+
+
 def discover_and_validate_nginx(runner: Runner, service: ServiceMetadata) -> NginxTarget:
     run_nginx_config_test(runner, service)
-    nginx_config = runner.run(["nginx", "-T"]).stdout
-    bind_path = application_bind_from_exec_start(service.exec_start_raw)
-    target = discover_nginx_target(nginx_config, bind_path)
-    if target.certificate:
-        runner.run(
-            [
-                "openssl", "x509", "-in", str(target.certificate), "-noout",
-                "-checkhost", target.server_name,
-            ]
-        )
-    return target
+    return run_nginx_discovery(runner, service)
 
 
 def warning_codes(output: str) -> set[str]:

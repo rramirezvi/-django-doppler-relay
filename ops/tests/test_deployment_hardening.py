@@ -69,6 +69,7 @@ from ops.deployment_hardening import (
     run_as_service_user_command,
     run_git_materializing,
     run_nginx_config_test,
+    run_nginx_discovery,
     resolve_commit,
     ServiceUserCommand,
     safe_repo_path,
@@ -1573,6 +1574,133 @@ class NginxDiscoveryTests(unittest.TestCase):
         """
         with self.assertRaisesRegex(DeploymentError, "candidates: none"):
             discover_nginx_target(config, "/run/app.sock")
+
+
+class NginxDiscoveryCallerTests(unittest.TestCase):
+    """Coverage for run_nginx_discovery: the caller-side validation of
+    the privileged discovery helper's sanitized JSON output. Never
+    invokes real subprocesses -- a fake runner returns crafted stdout,
+    exactly mirroring how the real helper (or a rejecting sudo) would
+    respond."""
+
+    def setUp(self):
+        self.service = ServiceMetadata(
+            unit="django.service", working_directory=Path("/tmp"),
+            exec_start_path=Path("/bin/true"), exec_start_raw="/bin/true",
+            python=Path("/usr/bin/python3"), user="app", group="app",
+            main_pid=1, fragment_path=Path("/tmp/django.service"),
+            environment_files=(),
+        )
+
+    def _runner_returning(self, stdout, returncode=0):
+        class FakeRunner:
+            def run(inner, command, *, cwd=None, user=None, check=True, **kwargs):
+                return subprocess.CompletedProcess(command, returncode, stdout, "")
+        return FakeRunner()
+
+    def _success_payload(self, **overrides):
+        payload = {
+            "schema": "td02c.nginx-discovery/v1", "phase": "nginx_discovery",
+            "classification": "nginx_discovery_privileged_passed", "result": "PASS",
+            "exit_code": 0, "server_name": "app1.example.com", "port": 443,
+            "proxy_or_socket_target": "/run/app.sock",
+            "certificate_path": "/etc/letsencrypt/live/app1.example.com/fullchain.pem",
+            "certificate_key_path_present": True, "nginx_test_passed": True,
+        }
+        payload.update(overrides)
+        return payload
+
+    # 1. helper valido -> NginxTarget correcto
+    def test_success_returns_nginx_target(self):
+        runner = self._runner_returning(json.dumps(self._success_payload()), 0)
+        target = run_nginx_discovery(runner, self.service)
+        self.assertEqual(target.server_name, "app1.example.com")
+        self.assertEqual(target.port, 443)
+        self.assertEqual(target.upstream, "/run/app.sock")
+        self.assertEqual(
+            str(target.certificate), "/etc/letsencrypt/live/app1.example.com/fullchain.pem",
+        )
+
+    def test_certificate_absent_yields_none(self):
+        payload = self._success_payload(certificate_path=None, certificate_key_path_present=False)
+        runner = self._runner_returning(json.dumps(payload), 0)
+        target = run_nginx_discovery(runner, self.service)
+        self.assertIsNone(target.certificate)
+
+    # 2. JSON con campo extra: FAIL
+    def test_extra_field_is_rejected(self):
+        payload = self._success_payload(unexpected_field="x")
+        runner = self._runner_returning(json.dumps(payload), 0)
+        with self.assertRaisesRegex(DeploymentError, "nginx_discovery_schema_mismatch"):
+            run_nginx_discovery(runner, self.service)
+
+    def test_missing_required_field_is_rejected(self):
+        payload = self._success_payload()
+        del payload["server_name"]
+        runner = self._runner_returning(json.dumps(payload), 0)
+        with self.assertRaisesRegex(DeploymentError, "nginx_discovery_schema_mismatch"):
+            run_nginx_discovery(runner, self.service)
+
+    def test_wrong_schema_version_is_rejected(self):
+        payload = self._success_payload(schema="td02c.nginx-discovery/v2")
+        runner = self._runner_returning(json.dumps(payload), 0)
+        with self.assertRaisesRegex(DeploymentError, "nginx_discovery_schema_mismatch"):
+            run_nginx_discovery(runner, self.service)
+
+    # 3. salida no JSON: FAIL
+    def test_non_json_output_is_rejected(self):
+        runner = self._runner_returning("not json at all", 1)
+        with self.assertRaisesRegex(DeploymentError, "nginx_discovery_invalid_json"):
+            run_nginx_discovery(runner, self.service)
+
+    def test_sudo_no_password_is_classified_sudoers_missing(self):
+        runner = self._runner_returning("sudo: a password is required", 1)
+        with self.assertRaisesRegex(DeploymentError, "nginx_discovery_sudoers_missing"):
+            run_nginx_discovery(runner, self.service)
+
+    def test_sudo_not_allowed_is_classified_command_rejected(self):
+        runner = self._runner_returning(
+            "Sorry, user app is not allowed to execute "
+            "'/usr/local/libexec/td02c-nginx-discovery' as root.", 1,
+        )
+        with self.assertRaisesRegex(DeploymentError, "nginx_discovery_command_rejected"):
+            run_nginx_discovery(runner, self.service)
+
+    def test_helper_missing_is_classified(self):
+        runner = self._runner_returning(
+            "sudo: /usr/local/libexec/td02c-nginx-discovery: command not found", 1,
+        )
+        with self.assertRaisesRegex(DeploymentError, "nginx_discovery_helper_missing"):
+            run_nginx_discovery(runner, self.service)
+
+    # cero secretos: contenido sensible detectado antes de confiar en nada
+    def test_sensitive_output_detected_before_json_parsing(self):
+        runner = self._runner_returning(
+            "-----BEGIN PRIVATE KEY-----\nMIIExyz\n-----END PRIVATE KEY-----", 1,
+        )
+        with self.assertRaisesRegex(DeploymentError, "nginx_discovery_sensitive_output_detected"):
+            run_nginx_discovery(runner, self.service)
+
+    def test_helper_failure_classification_propagates(self):
+        payload = {
+            "schema": "td02c.nginx-discovery/v1", "phase": "nginx_discovery",
+            "classification": "nginx_discovery_no_vhost", "result": "FAIL", "exit_code": 1,
+        }
+        runner = self._runner_returning(json.dumps(payload), 1)
+        with self.assertRaisesRegex(DeploymentError, "nginx_discovery_no_vhost"):
+            run_nginx_discovery(runner, self.service)
+
+    # defensa en profundidad: un cuerpo "passed" no basta si el exit code
+    # del subproceso subyacente lo contradice
+    def test_success_classification_but_nonzero_exit_is_rejected(self):
+        runner = self._runner_returning(json.dumps(self._success_payload()), 1)
+        with self.assertRaisesRegex(DeploymentError, "nginx_discovery_privileged_passed"):
+            run_nginx_discovery(runner, self.service)
+
+    def test_never_calls_raw_nginx_dash_T(self):
+        source = inspect.getsource(discover_and_validate_nginx)
+        self.assertNotIn('"-T"', source)
+        self.assertNotIn("nginx_config = runner.run", source)
 
 
 class WarningParsingTests(unittest.TestCase):
