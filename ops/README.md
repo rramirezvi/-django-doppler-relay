@@ -531,7 +531,9 @@ cuenta. Su única invocación permitida es equivalente a:
 cd /opt/app/django-doppler-relay
 .venv/bin/python -m ops.td02c_authenticated_get_runner \
   --service-unit django.service \
-  --credential-file /ruta/temporal/externa/credential
+  --credential-file /ruta/temporal/externa/credential \
+  --user-id <id> \
+  --username <username>
 ```
 
 La ejecución directa `python ops/td02c_authenticated_get_runner.py` no está
@@ -556,8 +558,15 @@ permite ejecución como otro usuario.
 
 El archivo contiene solo la contraseña técnica, debe ser absoluto, externo al
 checkout, no symlink, propiedad del usuario operativo y modo `0600`. El runner
-lo elimina verificando device/inode. El usuario está fijado por contrato a
-`user_id=1`, `username=ricardo`. Tras validar actividad, staff y permisos, el
+lo elimina verificando device/inode. `--user-id` y `--username` son
+obligatorios (sin default silencioso); el runner exige que ambos identifiquen
+exactamente al mismo usuario real (`user_id` inexistente, `username` vacío o
+un desajuste entre ambos son rechazados fail-closed), que esté activo y
+`is_staff`, y que tenga al menos uno de `relay.change_bulksend` o
+`relay_super.change_bulksenduserconfigproxy` -- `is_superuser` nunca es
+obligatorio. El username usado en el POST de login siempre proviene del
+usuario ya validado por ORM, nunca del contenido del archivo credencial (que
+sigue conteniendo únicamente la contraseña, nunca JSON). Tras validar actividad, staff y permisos, el
 runner toma baselines de conteos, ejecuta `GET /admin/login/`, el único POST
 permitido `POST /admin/login/`, y `GET /app/`. Identifica la nueva sesión por la
 cookie obtenida y la diferencia frente al baseline, elimina solamente esa clave

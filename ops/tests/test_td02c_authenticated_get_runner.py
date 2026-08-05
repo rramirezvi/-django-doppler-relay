@@ -17,12 +17,19 @@ try:
 except ImportError:
     pwd = None  # type: ignore[assignment]
 
+from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Permission
+from django.contrib.contenttypes.models import ContentType
+from django.test import TestCase as DjangoTestCase
+
 from ops.td02c_authenticated_get_runner import (
     Baseline,
     CurlOperations,
+    DjangoState,
     EXPECTED_MODULE,
     RunnerFailure,
     delete_exact_file,
+    main,
     run,
     validate_credential_file,
     validate_module_entrypoint,
@@ -119,7 +126,10 @@ class RunnerOrchestrationTests(unittest.TestCase):
         self.credential.write_text("private-value", encoding="utf-8")
         self.credential.chmod(0o600)
         self.user = pwd.getpwuid(os.geteuid()).pw_name
-        self.args = SimpleNamespace(service_unit="django.service", credential_file=self.credential)
+        self.args = SimpleNamespace(
+            service_unit="django.service", credential_file=self.credential,
+            user_id=7, username="operador_td02c",
+        )
         self.service = SimpleNamespace(working_directory=self.repo, user=self.user)
 
     def execute(self, gate_side_effect=None, operations=None):
@@ -221,6 +231,108 @@ class RunnerOrchestrationTests(unittest.TestCase):
             operations.authenticate(workspace, NginxTarget("example.test", 443, "/run/django.sock", None))
 
 
+class ParameterizedRunnerUserValidationTests(DjangoTestCase):
+    """Real ORM coverage for DjangoState's parameterized user_id/username gate."""
+
+    def _make_user(self, username, **overrides):
+        User = get_user_model()
+        defaults = {"is_active": True, "is_staff": True, "is_superuser": False}
+        defaults.update(overrides)
+        return User.objects.create_user(username=username, password="unused-in-this-test", **defaults)
+
+    def _grant(self, user, app_label, codename):
+        content_type = ContentType.objects.get(app_label=app_label, model=codename.split("_", 1)[1])
+        permission = Permission.objects.get(content_type=content_type, codename=codename)
+        user.user_permissions.add(permission)
+
+    def _grant_change_bulksend(self, user):
+        self._grant(user, "relay", "change_bulksend")
+
+    def test_valid_technical_user_with_matching_id_and_username(self):
+        user = self._make_user("td02c_tech")
+        self._grant_change_bulksend(user)
+        state = DjangoState(user_id=user.pk, username="td02c_tech")
+        self.assertEqual(state.user.pk, user.pk)
+        self.assertEqual(state.user_id, user.pk)
+
+    def test_username_id_mismatch_is_rejected(self):
+        user = self._make_user("td02c_tech_real")
+        self._grant_change_bulksend(user)
+        with self.assertRaises(RunnerFailure):
+            DjangoState(user_id=user.pk, username="not-the-real-username")
+
+    def test_nonexistent_user_id_is_rejected(self):
+        with self.assertRaises(RunnerFailure):
+            DjangoState(user_id=999999, username="ghost")
+
+    def test_empty_username_is_rejected(self):
+        with self.assertRaises(RunnerFailure):
+            DjangoState(user_id=1, username="")
+
+    def test_inactive_user_is_rejected(self):
+        user = self._make_user("td02c_inactive", is_active=False)
+        self._grant_change_bulksend(user)
+        with self.assertRaises(RunnerFailure):
+            DjangoState(user_id=user.pk, username="td02c_inactive")
+
+    def test_non_staff_user_is_rejected(self):
+        user = self._make_user("td02c_nonstaff", is_staff=False)
+        self._grant_change_bulksend(user)
+        with self.assertRaises(RunnerFailure):
+            DjangoState(user_id=user.pk, username="td02c_nonstaff")
+
+    def test_insufficient_permission_is_rejected(self):
+        user = self._make_user("td02c_noperm")
+        with self.assertRaises(RunnerFailure):
+            DjangoState(user_id=user.pk, username="td02c_noperm")
+
+    def test_permission_via_relay_change_bulksend_is_sufficient(self):
+        user = self._make_user("td02c_perm1")
+        self._grant_change_bulksend(user)
+        state = DjangoState(user_id=user.pk, username="td02c_perm1")
+        self.assertEqual(state.user.username, "td02c_perm1")
+
+    def test_permission_via_relay_super_bulksenduserconfigproxy_is_sufficient(self):
+        user = self._make_user("td02c_perm2")
+        self._grant(user, "relay_super", "change_bulksenduserconfigproxy")
+        state = DjangoState(user_id=user.pk, username="td02c_perm2")
+        self.assertEqual(state.user.username, "td02c_perm2")
+
+    def test_superuser_not_required(self):
+        user = self._make_user("td02c_plain", is_superuser=False)
+        self._grant_change_bulksend(user)
+        state = DjangoState(user_id=user.pk, username="td02c_plain")
+        self.assertFalse(state.user.is_superuser)
+
+
+@unittest.skipUnless(os.name == "posix", "POSIX CLI argument parsing")
+class ParameterizedRunnerCliTests(unittest.TestCase):
+    def test_missing_user_id_argument_exits(self):
+        with self.assertRaises(SystemExit):
+            main(["--credential-file", "/tmp/x", "--username", "someone"])
+
+    def test_missing_username_argument_exits(self):
+        with self.assertRaises(SystemExit):
+            main(["--credential-file", "/tmp/x", "--user-id", "7"])
+
+    def test_non_numeric_user_id_argument_exits(self):
+        with self.assertRaises(SystemExit):
+            main(["--credential-file", "/tmp/x", "--user-id", "not-a-number", "--username", "someone"])
+
+    def test_username_is_never_sourced_from_credential_file(self):
+        source = Path("ops/td02c_authenticated_get_runner.py").read_text(encoding="utf-8")
+        self.assertIn('username={self.state.user.username}', source)
+        self.assertNotIn("credential_file.read_text", source)
+        self.assertNotIn("json.loads(self.credential_file", source)
+        self.assertNotIn("json.loads(credential", source)
+
+    def test_no_hardcoded_user_identity_remains(self):
+        source = Path("ops/td02c_authenticated_get_runner.py").read_text(encoding="utf-8")
+        self.assertNotIn("EXPECTED_USER_ID", source)
+        self.assertNotIn("EXPECTED_USERNAME", source)
+        self.assertNotIn('"ricardo"', source)
+
+
 @unittest.skipUnless(os.name == "posix", "POSIX module entrypoint")
 class ModuleEntrypointTests(unittest.TestCase):
     def setUp(self):
@@ -297,7 +409,9 @@ class ModuleEntrypointTests(unittest.TestCase):
             patch("ops.td02c_authenticated_get_runner.run") as runner,
             patch.object(module.sys, "stdout", stream),
         ):
-            self.assertEqual(module.main(["--credential-file", "not-read"]), 1)
+            self.assertEqual(
+                module.main(["--credential-file", "not-read", "--user-id", "1", "--username", "someone"]), 1
+            )
         runner.assert_not_called()
         diagnostic = stream.getvalue()
         self.assertIn('"substage": "entrypoint_validated"', diagnostic)
@@ -318,7 +432,9 @@ class ModuleEntrypointTests(unittest.TestCase):
             patch("ops.td02c_http_client.tempfile.mkdtemp") as workspace,
             patch.object(module.sys, "stdout", stream),
         ):
-            self.assertEqual(module.main(["--credential-file", "not-read"]), 1)
+            self.assertEqual(
+                module.main(["--credential-file", "not-read", "--user-id", "1", "--username", "someone"]), 1
+            )
         runner.assert_not_called()
         workspace.assert_not_called()
         diagnostic = stream.getvalue()

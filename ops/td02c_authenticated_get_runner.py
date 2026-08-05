@@ -39,8 +39,6 @@ from ops.td02c_http_client import (
     sanitize_location,
 )
 
-EXPECTED_USER_ID = 1
-EXPECTED_USERNAME = "ricardo"
 EXPECTED_MODULE = "ops.td02c_authenticated_get_runner"
 
 
@@ -130,7 +128,7 @@ def delete_exact_file(path: Path, identity: tuple[int, int, int]) -> None:
 
 
 class DjangoState:
-    def __init__(self) -> None:
+    def __init__(self, *, user_id: int, username: str) -> None:
         os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
         import django
 
@@ -145,14 +143,21 @@ class DjangoState:
         self.BulkSend = BulkSend
         self.BulkSendRecipient = BulkSendRecipient
         self.EmailMessage = EmailMessage
-        self.user = get_user_model().objects.get(pk=EXPECTED_USER_ID, username=EXPECTED_USERNAME)
+        self.user_id = user_id
+        User = get_user_model()
+        if not username or not username.strip():
+            raise RunnerFailure("authorized_user_invalid")
+        try:
+            self.user = User.objects.get(pk=user_id, username=username)
+        except User.DoesNotExist:
+            raise RunnerFailure("authorized_user_invalid") from None
         if not self.user.is_active or not self.user.is_staff or not can_operate_bulk_sends(self.user):
             raise RunnerFailure("authorized_user_invalid")
 
     def user_session_keys(self) -> frozenset[str]:
         keys = set()
         for session in self.Session.objects.all().iterator():
-            if str(session.get_decoded().get("_auth_user_id", "")) == str(EXPECTED_USER_ID):
+            if str(session.get_decoded().get("_auth_user_id", "")) == str(self.user_id):
                 keys.add(session.session_key)
         return frozenset(keys)
 
@@ -168,7 +173,7 @@ class DjangoState:
         if new_keys != {key}:
             raise RunnerFailure("session_identification_ambiguous")
         session = self.Session.objects.filter(session_key=key).first()
-        if session is None or str(session.get_decoded().get("_auth_user_id", "")) != str(EXPECTED_USER_ID):
+        if session is None or str(session.get_decoded().get("_auth_user_id", "")) != str(self.user_id):
             raise RunnerFailure("session_identification_failed")
 
     def delete_session(self, key: str) -> None:
@@ -537,7 +542,7 @@ class CurlOperations:
         origin = f"https://{target.server_name}"
         config.write_text("\n".join([
             'request = "POST"', f'header = "Origin: {origin}"', f'header = "Referer: {origin}/admin/login/"',
-            f'header = "X-CSRFToken: {csrf}"', f'data-urlencode = "username={EXPECTED_USERNAME}"',
+            f'header = "X-CSRFToken: {csrf}"', f'data-urlencode = "username={self.state.user.username}"',
             f'data-urlencode = "password@{password}"', 'data-urlencode = "next=/app/"'
         ]) + "\n", encoding="utf-8"); os.chmod(config, 0o600)
         response = self._curl(workspace, target, method="POST", path="/admin/login/", config=config)
@@ -576,7 +581,8 @@ def run(args: argparse.Namespace, stream: TextIO = sys.stdout) -> int:
             emit(log, "credential_file_validated", "FAIL", started, "credential_file_unsafe")
             raise
         emit(log, "credential_file_validated", "PASS", started)
-        state = DjangoState(); baseline = state.baseline(); emit_counts(stream, "baseline_before", baseline)
+        state = DjangoState(user_id=args.user_id, username=args.username)
+        baseline = state.baseline(); emit_counts(stream, "baseline_before", baseline)
         operations = CurlOperations(service_unit=args.service_unit, credential_file=credential, state=state, baseline=baseline, log=log)
         run_authenticated_get_gate(operations, log)
     except (
@@ -615,6 +621,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--service-unit", default="django.service")
     parser.add_argument("--credential-file", required=True, type=Path)
+    parser.add_argument("--user-id", required=True, type=int)
+    parser.add_argument("--username", required=True, type=str)
     args = parser.parse_args(argv)
     log = SafeDiagnosticLog(sys.stdout)
     started = time.monotonic()
