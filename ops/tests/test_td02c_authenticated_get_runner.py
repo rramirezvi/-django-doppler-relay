@@ -494,21 +494,6 @@ class ModuleEntrypointTests(unittest.TestCase):
         self.assertNotIn("not-read", diagnostic)
 
 
-def nginx_config(*server_names: str, socket: str = "/run/django.sock", certificate: str | None = None) -> str:
-    cert_line = f"ssl_certificate {certificate};" if certificate else ""
-    return "\n".join(
-        f"""
-        server {{
-            listen 443 ssl;
-            server_name {server_name};
-            {cert_line}
-            location / {{ proxy_pass http://unix:{socket}; }}
-        }}
-        """
-        for server_name in server_names
-    )
-
-
 EXEC_START_RAW = "{ path=/opt/app/.venv/bin/gunicorn ; argv[]=/opt/app/.venv/bin/gunicorn --bind unix:/run/django.sock ; }"
 
 
@@ -518,6 +503,13 @@ def completed(returncode: int = 0, stdout: str = "", stderr: str = "") -> Simple
 
 @unittest.skipUnless(os.name == "posix", "POSIX discovery diagnostics")
 class NginxDiscoveryDiagnosticsTests(unittest.TestCase):
+    """Coverage for CurlOperations' nginx discovery, now fully delegated to
+    ops.deployment_hardening.discover_and_validate_nginx() -- the same
+    privileged, already-deployed mechanism the normal preflight path uses.
+    This runner must never invoke nginx -t/-T (or openssl against the
+    root-only certificate) directly; see test_no_direct_nginx_invocation_remains.
+    """
+
     def setUp(self):
         self.log_stream = io.StringIO()
         from ops.td02c_http_client import SafeDiagnosticLog
@@ -531,6 +523,7 @@ class NginxDiscoveryDiagnosticsTests(unittest.TestCase):
             exec_start_raw=EXEC_START_RAW,
             working_directory=Path(self.temp.name),
         )
+        self.target = NginxTarget("canary.example.com", 443, "/run/django.sock", None)
 
     def operations(self, service=None) -> CurlOperations:
         instance = CurlOperations.__new__(CurlOperations)
@@ -553,33 +546,40 @@ class NginxDiscoveryDiagnosticsTests(unittest.TestCase):
         self.assertTrue(failures, "expected at least one FAIL substage")
         return failures[-1]
 
-    def dispatch(self, handlers):
-        """Return a subprocess.run side_effect keyed by the command's first two tokens."""
-        defaults = {("systemctl", "is-active"): completed(0, "active\n", "")}
-
+    def systemctl_dispatch(self, *, active=True):
         def side_effect(argv, **kwargs):
-            key = tuple(argv[:2])
-            if key in handlers:
-                result = handlers[key]
-                if isinstance(result, BaseException):
-                    raise result
-                return result
-            return defaults.get(key, completed(0, "", ""))
-
+            if tuple(argv[:2]) == ("systemctl", "is-active"):
+                return completed(0 if active else 3, "active\n" if active else "inactive\n", "")
+            raise AssertionError(f"unexpected direct subprocess call from runner: {argv}")
         return side_effect
 
-    def run_discovery(self, handlers, *, service=None):
+    def run_discovery(self, *, nginx_result=None, service=None, systemctl_active=True):
+        """nginx_result: a BaseException to make discover_and_validate_nginx
+        raise, an NginxTarget to make it succeed, or None to leave it
+        unpatched (for tests that never reach that call)."""
         operations = self.operations(service)
-        patcher = patch(
-            "ops.td02c_authenticated_get_runner.subprocess.run", side_effect=self.dispatch(handlers)
-        )
-        patcher.start()
-        self.addCleanup(patcher.stop)
+        patchers = [
+            patch(
+                "ops.td02c_authenticated_get_runner.subprocess.run",
+                side_effect=self.systemctl_dispatch(active=systemctl_active),
+            )
+        ]
+        if isinstance(nginx_result, BaseException):
+            patchers.append(
+                patch("ops.td02c_authenticated_get_runner.discover_and_validate_nginx", side_effect=nginx_result)
+            )
+        elif nginx_result is not None:
+            patchers.append(
+                patch("ops.td02c_authenticated_get_runner.discover_and_validate_nginx", return_value=nginx_result)
+            )
+        for patcher in patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
         return operations, operations.discover_target
 
     # 1. systemctl falla ----------------------------------------------------
     def test_systemctl_not_active_is_classified(self):
-        _, call = self.run_discovery({("systemctl", "is-active"): completed(3, "inactive\n", "")})
+        _, call = self.run_discovery(systemctl_active=False)
         with self.assertRaises(AuthenticatedGetFailure) as caught:
             call()
         self.assertEqual(caught.exception.error_class, "systemctl_failed")
@@ -588,7 +588,7 @@ class NginxDiscoveryDiagnosticsTests(unittest.TestCase):
     # 2. metadata del servicio inválida --------------------------------------
     def test_invalid_service_metadata_is_classified(self):
         service = SimpleNamespace(unit="", user="app", exec_start_raw=EXEC_START_RAW, working_directory=Path("/opt/app"))
-        _, call = self.run_discovery({}, service=service)
+        _, call = self.run_discovery(service=service)
         with self.assertRaises(AuthenticatedGetFailure) as caught:
             call()
         self.assertEqual(caught.exception.error_class, "service_metadata_invalid")
@@ -599,213 +599,191 @@ class NginxDiscoveryDiagnosticsTests(unittest.TestCase):
             unit="django.service", user="app", exec_start_raw=EXEC_START_RAW,
             working_directory=Path("/does/not/exist/at/all"),
         )
-        _, call = self.run_discovery(
-            {("systemctl", "is-active"): completed(0, "active\n", "")}, service=service
-        )
+        _, call = self.run_discovery(service=service)
         with self.assertRaises(AuthenticatedGetFailure) as caught:
             call()
         self.assertEqual(caught.exception.error_class, "working_directory_invalid")
 
-    # 4. nginx -t falla -------------------------------------------------------
-    def test_nginx_test_failure_is_classified(self):
-        _, call = self.run_discovery({
-            ("systemctl", "is-active"): completed(0, "active\n", ""),
-            ("nginx", "-t"): completed(1, "", "nginx: [emerg] invalid directive\n"),
-        })
+    def _assert_nginx_failure(self, deployment_error_message, expected_classification, expected_stage):
+        _, call = self.run_discovery(nginx_result=DeploymentError(deployment_error_message))
         with self.assertRaises(AuthenticatedGetFailure) as caught:
             call()
-        self.assertEqual(caught.exception.error_class, "nginx_test_failed")
-        self.assertEqual(self.last_failure()["stage"], "nginx_config_tested")
+        self.assertEqual(caught.exception.error_class, expected_classification)
+        self.assertEqual(self.last_failure()["stage"], expected_stage)
 
-    # 5. nginx -T falla ---------------------------------------------------
-    def test_nginx_dump_failure_is_classified(self):
-        _, call = self.run_discovery({
-            ("systemctl", "is-active"): completed(0, "active\n", ""),
-            ("nginx", "-t"): completed(0, "", ""),
-            ("nginx", "-T"): completed(1, "", "nginx: configuration file test failed\n"),
-        })
-        with self.assertRaises(AuthenticatedGetFailure) as caught:
-            call()
-        self.assertEqual(caught.exception.error_class, "nginx_dump_failed")
+    # 4. nginx -t privilegiado (helper de config-check) rechazado ------------
+    def test_nginx_check_permission_denied_is_classified(self):
+        self._assert_nginx_failure(
+            "nginx_check_permission_denied: nginx configuration check failed",
+            "command_permission_denied", "nginx_config_tested",
+        )
 
-    # 6. nginx -T devuelve salida vacia ---------------------------------------
-    def test_nginx_empty_output_is_classified(self):
-        _, call = self.run_discovery({
-            ("systemctl", "is-active"): completed(0, "active\n", ""),
-            ("nginx", "-t"): completed(0, "", ""),
-            ("nginx", "-T"): completed(0, "   \n", ""),
-        })
-        with self.assertRaises(AuthenticatedGetFailure) as caught:
-            call()
-        self.assertEqual(caught.exception.error_class, "nginx_output_empty")
+    def test_nginx_check_sudoers_missing_is_classified(self):
+        self._assert_nginx_failure(
+            "nginx_check_sudoers_missing: nginx configuration check failed",
+            "command_permission_denied", "nginx_config_tested",
+        )
 
-    # 7. salida malformada (parsing exception) -------------------------------
-    def test_unparseable_output_is_classified(self):
-        _, call = self.run_discovery({
-            ("systemctl", "is-active"): completed(0, "active\n", ""),
-            ("nginx", "-t"): completed(0, "", ""),
-            ("nginx", "-T"): completed(0, "server { listen 443 ssl;", ""),
-        })
-        with patch(
-            "ops.td02c_authenticated_get_runner._parse_vhost_candidates",
-            side_effect=ValueError("boom"),
-        ):
-            with self.assertRaises(AuthenticatedGetFailure) as caught:
-                call()
-        self.assertEqual(caught.exception.error_class, "nginx_output_unparseable")
+    def test_nginx_check_config_invalid_is_classified(self):
+        self._assert_nginx_failure(
+            "nginx_check_config_invalid: nginx configuration check failed",
+            "nginx_test_failed", "nginx_config_tested",
+        )
 
-    # 8. cero vhosts ----------------------------------------------------------
-    def test_zero_vhosts_is_classified(self):
-        config = nginx_config()  # no server blocks at all
-        _, call = self.run_discovery({
-            ("systemctl", "is-active"): completed(0, "active\n", ""),
-            ("nginx", "-t"): completed(0, "", ""),
-            ("nginx", "-T"): completed(0, config or "http {}\n", ""),
-        })
-        with self.assertRaises(AuthenticatedGetFailure) as caught:
-            call()
-        self.assertEqual(caught.exception.error_class, "no_vhost_found")
+    # 5. helper de discovery privilegiado ausente o rechazado ----------------
+    def test_nginx_discovery_helper_missing_is_classified(self):
+        self._assert_nginx_failure(
+            "nginx_discovery_helper_missing: discovery helper is not installed",
+            "command_not_found", "nginx_config_dumped",
+        )
 
-    # 9. multiples vhosts -------------------------------------------------
+    def test_nginx_discovery_sudoers_missing_is_classified(self):
+        self._assert_nginx_failure(
+            "nginx_discovery_sudoers_missing: discovery sudoers rule is not installed",
+            "command_permission_denied", "nginx_config_dumped",
+        )
+
+    def test_nginx_discovery_command_rejected_is_classified(self):
+        self._assert_nginx_failure(
+            "nginx_discovery_command_rejected: sudo refused the discovery helper",
+            "command_permission_denied", "nginx_config_dumped",
+        )
+
+    # 6. JSON/schema invalidos del helper -------------------------------------
+    def test_nginx_discovery_invalid_json_is_classified(self):
+        self._assert_nginx_failure(
+            "nginx_discovery_invalid_json: discovery helper did not return valid JSON",
+            "nginx_dump_failed", "nginx_config_dumped",
+        )
+
+    def test_nginx_discovery_schema_mismatch_is_classified(self):
+        self._assert_nginx_failure(
+            "nginx_discovery_schema_mismatch: unexpected schema version",
+            "nginx_dump_failed", "nginx_config_dumped",
+        )
+
+    def test_nginx_discovery_sensitive_output_detected_is_classified(self):
+        self._assert_nginx_failure(
+            "nginx_discovery_sensitive_output_detected: discovery helper output contained unexpected sensitive content",
+            "nginx_dump_failed", "nginx_config_dumped",
+        )
+
+    def test_nginx_discovery_config_test_failed_is_classified(self):
+        self._assert_nginx_failure(
+            "nginx_discovery_config_test_failed: nginx discovery failed",
+            "nginx_test_failed", "nginx_config_dumped",
+        )
+
+    # 8/9/10/11. cero/wildcard/variable/multiples vhosts ----------------------
+    def test_no_vhost_is_classified(self):
+        self._assert_nginx_failure(
+            "nginx_discovery_no_vhost: nginx discovery failed",
+            "no_vhost_found", "vhost_candidates_parsed",
+        )
+
+    def test_hostname_rejected_is_classified(self):
+        self._assert_nginx_failure(
+            "nginx_discovery_hostname_rejected: nginx discovery failed",
+            "no_vhost_found", "vhost_candidates_parsed",
+        )
+
     def test_multiple_vhosts_is_classified(self):
-        config = nginx_config("one.example.com", "two.example.com")
-        _, call = self.run_discovery({
-            ("systemctl", "is-active"): completed(0, "active\n", ""),
-            ("nginx", "-t"): completed(0, "", ""),
-            ("nginx", "-T"): completed(0, config, ""),
-        })
-        with self.assertRaises(AuthenticatedGetFailure) as caught:
-            call()
-        self.assertEqual(caught.exception.error_class, "multiple_vhosts_found")
-        self.assertIn("one.example.com", self.last_failure().get("detail", ""))
-
-    # 10. wildcard ----------------------------------------------------------
-    def test_wildcard_vhost_is_rejected(self):
-        config = nginx_config("*.example.com")
-        _, call = self.run_discovery({
-            ("systemctl", "is-active"): completed(0, "active\n", ""),
-            ("nginx", "-t"): completed(0, "", ""),
-            ("nginx", "-T"): completed(0, config, ""),
-        })
-        with self.assertRaises(AuthenticatedGetFailure) as caught:
-            call()
-        self.assertEqual(caught.exception.error_class, "wildcard_vhost_rejected")
-
-    # 11. variable de nginx ---------------------------------------------------
-    def test_variable_vhost_is_rejected(self):
-        config = nginx_config("$host")
-        _, call = self.run_discovery({
-            ("systemctl", "is-active"): completed(0, "active\n", ""),
-            ("nginx", "-t"): completed(0, "", ""),
-            ("nginx", "-T"): completed(0, config, ""),
-        })
-        with self.assertRaises(AuthenticatedGetFailure) as caught:
-            call()
-        self.assertEqual(caught.exception.error_class, "variable_vhost_rejected")
-
-    # 12. certificado ausente -------------------------------------------------
-    def test_missing_certificate_file_is_classified(self):
-        config = nginx_config("canary.example.com", certificate="/does/not/exist.pem")
-        _, call = self.run_discovery({
-            ("systemctl", "is-active"): completed(0, "active\n", ""),
-            ("nginx", "-t"): completed(0, "", ""),
-            ("nginx", "-T"): completed(0, config, ""),
-        })
-        with self.assertRaises(AuthenticatedGetFailure) as caught:
-            call()
-        self.assertEqual(caught.exception.error_class, "certificate_not_found")
+        self._assert_nginx_failure(
+            "nginx_discovery_multiple_vhosts: nginx discovery failed",
+            "multiple_vhosts_found", "unique_vhost_selected",
+        )
 
     # 13. certificado no corresponde al hostname ------------------------------
-    def test_certificate_hostname_mismatch_is_classified(self):
-        with tempfile.NamedTemporaryFile(suffix=".pem", delete=False) as handle:
-            handle.write(b"not-a-real-cert")
-            cert_path = handle.name
-        self.addCleanup(lambda: os.unlink(cert_path))
-        config = nginx_config("canary.example.com", certificate=cert_path)
-        _, call = self.run_discovery({
-            ("systemctl", "is-active"): completed(0, "active\n", ""),
-            ("nginx", "-t"): completed(0, "", ""),
-            ("nginx", "-T"): completed(0, config, ""),
-            ("openssl", "x509"): completed(1, "", "certificate does not cover host\n"),
-        })
-        with self.assertRaises(AuthenticatedGetFailure) as caught:
-            call()
-        self.assertEqual(caught.exception.error_class, "certificate_hostname_mismatch")
+    def test_certificate_mismatch_is_classified(self):
+        self._assert_nginx_failure(
+            "nginx_discovery_certificate_mismatch: nginx discovery failed",
+            "certificate_hostname_mismatch", "certificate_hostname_validated",
+        )
+
+    # socket/upstream inexistente ---------------------------------------------
+    def test_socket_missing_is_classified(self):
+        self._assert_nginx_failure(
+            "nginx_discovery_socket_missing: nginx discovery failed",
+            "local_resolution_invalid", "local_resolution_prepared",
+        )
+
+    def test_nginx_discovery_unexpected_error_is_classified(self):
+        self._assert_nginx_failure(
+            "nginx_discovery_unexpected_error: nginx discovery failed",
+            "unexpected_discovery_error", "nginx_config_dumped",
+        )
+
+    # clasificacion desconocida: falla cerrado, nunca se ignora ---------------
+    def test_unknown_classification_fails_closed_onto_default(self):
+        self._assert_nginx_failure(
+            "nginx_discovery_totally_new_future_code: something new and unmapped",
+            "unexpected_discovery_error", "nginx_config_dumped",
+        )
 
     # 14. resolucion local invalida -------------------------------------------
     def test_local_resolution_invalid_is_classified(self):
         bad_target = NginxTarget("canary.example.com", 8443, "relative/socket", None)
-        config = nginx_config("canary.example.com", certificate=None)
-        _, call = self.run_discovery({
-            ("systemctl", "is-active"): completed(0, "active\n", ""),
-            ("nginx", "-t"): completed(0, "", ""),
-            ("nginx", "-T"): completed(0, config, ""),
-        })
-        with patch("ops.td02c_authenticated_get_runner.discover_nginx_target", return_value=bad_target):
-            with self.assertRaises(AuthenticatedGetFailure) as caught:
-                call()
+        _, call = self.run_discovery(nginx_result=bad_target)
+        with self.assertRaises(AuthenticatedGetFailure) as caught:
+            call()
         self.assertEqual(caught.exception.error_class, "local_resolution_invalid")
 
-    # 15. permiso denegado ----------------------------------------------------
-    def test_permission_denied_is_classified(self):
-        for command in (("systemctl", "is-active"), ("nginx", "-t")):
-            with self.subTest(command=command):
-                self.log_stream.truncate(0); self.log_stream.seek(0)
-                _, call = self.run_discovery({command: PermissionError("denied")})
-                with self.assertRaises(AuthenticatedGetFailure) as caught:
-                    call()
-                self.assertEqual(caught.exception.error_class, "command_permission_denied")
-
-    def test_nginx_permission_denied_stderr_is_classified(self):
-        _, call = self.run_discovery({
-            ("systemctl", "is-active"): completed(0, "active\n", ""),
-            ("nginx", "-t"): completed(1, "", "nginx: [emerg] open() failed (13: Permission denied)\n"),
-        })
-        with self.assertRaises(AuthenticatedGetFailure) as caught:
-            call()
+    # 15. permiso denegado a nivel de systemctl (unico comando directo restante)
+    def test_systemctl_permission_denied_is_classified(self):
+        operations = self.operations()
+        with patch("ops.td02c_authenticated_get_runner.subprocess.run", side_effect=PermissionError("denied")):
+            with self.assertRaises(AuthenticatedGetFailure) as caught:
+                operations.discover_target()
         self.assertEqual(caught.exception.error_class, "command_permission_denied")
 
-    # 16. comando inexistente --------------------------------------------------
-    def test_command_not_found_is_classified(self):
-        _, call = self.run_discovery({
-            ("systemctl", "is-active"): completed(0, "active\n", ""),
-            ("nginx", "-t"): FileNotFoundError("no such file"),
-        })
-        with self.assertRaises(AuthenticatedGetFailure) as caught:
-            call()
+    # 16. comando inexistente (systemctl) --------------------------------------
+    def test_systemctl_not_found_is_classified(self):
+        operations = self.operations()
+        with patch("ops.td02c_authenticated_get_runner.subprocess.run", side_effect=FileNotFoundError("no such file")):
+            with self.assertRaises(AuthenticatedGetFailure) as caught:
+                operations.discover_target()
         self.assertEqual(caught.exception.error_class, "command_not_found")
 
-    # 17. excepcion inesperada --------------------------------------------------
-    def test_unexpected_exception_is_classified(self):
+    # 17. excepcion inesperada durante el discovery privilegiado ---------------
+    def test_unexpected_exception_during_nginx_discovery_is_classified(self):
+        _, call = self.run_discovery(nginx_result=MemoryError("unexpected"))
+        with self.assertRaises(AuthenticatedGetFailure) as caught:
+            call()
+        self.assertEqual(caught.exception.error_class, "unexpected_discovery_error")
+        self.assertEqual(self.last_failure()["stage"], "nginx_config_tested")
+
+    def test_unexpected_exception_during_systemctl_is_classified(self):
         operations = self.operations()
-        with patch("ops.td02c_authenticated_get_runner.subprocess.run",
-                    side_effect=self.dispatch({
-                        ("systemctl", "is-active"): MemoryError("unexpected"),
-                    })):
+        with patch("ops.td02c_authenticated_get_runner.subprocess.run", side_effect=MemoryError("unexpected")):
             with self.assertRaises(AuthenticatedGetFailure) as caught:
                 operations.discover_target()
         self.assertEqual(caught.exception.error_class, "unexpected_discovery_error")
         self.assertEqual(self.last_failure()["stage"], "service_metadata_loaded")
 
     # 23. mensajes de error sanitizados ------------------------------------
-    def test_error_detail_is_redacted(self):
-        _, call = self.run_discovery({
-            ("systemctl", "is-active"): completed(0, "active\n", ""),
-            ("nginx", "-t"): completed(1, "", "SECRET_KEY=abcd1234\nnginx: [emerg] bad config\n"),
-        })
+    def test_sanitize_stream_redacts_secret_lines(self):
+        # _sanitize_stream is called on str(DeploymentError(...)), which is
+        # always "classification: short static phrase" for every real
+        # deployment_hardening message -- never a raw secret. This tests the
+        # redaction primitive itself directly (defense-in-depth), since a
+        # classification-prefixed line can never satisfy redact_output's
+        # line-start anchor the way a raw, unprefixed command output line can.
+        from ops.td02c_authenticated_get_runner import _sanitize_stream
+        self.assertNotIn("abcd1234", _sanitize_stream("SECRET_KEY=abcd1234\nnginx: [emerg] bad config\n"))
+
+    def test_nginx_failure_detail_is_bounded_and_single_line(self):
+        _, call = self.run_discovery(
+            nginx_result=DeploymentError("nginx_check_config_invalid: nginx configuration check failed")
+        )
         with self.assertRaises(AuthenticatedGetFailure):
             call()
         detail = self.last_failure().get("detail", "")
-        self.assertNotIn("abcd1234", detail)
+        self.assertNotIn("\n", detail)
+        self.assertLessEqual(len(detail), 200)
 
     # 24. exito conserva el comportamiento anterior --------------------------
     def test_successful_discovery_returns_expected_target(self):
-        config = nginx_config("canary.example.com")
-        operations, call = self.run_discovery({
-            ("systemctl", "is-active"): completed(0, "active\n", ""),
-            ("nginx", "-t"): completed(0, "", ""),
-            ("nginx", "-T"): completed(0, config, ""),
-        })
+        operations, call = self.run_discovery(nginx_result=self.target)
         target = call()
         self.assertEqual(target.server_name, "canary.example.com")
         self.assertIs(operations.target, target)
@@ -823,9 +801,7 @@ class NginxDiscoveryDiagnosticsTests(unittest.TestCase):
 
     # 20/21. cero HTTP y cero sesion cuando falla el discovery ----------------
     def test_discovery_failure_never_reaches_http_or_session_stages(self):
-        operations, call = self.run_discovery({
-            ("systemctl", "is-active"): completed(3, "inactive\n", ""),
-        })
+        operations, call = self.run_discovery(systemctl_active=False)
         operations.get_login = Mock()
         operations.authenticate = Mock()
         operations.authenticated_get = Mock()
@@ -838,18 +814,49 @@ class NginxDiscoveryDiagnosticsTests(unittest.TestCase):
         for forbidden in ("sessionid", "csrftoken"):
             self.assertNotIn(forbidden, output)
 
+    def test_nginx_discovery_failure_never_reaches_http_or_session_stages(self):
+        operations, call = self.run_discovery(
+            nginx_result=DeploymentError("nginx_discovery_helper_missing: discovery helper is not installed")
+        )
+        operations.get_login = Mock()
+        operations.authenticate = Mock()
+        operations.authenticated_get = Mock()
+        with self.assertRaises(AuthenticatedGetFailure):
+            call()
+        operations.get_login.assert_not_called()
+        operations.authenticate.assert_not_called()
+        operations.authenticated_get.assert_not_called()
+
     # 22. cero exposicion de secretos ------------------------------------------
     def test_no_secrets_in_discovery_diagnostics(self):
         operations = self.operations()
         operations.credential_file = Path("/tmp/super-secret-marker-value")
-        with patch("ops.td02c_authenticated_get_runner.subprocess.run",
-                    side_effect=self.dispatch({
-                        ("systemctl", "is-active"): completed(0, "active\n", ""),
-                        ("nginx", "-t"): completed(0, "", ""),
-                        ("nginx", "-T"): completed(0, nginx_config("canary.example.com"), ""),
-                    })):
+        with (
+            patch("ops.td02c_authenticated_get_runner.subprocess.run", side_effect=self.systemctl_dispatch(active=True)),
+            patch("ops.td02c_authenticated_get_runner.discover_and_validate_nginx", return_value=self.target),
+        ):
             operations.discover_target()
         self.assertNotIn("super-secret-marker-value", self.log_stream.getvalue())
+
+    # prueba estructural: sin invocaciones directas a nginx -t/-T o openssl ---
+    def test_no_direct_nginx_invocation_remains(self):
+        source = Path("ops/td02c_authenticated_get_runner.py").read_text(encoding="utf-8")
+        for forbidden in (
+            '"nginx", "-t"', "'nginx', '-t'", '"nginx", "-T"', "'nginx', '-T'",
+            "/usr/sbin/nginx", '"openssl"', "'openssl'",
+        ):
+            self.assertNotIn(forbidden, source)
+        self.assertIn("discover_and_validate_nginx", source)
+
+    def test_no_second_privileged_mechanism_introduced(self):
+        # classification keys like "nginx_discovery_sudoers_missing" legitimately
+        # mirror ops.deployment_hardening's existing vocabulary; what must never
+        # appear here is a NEW sudoers rule or installed-helper path definition.
+        source = Path("ops/td02c_authenticated_get_runner.py").read_text(encoding="utf-8")
+        self.assertNotIn("/usr/local/libexec", source)
+        self.assertNotIn("/etc/sudoers.d", source)
+        self.assertNotIn("SUDOERS_CONTENT", source)
+        self.assertNotIn("NOPASSWD", source)
 
 
 if __name__ == "__main__":
