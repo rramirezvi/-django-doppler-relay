@@ -7,11 +7,12 @@ import stat
 import tempfile
 import unittest
 from dataclasses import fields
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from ops.td02c_authenticated_get_runner import Baseline, CurlOperations, RunnerFailure
+from ops.td02c_deployment_runner import TD02CDeploymentError, repository_lock
 from ops.td02c_http_client import (
     AuthenticatedGetFailure,
     ResponseMetadata,
@@ -28,11 +29,22 @@ from ops.bulk_v2_canary_client import (
     _assert_expected_delta,
     _assert_import_only_profile,
     _assert_profile_matches_settings,
+    _assert_safe_csv_path,
     _execute_canary_post,
     main,
     run_canary,
     validate_client_module_identity,
 )
+
+
+def _noop_repository_lock() -> MagicMock:
+    """Matches the mocking pattern already used for this exact primitive in
+    ops/tests/test_td02c_deployment_runner.py (module-level patch of
+    ``repository_lock`` with a no-op MagicMock context manager) -- reused
+    here instead of inventing a new one."""
+    return MagicMock(
+        __enter__=Mock(return_value=Path("/tmp/unused.lock")), __exit__=Mock(return_value=False)
+    )
 
 
 def nginx_config(server_name: str, socket: str = "/run/django.sock") -> str:
@@ -188,6 +200,37 @@ class ImportOnlyEnforcementTests(unittest.TestCase):
     def test_backslash_is_rejected(self):
         with self.assertRaisesRegex(RunnerFailure, "import_only_violation"):
             _assert_import_only_profile(profile(template_id="back\\slash"))
+
+
+class CsvPathValidationTests(unittest.TestCase):
+    """Fix: csv_path is not a CanaryProfile field -- it is supplied
+    separately to run_canary -- but ops.td02c_http_client.write_post_curl_config
+    interpolates it into the exact same flat
+    ``form = "recipients_file=@{csv_path};type=text/csv"`` line that
+    _assert_import_only_profile's forbidden-character check protects the
+    other four fields against. _assert_safe_csv_path applies the identical
+    check to csv_path, before any workspace/credential/network activity."""
+
+    def test_clean_path_passes(self):
+        _assert_safe_csv_path(PurePosixPath("/tmp/canary-import.csv"))
+
+    def test_embedded_newline_is_rejected(self):
+        with self.assertRaisesRegex(RunnerFailure, "import_only_violation"):
+            _assert_safe_csv_path(
+                PurePosixPath('/tmp/canary.csv\nform = "sender_id=999')
+            )
+
+    def test_embedded_carriage_return_is_rejected(self):
+        with self.assertRaisesRegex(RunnerFailure, "import_only_violation"):
+            _assert_safe_csv_path(PurePosixPath("/tmp/canary.csv\r\nextra"))
+
+    def test_embedded_quote_is_rejected(self):
+        with self.assertRaisesRegex(RunnerFailure, "import_only_violation"):
+            _assert_safe_csv_path(PurePosixPath('/tmp/broken"quote.csv'))
+
+    def test_embedded_backslash_is_rejected(self):
+        with self.assertRaisesRegex(RunnerFailure, "import_only_violation"):
+            _assert_safe_csv_path(PurePosixPath("/tmp/canary.csv") / "back\\slash")
 
 
 class ExpectedDeltaAssertionTests(unittest.TestCase):
@@ -347,8 +390,12 @@ class RunCanaryOrchestrationTests(unittest.TestCase):
         self.repo.mkdir()
         self.credential = self.root / "credential"
         self.credential.write_text("private-value", encoding="utf-8")
-        self.csv_path = self.root / "canary.csv"
-        self.csv_path.write_text("email\nsynthetic@example.invalid\n", encoding="utf-8")
+        # A pure, filesystem-untouched POSIX-style path: none of the tests in
+        # this class actually read csv_path's bytes (real POST execution is
+        # always faked below), and a real OS-native Path would render with
+        # backslash separators on Windows dev boxes, colliding with the new
+        # csv_path forbidden-character check (see CsvPathValidationTests).
+        self.csv_path = PurePosixPath("/tmp/canary-import.csv")
         self.service = SimpleNamespace(working_directory=self.repo, user="app")
 
     def invoke(
@@ -395,6 +442,7 @@ class RunCanaryOrchestrationTests(unittest.TestCase):
             patch("ops.bulk_v2_canary_client.delete_exact_file"),
             patch("ops.bulk_v2_canary_client.DjangoState", return_value=state),
             patch("ops.bulk_v2_canary_client.CurlOperations", return_value=operations),
+            patch("ops.bulk_v2_canary_client.repository_lock", return_value=_noop_repository_lock()),
             patch("ops.bulk_v2_canary_client.run_authenticated_get_gate", side_effect=fake_run_gate),
             patch("ops.bulk_v2_canary_client._execute_canary_post", side_effect=fake_execute_post),
         ]
@@ -492,6 +540,32 @@ class RunCanaryOrchestrationTests(unittest.TestCase):
         validate.assert_not_called()
         self.assertIn("import_only_violation", stream.getvalue())
 
+    def test_csv_path_import_only_violation_refuses_before_credential_access(self):
+        # Fix: csv_path is not a CanaryProfile field -- it is supplied
+        # separately -- but it is interpolated into the exact same flat
+        # form-field line td02c_http_client.write_post_curl_config writes,
+        # so it must be checked before any workspace/credential/network
+        # activity too, exactly like the other four fields above.
+        stream = io.StringIO()
+        with (
+            patch("ops.bulk_v2_canary_client._load_django_settings", return_value=active_settings()),
+            patch("ops.bulk_v2_canary_client.discover_service") as discover,
+            patch("ops.bulk_v2_canary_client.validate_credential_file") as validate,
+        ):
+            unsafe_csv_path = PurePosixPath('/tmp/canary.csv";form = "sender_id=999')
+            code = run_canary(
+                profile(),
+                stream,
+                csv_path=unsafe_csv_path,
+                credential_file=self.credential,
+                service_unit="django.service",
+                username="td02c_tech",
+            )
+        self.assertEqual(code, 1)
+        discover.assert_not_called()
+        validate.assert_not_called()
+        self.assertIn("import_only_violation", stream.getvalue())
+
     def test_disposition_required_refuses_before_http(self):
         dirty_baseline = baseline(bulk_sends_v2=1, recipients=4)
         state = Mock(baseline=Mock(return_value=dirty_baseline))
@@ -505,6 +579,7 @@ class RunCanaryOrchestrationTests(unittest.TestCase):
             ),
             patch("ops.bulk_v2_canary_client.delete_exact_file"),
             patch("ops.bulk_v2_canary_client.DjangoState", return_value=state),
+            patch("ops.bulk_v2_canary_client.repository_lock", return_value=_noop_repository_lock()),
             patch("ops.bulk_v2_canary_client.CurlOperations") as curl_ops,
             patch("ops.bulk_v2_canary_client.subprocess.run") as curl,
         ):
@@ -594,6 +669,175 @@ class RunCanaryOrchestrationTests(unittest.TestCase):
         import ops.bulk_v2_canary_client as module
 
         self.assertFalse(hasattr(module, "settings"))
+
+    def test_unexpected_exception_from_baseline_is_caught_classified_and_returns_one(self):
+        # Fix: state.baseline() is a Django ORM call that could raise
+        # django.db.utils.*/django.core.exceptions.* -- none of which are
+        # AuthenticatedGetFailure/DeploymentError/RunnerFailure/OSError/
+        # subprocess.SubprocessError. A plain RuntimeError stands in for any
+        # such unexpected type here.
+        dirty_state = Mock(baseline=Mock(side_effect=RuntimeError("db connection reset")))
+        stream = io.StringIO()
+        with (
+            patch("ops.bulk_v2_canary_client._load_django_settings", return_value=active_settings()),
+            patch("ops.bulk_v2_canary_client.discover_service", return_value=self.service),
+            patch(
+                "ops.bulk_v2_canary_client.validate_credential_file",
+                return_value=(self.credential, (1, 2, 3)),
+            ),
+            patch("ops.bulk_v2_canary_client.delete_exact_file"),
+            patch("ops.bulk_v2_canary_client.DjangoState", return_value=dirty_state),
+            patch("ops.bulk_v2_canary_client.repository_lock", return_value=_noop_repository_lock()),
+            patch("ops.bulk_v2_canary_client.CurlOperations") as curl_ops,
+            patch("ops.bulk_v2_canary_client.subprocess.run") as curl,
+        ):
+            code = run_canary(
+                profile(),
+                stream,
+                csv_path=self.csv_path,
+                credential_file=self.credential,
+                service_unit="django.service",
+                username="td02c_tech",
+            )
+        self.assertEqual(code, 1)
+        curl_ops.assert_not_called()
+        curl.assert_not_called()
+        self.assertIn("unexpected_error", stream.getvalue())
+        self.assertNotIn("db connection reset", stream.getvalue())
+
+    def test_unexpected_pwd_like_failure_during_credential_validation_is_caught(self):
+        # Fix: pwd.getpwnam (inside the reused validate_credential_file) can
+        # raise a bare KeyError -- not covered by the pre-fix except tuple
+        # either. The inner credential_file_validated FAIL diagnostic still
+        # fires (existing behavior, unchanged); this proves the exception
+        # itself no longer escapes run_canary uncaught.
+        stream = io.StringIO()
+        with (
+            patch("ops.bulk_v2_canary_client._load_django_settings", return_value=active_settings()),
+            patch("ops.bulk_v2_canary_client.discover_service", return_value=self.service),
+            patch(
+                "ops.bulk_v2_canary_client.validate_credential_file",
+                side_effect=KeyError("getpwnam(): name not found: 'app'"),
+            ),
+        ):
+            code = run_canary(
+                profile(),
+                stream,
+                csv_path=self.csv_path,
+                credential_file=self.credential,
+                service_unit="django.service",
+                username="td02c_tech",
+            )
+        self.assertEqual(code, 1)
+        self.assertIn("credential_file_unsafe", stream.getvalue())
+        self.assertIn("unexpected_error", stream.getvalue())
+
+    def test_concurrent_lock_contention_translates_to_runner_failure_with_zero_post_activity(self):
+        # Fix: repository_lock (reused unmodified from
+        # ops.td02c_deployment_runner) raises TD02CDeploymentError on
+        # contention. run_canary must translate that into this module's own
+        # RunnerFailure taxonomy (concurrent_execution_blocked) rather than
+        # leaking the deployment-runner's own error type, and must make zero
+        # CurlOperations/POST calls once contention is detected.
+        state = Mock(baseline=Mock(return_value=baseline()))
+        stream = io.StringIO()
+        with (
+            patch("ops.bulk_v2_canary_client._load_django_settings", return_value=active_settings()),
+            patch("ops.bulk_v2_canary_client.discover_service", return_value=self.service),
+            patch(
+                "ops.bulk_v2_canary_client.validate_credential_file",
+                return_value=(self.credential, (1, 2, 3)),
+            ),
+            patch("ops.bulk_v2_canary_client.delete_exact_file"),
+            patch("ops.bulk_v2_canary_client.DjangoState", return_value=state),
+            patch(
+                "ops.bulk_v2_canary_client.repository_lock",
+                side_effect=TD02CDeploymentError("preflight", "operation_already_running"),
+            ),
+            patch("ops.bulk_v2_canary_client.CurlOperations") as curl_ops,
+            patch("ops.bulk_v2_canary_client.subprocess.run") as curl,
+            patch("ops.bulk_v2_canary_client._execute_canary_post") as execute_post,
+        ):
+            code = run_canary(
+                profile(),
+                stream,
+                csv_path=self.csv_path,
+                credential_file=self.credential,
+                service_unit="django.service",
+                username="td02c_tech",
+            )
+        self.assertEqual(code, 1)
+        curl_ops.assert_not_called()
+        curl.assert_not_called()
+        execute_post.assert_not_called()
+        state.baseline.assert_not_called()
+        self.assertIn("concurrent_execution_blocked", stream.getvalue())
+
+
+@unittest.skipUnless(os.name == "posix", "flock-based repository_lock is POSIX-only")
+class RealConcurrentExecutionLockTests(unittest.TestCase):
+    """Reuses the project's proven flock-based repository_lock primitive
+    (ops.td02c_deployment_runner.repository_lock) for real, mirroring the
+    mocking/isolation pattern already used for it in
+    ops/tests/test_td02c_deployment_runner.py (patching
+    tempfile.gettempdir so this test's lock file never touches the real
+    global operational lock namespace)."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.operational = self.root / "operational-locks"
+        self.operational.mkdir(mode=0o700)
+        self.credential = self.root / "credential"
+        self.credential.write_text("private-value", encoding="utf-8")
+        self.csv_path = PurePosixPath("/tmp/canary-import.csv")
+        self.service = SimpleNamespace(working_directory=self.repo, user="app")
+        gettempdir_patch = patch(
+            "ops.td02c_deployment_runner.tempfile.gettempdir",
+            return_value=str(self.operational),
+        )
+        gettempdir_patch.start()
+        self.addCleanup(gettempdir_patch.stop)
+
+    def test_second_real_invocation_is_blocked_while_first_holds_the_lock(self):
+        state = Mock(baseline=Mock(return_value=baseline()))
+        stream = io.StringIO()
+        # run_canary calls repository_lock(repository=service.working_directory,
+        # operation=...) with no test_lock_directory override -- the same
+        # production code path -- so holding the equivalent lock here
+        # (same repository, hence the same digest-derived lock file under
+        # the patched gettempdir) genuinely collides.
+        with repository_lock(self.repo, "external-holder"):
+            with (
+                patch("ops.bulk_v2_canary_client._load_django_settings", return_value=active_settings()),
+                patch("ops.bulk_v2_canary_client.discover_service", return_value=self.service),
+                patch(
+                    "ops.bulk_v2_canary_client.validate_credential_file",
+                    return_value=(self.credential, (1, 2, 3)),
+                ),
+                patch("ops.bulk_v2_canary_client.delete_exact_file"),
+                patch("ops.bulk_v2_canary_client.DjangoState", return_value=state),
+                patch("ops.bulk_v2_canary_client.CurlOperations") as curl_ops,
+                patch("ops.bulk_v2_canary_client.subprocess.run") as curl,
+                patch("ops.bulk_v2_canary_client._execute_canary_post") as execute_post,
+            ):
+                code = run_canary(
+                    profile(),
+                    stream,
+                    csv_path=self.csv_path,
+                    credential_file=self.credential,
+                    service_unit="django.service",
+                    username="td02c_tech",
+                )
+        self.assertEqual(code, 1)
+        curl_ops.assert_not_called()
+        curl.assert_not_called()
+        execute_post.assert_not_called()
+        state.baseline.assert_not_called()
+        self.assertIn("concurrent_execution_blocked", stream.getvalue())
 
 
 class ClientModuleIdentityTests(unittest.TestCase):
@@ -691,6 +935,8 @@ class ErrorCodesTests(unittest.TestCase):
             "client_module_path_mismatch",
             "client_module_not_importable_from_checkout",
             "client_entrypoint_identity_mismatch",
+            "unexpected_error",
+            "concurrent_execution_blocked",
         ):
             self.assertIn(code, ERROR_CODES)
 
@@ -759,6 +1005,36 @@ class MainCliTests(unittest.TestCase):
         self.assertEqual(code, 1)
         runner.assert_not_called()
         self.assertIn("client_module_path_mismatch", stream.getvalue())
+
+    def test_main_never_propagates_even_if_run_canary_unexpectedly_raises(self):
+        # Defense in depth at the CLI boundary: run_canary is already fixed
+        # to classify and swallow any unexpected exception (see
+        # test_unexpected_exception_from_baseline_is_caught_classified_and_returns_one),
+        # but main() must never crash with a raw traceback even if that
+        # invariant were somehow violated.
+        stream = io.StringIO()
+        with (
+            patch("ops.bulk_v2_canary_client.validate_module_entrypoint"),
+            patch("ops.bulk_v2_canary_client.validate_client_module_identity"),
+            patch(
+                "ops.bulk_v2_canary_client.run_canary",
+                side_effect=RuntimeError("synthetic crash"),
+            ),
+            patch("ops.bulk_v2_canary_client.sys.stdout", stream),
+        ):
+            code = main([
+                "--credential-file", "/tmp/not-read",
+                "--username", "td02c_tech",
+                "--user-id", "42",
+                "--request-id", "fresh-canary-request-id",
+                "--template-id", "td02c-canary-import-only",
+                "--template-name", "TD-02C Canary Import Only",
+                "--subject", "TD-02C Canary Import Only",
+                "--csv-path", "/tmp/canary.csv",
+            ])
+        self.assertEqual(code, 1)
+        self.assertIn("unexpected_error", stream.getvalue())
+        self.assertNotIn("synthetic crash", stream.getvalue())
 
 
 if __name__ == "__main__":

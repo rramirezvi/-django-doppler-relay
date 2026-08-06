@@ -37,6 +37,7 @@ from ops.td02c_authenticated_get_runner import (
     validate_credential_file,
     validate_module_entrypoint,
 )
+from ops.td02c_deployment_runner import TD02CDeploymentError, repository_lock
 from ops.td02c_http_client import (
     AuthenticatedGetFailure,
     ERROR_CODES as _HTTP_CLIENT_ERROR_CODES,
@@ -66,6 +67,8 @@ ERROR_CODES = {
     "client_module_path_mismatch",
     "client_module_not_importable_from_checkout",
     "client_entrypoint_identity_mismatch",
+    "unexpected_error",
+    "concurrent_execution_blocked",
 } | _HTTP_CLIENT_ERROR_CODES
 
 # Matches the --write-out format ops.td02c_authenticated_get_runner.
@@ -139,6 +142,19 @@ def _assert_import_only_profile(profile: CanaryProfile) -> None:
     ):
         if not value or any(char in value for char in _FORBIDDEN_PROFILE_CHARS):
             raise RunnerFailure("import_only_violation")
+
+
+def _assert_safe_csv_path(csv_path: Path) -> None:
+    """csv_path is not a CanaryProfile field -- it is supplied separately to
+    run_canary/_execute_canary_post -- but ops.td02c_http_client's
+    write_post_curl_config interpolates it into the exact same flat
+    ``form = "recipients_file=@{csv_path};type=text/csv"`` line that
+    _assert_import_only_profile's forbidden-character check protects the
+    other four fields against. Apply the identical check here, before any
+    workspace, credential, or network activity."""
+    value = str(csv_path)
+    if not value or any(char in value for char in _FORBIDDEN_PROFILE_CHARS):
+        raise RunnerFailure("import_only_violation")
 
 
 def _assert_expected_delta(before: Baseline, after: Baseline, *, expect_success: bool) -> None:
@@ -286,6 +302,7 @@ def run_canary(
     try:
         _assert_profile_matches_settings(profile, settings)
         _assert_import_only_profile(profile)
+        _assert_safe_csv_path(csv_path)
     except RunnerFailure as exc:
         log.emit(StageDiagnostic("profile_validated", "FAIL", 1, time.monotonic() - started, str(exc), detail=f"request={fingerprint}"))
         return 1
@@ -309,29 +326,53 @@ def run_canary(
         log.emit(StageDiagnostic("credential_file_validated", "PASS", 0, time.monotonic() - started))
 
         state = DjangoState(user_id=profile.user_id, username=username)
-        baseline = state.baseline()
-        emit_counts(stream, "baseline_before", baseline)
 
-        # A prior, undisposed canary run permanently blocks every future
-        # TD-02C deployment preflight (ops/README.md, Disposition section) --
-        # refuse to compound that rather than silently stacking rows.
-        if baseline.bulk_sends_v2 or baseline.recipients:
-            raise RunnerFailure("disposition_required")
+        # Serialize the disposition-check-through-POST section with the
+        # project's existing, proven flock-based lock (reused unmodified --
+        # not a new locking mechanism). Without it, two concurrent
+        # invocations could both observe a clean baseline and both proceed,
+        # each creating a BulkSend/BulkSendRecipient row.
+        try:
+            with repository_lock(repository=service.working_directory, operation="bulk_v2_canary"):
+                baseline = state.baseline()
+                emit_counts(stream, "baseline_before", baseline)
 
-        operations = CurlOperations(
-            service_unit=service_unit, credential_file=credential, state=state, baseline=baseline, log=log
-        )
+                # A prior, undisposed canary run permanently blocks every
+                # future TD-02C deployment preflight (ops/README.md,
+                # Disposition section) -- refuse to compound that rather
+                # than silently stacking rows.
+                if baseline.bulk_sends_v2 or baseline.recipients:
+                    raise RunnerFailure("disposition_required")
 
-        with secure_cookie_workspace() as workspace:
-            run_authenticated_get_gate(
-                operations, log, workspace_factory=lambda: _retained_workspace(workspace)
-            )
-            decision = _execute_canary_post(operations, workspace, profile, csv_path, log)
+                operations = CurlOperations(
+                    service_unit=service_unit, credential_file=credential, state=state, baseline=baseline, log=log
+                )
+
+                with secure_cookie_workspace() as workspace:
+                    run_authenticated_get_gate(
+                        operations, log, workspace_factory=lambda: _retained_workspace(workspace)
+                    )
+                    decision = _execute_canary_post(operations, workspace, profile, csv_path, log)
+        except TD02CDeploymentError as exc:
+            # Translate rather than leak the deployment-runner's own error
+            # type -- classified consistently with this module's other
+            # refusals.
+            raise RunnerFailure("concurrent_execution_blocked") from exc
     except (AuthenticatedGetFailure, DeploymentError, RunnerFailure, OSError, subprocess.SubprocessError) as exc:
         failure = True
         if not isinstance(exc, AuthenticatedGetFailure):
             classification = str(exc) if str(exc) in ERROR_CODES else "runner_failed"
             log.emit(StageDiagnostic("canary_client", "FAIL", 1, 0.0, classification))
+    except Exception as exc:
+        # Fail closed on any exception type this module did not anticipate
+        # (e.g. django.db.utils.*/django.core.exceptions.* from
+        # state.baseline(), or a bare KeyError from pwd.getpwnam inside the
+        # reused validate_credential_file) -- never let it propagate out of
+        # run_canary, and never echo its raw message unless it is already a
+        # known, safe classification string.
+        failure = True
+        classification = str(exc) if str(exc) in ERROR_CODES else "unexpected_error"
+        log.emit(StageDiagnostic("canary_client", "FAIL", 1, 0.0, classification))
     finally:
         if state is not None and baseline is not None:
             started = time.monotonic()
@@ -460,14 +501,25 @@ def main(argv: Sequence[str] | None = None) -> int:
         subject=args.subject,
         max_rows=args.max_rows,
     )
-    return run_canary(
-        profile,
-        sys.stdout,
-        csv_path=args.csv_path,
-        credential_file=args.credential_file,
-        service_unit=args.service_unit,
-        username=args.username,
-    )
+    started = time.monotonic()
+    try:
+        # Defense in depth: run_canary already classifies and swallows any
+        # unexpected exception itself and always returns an int, but the CLI
+        # entrypoint must never crash with a raw traceback even if that
+        # invariant were somehow violated -- same bare except Exception
+        # idiom used for the two validate_*_identity calls above.
+        return run_canary(
+            profile,
+            sys.stdout,
+            csv_path=args.csv_path,
+            credential_file=args.credential_file,
+            service_unit=args.service_unit,
+            username=args.username,
+        )
+    except Exception as exc:
+        classification = str(exc) if str(exc) in ERROR_CODES else "unexpected_error"
+        log.emit(StageDiagnostic("canary_client", "FAIL", 1, time.monotonic() - started, classification))
+        return 1
 
 
 if __name__ == "__main__":

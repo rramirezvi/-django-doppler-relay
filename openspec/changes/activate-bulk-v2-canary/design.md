@@ -111,6 +111,15 @@ def run_canary(profile: CanaryProfile, *, csv_path: Path,
 ERROR_CODES = {
     "settings_gate_failed", "profile_mismatch", "import_only_violation",
     "unexpected_row_delta", "firewall_breach", "disposition_required",
+    "client_module_path_mismatch", "client_module_not_importable_from_checkout",
+    "client_entrypoint_identity_mismatch",
+    # Review-driven follow-up fixes (post-PR3): csv_path is validated with
+    # the same import_only_violation code as the other four profile fields;
+    # any unexpected exception in run_canary/main is classified
+    # "unexpected_error" and never propagates; lock contention on the
+    # reused ops.td02c_deployment_runner.repository_lock is translated to
+    # "concurrent_execution_blocked".
+    "unexpected_error", "concurrent_execution_blocked",
 }  # plus the existing td02c_http_client taxonomy
 ```
 
