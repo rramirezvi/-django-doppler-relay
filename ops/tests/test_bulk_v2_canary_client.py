@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 import os
 import stat
 import tempfile
@@ -83,6 +84,28 @@ def baseline(**changes) -> Baseline:
     }
     values.update(changes)
     return Baseline(**values)
+
+
+def _iter_json_leaf_values(output: str):
+    """Yield every leaf value from each newline-delimited JSON object in
+    ``output`` (the SafeDiagnosticLog/emit_counts format: one JSON object per
+    line). Used to assert a raw id never appears as an actual field value,
+    without false-positiving on unrelated numeric noise (e.g. a
+    ``duration_seconds`` float like ``0.000142`` that merely *contains* the
+    digits "42" as a substring of a larger, unrelated number)."""
+    for line in output.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        stack = [json.loads(line)]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                stack.extend(node.values())
+            elif isinstance(node, list):
+                stack.extend(node)
+            else:
+                yield node
 
 
 class CanaryProfileShapeTests(unittest.TestCase):
@@ -548,7 +571,18 @@ class RunCanaryOrchestrationTests(unittest.TestCase):
         code, output, state, operations, delete_mock = self.invoke()
         self.assertEqual(code, 0)
         self.assertNotIn(profile().request_id, output)
-        self.assertNotIn(str(profile().user_id), output)
+        # A plain `str(user_id) not in output` substring check is flaky: the
+        # log also carries real duration_seconds floats (e.g. "0.000142"),
+        # whose digits can coincidentally contain "42" without the raw id
+        # ever being logged. Assert against actual JSON leaf values instead,
+        # so only a genuine "42" field value (int or str) fails the test.
+        raw_user_id = profile().user_id
+        leaked = [
+            value
+            for value in _iter_json_leaf_values(output)
+            if value == raw_user_id or value == str(raw_user_id)
+        ]
+        self.assertEqual(leaked, [], f"raw user_id leaked as a JSON field value: {leaked}")
         # sha256(client_request_id)[:12] fingerprint, matching relay/api.py's
         # own pattern -- 12 lowercase hex characters, never the raw token.
         self.assertRegex(output, r"request=[a-f0-9]{12}")
