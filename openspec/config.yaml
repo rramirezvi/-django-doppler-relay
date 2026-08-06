@@ -1,0 +1,64 @@
+schema: spec-driven
+
+context: |
+  Project: django-doppler-relay ("-django-doppler-relay" repo), Django app "relay",
+  plus "reports", "templates_admin", "relay_super", and an "ops" package for
+  hardened production deployment tooling.
+
+  Tech stack: Python 3.11.5, Django >=4.2,<6, django-environ, psycopg2-binary
+  (PostgreSQL; SQLite optional via USE_SQLITE for local dev), requests,
+  tenacity, python-dateutil. No DRF detected. No frontend framework — Django
+  templates + admin only.
+
+  Architecture: Django monolith. Apps: relay (core: BulkSend, EmailMessage,
+  UserEmailConfig, bulk v2 pipeline), relay_super (admin proxy), reports
+  (Doppler report ingestion/loader), templates_admin. Settings at
+  config/settings.py using django-environ (.env-driven, fail-closed on empty
+  SECRET_KEY). Middleware includes a custom HideReportsAdminMiddleware.
+  Separate "ops" package (not a Django app) implements a hardened, fail-closed
+  deployment/rollback orchestrator (ops/td02c_deployment_runner.py,
+  deployment_hardening.py, nginx/worker/settings gates, authenticated GET
+  runner) with extensive Spanish-language operational documentation in
+  ops/README.md — this is security/production-critical infrastructure code,
+  not application code.
+
+  Testing: Django's built-in test runner (`manage.py test`), no pytest/
+  pytest-django detected in requirements.txt. Standalone `unittest` also used
+  directly for the ops package (e.g. `python -m unittest
+  ops.tests.test_deployment_hardening -v`). Near 1:1 test-to-module coverage
+  pattern: relay/tests/ (8 files covering bulk v2 pipeline, endpoints, security
+  settings) and ops/tests/ (9 files, one per ops/*.py gate/runner module).
+  ops/README.md documents a strict production/isolated test-profile split
+  (ops.deployment_test_profile) — Django tests that create a test database are
+  forbidden against production and must run in isolated PostgreSQL first.
+
+  Style: Spanish used in in-repo operational docs/comments (ops/README.md,
+  some settings comments); code identifiers and docstrings in English. No
+  linter/formatter config (ruff/black/flake8) detected at repo root.
+
+rules:
+  proposal:
+    - Include rollback plan for risky changes
+    - Never propose changes that skip the isolated-PostgreSQL test profile before touching ops/ or deployment behavior
+  specs:
+    - Use Given/When/Then for scenarios
+    - Use RFC 2119 keywords (MUST, SHALL, SHOULD, MAY)
+  design:
+    - Include sequence diagrams for complex flows
+    - Document architecture decisions with rationale
+    - For ops/ changes, document fail-closed behavior and rollback explicitly
+  tasks:
+    - Group by phase, use hierarchical numbering
+    - Keep tasks completable in one session
+  apply:
+    guidelines:
+      - Follow existing code patterns
+      - Never modify ops/ deployment safety invariants without explicit design sign-off
+    tdd: true           # Strict TDD — see rationale below
+    test_command: "python manage.py test"
+  verify:
+    test_command: "python manage.py test"
+    build_command: ""
+    coverage_threshold: 0
+  archive:
+    - Warn before merging destructive deltas
