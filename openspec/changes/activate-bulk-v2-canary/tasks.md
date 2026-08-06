@@ -115,7 +115,7 @@ field names) before marking done. All three land in `ops/README.md`; per
 independently deployable without the others — same doc, same reviewable
 runbook story.
 
-- [ ] **7. Doc: Production preflight + flags-only activation/rollback**
+- [x] **7. Doc: Production preflight + flags-only activation/rollback**
       Requirements covered: *Production Preflight Before Flag Changes*,
       *Flags-Only Activation*, *Flags-Only Deactivation and Rollback*,
       *Gate-Verified Activation State*. Content: fresh read-only preflight
@@ -132,7 +132,7 @@ runbook story.
       (`_django_state()` hardcodes `expect_active=False`, so deployment
       preflight fails closed while canary flags are ON).
 
-- [ ] **8. Doc: Promotion/abort criteria + evidence capture checklist**
+- [x] **8. Doc: Promotion/abort criteria + evidence capture checklist**
       Requirements covered: *Promotion and Abort Criteria*, *Evidence
       Capture*. Content: promotable only when gate reports active, client
       POST succeeds, and evidence was captured; abort immediately on any gate
@@ -142,7 +142,7 @@ runbook story.
       `EmailMessage.objects.count() == 0` for the run — explicitly never raw
       `client_request_id`, raw user id, or recipient data.
 
-- [ ] **9. Doc: Disposition of canary-created rows**
+- [x] **9. Doc: Disposition of canary-created rows**
       Requirement covered: *Disposition of Canary-Created Rows*. Content:
       why retention is not viable (`_validate_operational_gates` requires
       `BulkSend.objects.filter(engine_version="v2").count() == 0` and

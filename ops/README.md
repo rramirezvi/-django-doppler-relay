@@ -70,6 +70,183 @@ application/json` only for the one authorized idempotent retry. Redirects,
 HTML and all other statuses abort without retry. The temporary workspace is
 deleted on success and failure.
 
+## Bulk Processing Engine V2 canary activation (production)
+
+Activation and rollback are **flags-only**: four Django settings plus a
+`django.service` restart, no code deploy. Both directions are verified with
+the same existing gate call, never a new parser. The execution client that
+performs the single import-only POST (`ops/bulk_v2_canary_client.py`) lands
+in a later PR of this change; this section documents the surrounding
+flags-only runbook, promotion/abort criteria, evidence, and mandatory row
+disposal so the runbook is complete before that client is exercised.
+
+### Production preflight before any flag change
+
+Even though the production checkout commit was already confirmed once
+(`8212a4e` / `td02c-final`, TD-02C closure), that confirmation MUST NOT be
+trusted for a later activation attempt. Run a fresh, read-only preflight
+immediately before touching any flag:
+
+- confirm the checked-out commit still equals the previously confirmed
+  commit;
+- if it matches, proceed; if it does not, **abort and change no flag**.
+
+This preflight is read-only Git inspection only — no fetch, no flag edit, no
+restart.
+
+### The four activation flags
+
+| Flag | Active value | Inactive value |
+|---|---|---|
+| `BULK_PROCESSING_ENGINE_V2` | `True` | `False` |
+| `BULK_PROCESSING_V2_CANARY_ENABLED` | `True` | `False` |
+| `BULK_PROCESSING_V2_CANARY_REQUEST_IDS` | one fresh request-id token | empty |
+| `BULK_PROCESSING_V2_CANARY_USER_IDS` | one canary user id | empty |
+
+Two more settings are validated by the same gate call but are **never
+changed** by activation or rollback — they stay pinned in both states:
+
+- `BULK_PROCESSING_V2_CANARY_MAX_ROWS` stays `20`;
+- `BULK_PROCESSING_V2_ALLOW_EXTERNAL_TEMPLATE_LOOKUP` stays `False`.
+
+All six values are edited only in `.env` and take effect only through a
+`django.service` restart. No application code is deployed or modified by
+activation or rollback.
+
+### Runbook (each step gated before the next)
+
+| # | Step | Verification before continuing |
+|---|---|---|
+| 1 | Read effective state | `evaluate_django_settings(settings, expect_active=False)` → `allowed=True` |
+| 2 | Propose canonical raw values | Exactly one fresh request-id and one user-id; no spaces, duplicates, or wildcards |
+| 3 | Apply the `.env` edit (operator) | Record the prior line values so rollback is a literal revert |
+| 4 | Restart `django.service` | `td02c_worker_gate` pre/post checks + `validate_readiness_layers` PASS |
+| 5 | Prove ON | `evaluate_django_settings(settings, expect_active=True)` → `allowed=True` |
+| 6 | Execute the canary client | `201 application/json`, `classify_canary_response` reports allowed |
+| 7 | Verify results | Expected row-delta assertion passes; app log shows `bulk_v2_canary decision=canary_allowed` |
+| 8 | Deactivate (`.env` → `False`/empty) + restart | `evaluate_django_settings(settings, expect_active=False)` → `allowed=True` |
+| 9 | Dispose canary data | Counts back to `(0, 0, 0)`; media file removed |
+
+Abort at any failed step. Steps 8 and 9 always run — on success or on abort —
+so no run ever leaves flags on or rows undisposed.
+
+### Gate verification, both directions
+
+Both activation and rollback are verified with the same existing function,
+never a new or duplicated parser:
+
+```python
+from ops.td02c_settings_gate import evaluate_django_settings
+
+evaluate_django_settings(settings, expect_active=True)
+# → SettingsGateResult(allowed=True, code="canary_settings_active")
+
+evaluate_django_settings(settings, expect_active=False)
+# → SettingsGateResult(allowed=True, code="canary_settings_inactive")
+```
+
+A `False` result carries `code="settings_gate_failed"` and a `reasons` tuple
+(for example `request_allowlist_mismatch`, `max_rows_mismatch`,
+`external_lookup_must_be_false`) — treat any non-empty `reasons` as abort, not
+a partial pass.
+
+### Mandatory ordering: flags first, always
+
+`ops/td02c_deployment_runner.py`'s internal `_django_state()` hardcodes
+`evaluate_django_settings(settings, expect_active=False)` before every
+`preflight-only`/`deploy-only` run. Concretely, this means: **while any
+canary flag is still active, every future TD-02C deployment preflight fails
+closed** — it never falls through to a stale or partial check. Rollback of
+the four flags (step 8) is therefore never optional and never deferred past
+the canary run, independent of whether row disposal (step 9) has happened
+yet.
+
+### Rollback layers
+
+| Layer | Trigger | Mechanism | Verification |
+|---|---|---|---|
+| Flags | Any abort after step 3, or normal run completion | `.env` revert to the recorded prior values + `django.service` restart | `evaluate_django_settings(settings, expect_active=False)` → `allowed=True` |
+| Code | Only if a deployment/fast-forward is implicated | Existing `targeted_rollback()` via `--mode rollback` | Existing runner evidence |
+| Data | Whenever any canary row exists | Delete `BulkSendRecipient` → `BulkSend` → the `recipients_file` media artifact, scoped to the canary run's `client_request_id` | `(jobs, v2, ledger) == (0, 0, 0)` |
+
+Flags roll back independently of code and data — a flags-only rollback never
+requires a code-level rollback or waits on row disposal to be considered
+complete for the "no code deployed or modified" guarantee.
+
+### Promotion and abort criteria
+
+A run is **promotable** only when all three hold:
+
+- the gate reports active (`canary_settings_active`, `allowed=True`);
+- the canary client's import-only POST succeeds (`201`/allowed `200` retry);
+- evidence was captured per the checklist below.
+
+A run is **aborted immediately** — flags-only rollback (step 8), no
+retry — when either holds:
+
+- the gate reports a failure reason (any non-empty `reasons`);
+- the client refuses to run for any reason (gate precondition failure,
+  missing credential source, import-only allowlist violation, or an
+  unexpected row delta).
+
+There is no partial-promotion state and no retry until the specific reported
+reason has been addressed.
+
+### Evidence capture checklist
+
+Capture this for every activation/deactivation attempt:
+
+- [ ] gate result code and reasons (`canary_settings_active` /
+      `canary_settings_inactive`, or `settings_gate_failed` with its
+      `reasons` tuple);
+- [ ] the fingerprinted client log line — `sha256(client_request_id)[:12]`,
+      never the raw token;
+- [ ] confirmation of zero external calls (no external template lookup, no
+      network beyond the single approved POST);
+- [ ] confirmation that `EmailMessage.objects.count() == 0` for the run —
+      the import-only client never sends, so this must always be zero; a
+      nonzero count is a firewall breach, not an evidence gap.
+
+Never record: the raw `client_request_id`, the raw user id, or recipient
+data. The evidence file itself follows the existing `SafeDiagnosticLog`
+conventions used elsewhere in this document (external path, `0700`/`0600`,
+atomic rename, re-read before PASS).
+
+### Disposition of canary-created rows
+
+Retention is **not viable**. `ops/td02c_deployment_runner.py:534-538`
+(`_validate_operational_gates`) reads:
+
+```python
+_, jobs, v2, ledger = _django_state()
+if (jobs, v2, ledger) != (0, 0, 0):
+    raise TD02CDeploymentError(phase, "unexpected_active_work")
+```
+
+where `v2 = BulkSend.objects.filter(engine_version="v2").count()` and
+`ledger = BulkSendRecipient.objects.count()`. This check runs before every
+future `preflight-only` and `deploy-only` TD-02C deployment. Any retained
+canary row — even one kept purely "as evidence" — permanently blocks all
+future deployments, not just the next one. Deletion is therefore the only
+viable disposition; the evidence checklist above is the durable record, not
+the rows themselves.
+
+After evidence capture (never before), delete in this order:
+
+1. `BulkSendRecipient` rows created by the run;
+2. the parent `BulkSend` row(s) (`engine_version="v2"`);
+3. the `recipients_file` media artifact under `bulk_recipients/`
+   (`BulkSend.recipients_file` is a `FileField(upload_to="bulk_recipients/")`
+   — deleting the row alone does not remove the file on disk).
+
+Then verify a subsequent operational-gates check reports
+`(jobs, v2, ledger) == (0, 0, 0)` — the same tuple `_validate_operational_gates`
+enforces, confirming deployability is restored.
+
+No `EmailMessage` row exists to dispose of: the import-only client never
+sends. If one appeared for this run, that is a V1/V2 firewall breach to
+escalate, not a disposition item to delete.
+
 ## Phases
 
 ### Preflight â€” before fast-forward
