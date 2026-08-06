@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import subprocess
 import sys
 import time
@@ -62,6 +63,9 @@ ERROR_CODES = {
     "unexpected_row_delta",
     "firewall_breach",
     "disposition_required",
+    "client_module_path_mismatch",
+    "client_module_not_importable_from_checkout",
+    "client_entrypoint_identity_mismatch",
 } | _HTTP_CLIENT_ERROR_CODES
 
 # Matches the --write-out format ops.td02c_authenticated_get_runner.
@@ -354,6 +358,56 @@ def run_canary(
     return 1 if failure else 0
 
 
+def validate_client_module_identity(service_unit: str) -> None:
+    """Prove ``ops.bulk_v2_canary_client`` -- this module, not the reused
+    ``ops.td02c_authenticated_get_runner`` -- is imported from the expected
+    checkout, and that its CLI entrypoint (``main``) resolves to that exact
+    same location.
+
+    ``validate_module_entrypoint`` (reused above, unmodified) is a closure
+    over ``ops.td02c_authenticated_get_runner``'s own
+    ``__package__``/``__spec__``/``__file__`` globals: calling it from here
+    only proves that *other* module, and the ``ops`` package it lives in,
+    are correctly deployed and importable from the discovered checkout. It
+    proves nothing about this module's own identity. This function performs
+    the equivalent proof against this module's own globals, following the
+    same idiom (same exception type, same ``discover_service``/``Runner``
+    lookup for the expected checkout directory).
+    """
+    if __package__ != "ops" or __spec__ is None or __spec__.name != EXPECTED_MODULE:
+        raise RunnerFailure("client_module_not_importable_from_checkout")
+
+    service = discover_service(Runner(), service_unit)
+    working_directory = service.working_directory.resolve(strict=True)
+    resolved_file = Path(__file__).resolve()
+
+    # Sub-requirement 1+4: the resolved __file__ must fall under the
+    # discovered checkout's working_directory -- not merely "is a module
+    # with this name importable somewhere on sys.path." A same-named module
+    # importable from a PYTHONPATH-injected duplicate elsewhere resolves
+    # outside working_directory and is rejected here.
+    try:
+        resolved_file.relative_to(working_directory)
+    except ValueError:
+        raise RunnerFailure("client_module_not_importable_from_checkout") from None
+
+    # Sub-requirement 2: not just "somewhere under the checkout" -- the
+    # loaded file must be exactly the expected one.
+    expected_file = (working_directory / "ops" / "bulk_v2_canary_client.py").resolve()
+    if resolved_file != expected_file:
+        raise RunnerFailure("client_module_path_mismatch")
+
+    # Sub-requirement 3: main is reachable and not shadowed by some other
+    # module's main -- its defining file must match the same identity just
+    # proven above.
+    try:
+        entrypoint_file = Path(inspect.getfile(main)).resolve()
+    except TypeError:
+        raise RunnerFailure("client_entrypoint_identity_mismatch") from None
+    if entrypoint_file != expected_file:
+        raise RunnerFailure("client_entrypoint_identity_mismatch")
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--service-unit", default="django.service")
@@ -384,6 +438,19 @@ def main(argv: Sequence[str] | None = None) -> int:
         log.emit(StageDiagnostic("entrypoint_validated", "FAIL", 1, time.monotonic() - started, classification))
         return 1
     log.emit(StageDiagnostic("entrypoint_validated", "PASS", 0, time.monotonic() - started))
+
+    started = time.monotonic()
+    try:
+        # Runs alongside, not in place of, validate_module_entrypoint above:
+        # that call proves the ops package/td02c_authenticated_get_runner
+        # are correctly deployed; this proves this module (and its own
+        # main entrypoint) resolve to that same expected checkout.
+        validate_client_module_identity(args.service_unit)
+    except (DeploymentError, OSError, RunnerFailure, subprocess.SubprocessError) as exc:
+        classification = str(exc).split(":", 1)[0]
+        log.emit(StageDiagnostic("client_module_identity_validated", "FAIL", 1, time.monotonic() - started, classification))
+        return 1
+    log.emit(StageDiagnostic("client_module_identity_validated", "PASS", 0, time.monotonic() - started))
 
     profile = CanaryProfile(
         request_id=args.request_id,

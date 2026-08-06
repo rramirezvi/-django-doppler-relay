@@ -30,6 +30,7 @@ from ops.bulk_v2_canary_client import (
     _execute_canary_post,
     main,
     run_canary,
+    validate_client_module_identity,
 )
 
 
@@ -561,6 +562,89 @@ class RunCanaryOrchestrationTests(unittest.TestCase):
         self.assertFalse(hasattr(module, "settings"))
 
 
+class ClientModuleIdentityTests(unittest.TestCase):
+    """Reviewer-mandated fix: ``validate_module_entrypoint`` (reused in
+    ``main()`` above) is a closure over
+    ``ops.td02c_authenticated_get_runner``'s own
+    ``__package__``/``__spec__``/``__file__`` globals -- calling it from
+    this module only proves *that* module is correctly deployed and
+    importable from the expected checkout, not that
+    ``ops.bulk_v2_canary_client`` itself is. ``validate_client_module_identity``
+    performs the equivalent proof using this module's own identity globals,
+    so it is exercised directly here (no POSIX/``pwd`` dependency, unlike
+    the reused entrypoint check)."""
+
+    def setUp(self):
+        import ops.bulk_v2_canary_client as module
+
+        self.module = module
+        self.actual_file = Path(module.__file__).resolve()
+        # ops/bulk_v2_canary_client.py -> ops/ -> <repo root>
+        self.repo_root = self.actual_file.parent.parent
+
+    def service(self, working_directory: Path) -> SimpleNamespace:
+        return SimpleNamespace(working_directory=working_directory, user="app", unit="django.service")
+
+    def test_happy_path_module_resolves_from_expected_checkout(self):
+        # Sub-requirement 1+2: __file__ sits inside the discovered service's
+        # working_directory, and resolves to exactly
+        # <working_directory>/ops/bulk_v2_canary_client.py.
+        with patch(
+            "ops.bulk_v2_canary_client.discover_service",
+            return_value=self.service(self.repo_root),
+        ):
+            validate_client_module_identity("django.service")  # must not raise
+
+    def test_pythonpath_injected_duplicate_is_rejected(self):
+        # Sub-requirement 4: a same-named module technically importable from
+        # elsewhere on sys.path must be rejected because its resolved file
+        # does not fall under the discovered checkout's working_directory --
+        # not merely "is it importable somewhere."
+        with tempfile.TemporaryDirectory() as elsewhere:
+            with patch(
+                "ops.bulk_v2_canary_client.discover_service",
+                return_value=self.service(Path(elsewhere)),
+            ):
+                with self.assertRaisesRegex(
+                    RunnerFailure, "client_module_not_importable_from_checkout"
+                ):
+                    validate_client_module_identity("django.service")
+
+    def test_wrong_file_identity_is_rejected(self):
+        # Sub-requirement 2: working_directory here is the "ops" directory
+        # itself -- an ancestor of the resolved file, so the containment
+        # check alone would pass -- but the exact expected location
+        # (<working_directory>/ops/bulk_v2_canary_client.py) does not match
+        # the actual resolved file. Proves the check is exact-path identity,
+        # not just "a file with that basename exists somewhere under here."
+        ops_directory = self.actual_file.parent
+        with patch(
+            "ops.bulk_v2_canary_client.discover_service",
+            return_value=self.service(ops_directory),
+        ):
+            with self.assertRaisesRegex(RunnerFailure, "client_module_path_mismatch"):
+                validate_client_module_identity("django.service")
+
+    def test_entrypoint_shadowed_by_different_main_is_rejected(self):
+        # Sub-requirement 3: main is reachable, but its defining file must
+        # match the same resolved identity already proven for the module --
+        # proving main() isn't shadowed by some other module's main.
+        with (
+            patch(
+                "ops.bulk_v2_canary_client.discover_service",
+                return_value=self.service(self.repo_root),
+            ),
+            patch(
+                "ops.bulk_v2_canary_client.inspect.getfile",
+                return_value=str(self.repo_root / "ops" / "other_module.py"),
+            ),
+        ):
+            with self.assertRaisesRegex(
+                RunnerFailure, "client_entrypoint_identity_mismatch"
+            ):
+                validate_client_module_identity("django.service")
+
+
 class ErrorCodesTests(unittest.TestCase):
     def test_new_error_codes_are_present(self):
         for code in (
@@ -570,6 +654,9 @@ class ErrorCodesTests(unittest.TestCase):
             "unexpected_row_delta",
             "firewall_breach",
             "disposition_required",
+            "client_module_path_mismatch",
+            "client_module_not_importable_from_checkout",
+            "client_entrypoint_identity_mismatch",
         ):
             self.assertIn(code, ERROR_CODES)
 
@@ -609,6 +696,35 @@ class MainCliTests(unittest.TestCase):
         runner.assert_not_called()
         self.assertIn("effective_user_mismatch", stream.getvalue())
         self.assertNotIn("not-read", stream.getvalue())
+
+    def test_client_module_identity_failure_prevents_run_canary(self):
+        # Mirrors test_entrypoint_failure_prevents_run_canary's pattern, for
+        # the new, module-local identity check: entrypoint validation passes,
+        # but this module's own identity check fails -- run_canary must not
+        # be reached.
+        stream = io.StringIO()
+        with (
+            patch("ops.bulk_v2_canary_client.validate_module_entrypoint"),
+            patch(
+                "ops.bulk_v2_canary_client.validate_client_module_identity",
+                side_effect=RunnerFailure("client_module_path_mismatch"),
+            ),
+            patch("ops.bulk_v2_canary_client.run_canary") as runner,
+            patch("ops.bulk_v2_canary_client.sys.stdout", stream),
+        ):
+            code = main([
+                "--credential-file", "/tmp/not-read",
+                "--username", "td02c_tech",
+                "--user-id", "42",
+                "--request-id", "fresh-canary-request-id",
+                "--template-id", "td02c-canary-import-only",
+                "--template-name", "TD-02C Canary Import Only",
+                "--subject", "TD-02C Canary Import Only",
+                "--csv-path", "/tmp/canary.csv",
+            ])
+        self.assertEqual(code, 1)
+        runner.assert_not_called()
+        self.assertIn("client_module_path_mismatch", stream.getvalue())
 
 
 if __name__ == "__main__":
