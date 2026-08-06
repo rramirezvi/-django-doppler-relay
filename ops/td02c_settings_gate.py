@@ -34,16 +34,18 @@ def evaluate_effective_settings(
     max_rows: Any,
     allow_external_template_lookup: Any,
     expect_active: bool,
+    expected_request_id: str = CANARY_REQUEST_ID,
+    expected_user_id: int = CANARY_USER_ID,
 ) -> SettingsGateResult:
     """Validate the exact active or inactive operational configuration."""
     reasons: list[str] = []
 
     request_ids, request_error = normalize_allowlist(request_allowlist)
     user_ids, user_error = normalize_allowlist(user_allowlist, integer=True)
-    expected_requests = (CANARY_REQUEST_ID,) if expect_active else ()
-    expected_users = (CANARY_USER_ID,) if expect_active else ()
-    expected_request_raw = CANARY_REQUEST_ID if expect_active else ""
-    expected_user_raw = str(CANARY_USER_ID) if expect_active else ""
+    expected_requests = (expected_request_id,) if expect_active else ()
+    expected_users = (expected_user_id,) if expect_active else ()
+    expected_request_raw = expected_request_id if expect_active else ""
+    expected_user_raw = str(expected_user_id) if expect_active else ""
 
     if request_error or request_ids != expected_requests:
         reasons.append("request_allowlist_mismatch")
@@ -75,7 +77,13 @@ def evaluate_effective_settings(
     )
 
 
-def evaluate_django_settings(settings: Any, *, expect_active: bool) -> SettingsGateResult:
+def evaluate_django_settings(
+    settings: Any,
+    *,
+    expect_active: bool,
+    expected_request_id: str = CANARY_REQUEST_ID,
+    expected_user_id: int = CANARY_USER_ID,
+) -> SettingsGateResult:
     """Read the six effective values from a Django settings object."""
     return evaluate_effective_settings(
         engine_enabled=settings.BULK_PROCESSING_ENGINE_V2,
@@ -87,4 +95,6 @@ def evaluate_django_settings(settings: Any, *, expect_active: bool) -> SettingsG
             settings.BULK_PROCESSING_V2_ALLOW_EXTERNAL_TEMPLATE_LOOKUP
         ),
         expect_active=expect_active,
+        expected_request_id=expected_request_id,
+        expected_user_id=expected_user_id,
     )

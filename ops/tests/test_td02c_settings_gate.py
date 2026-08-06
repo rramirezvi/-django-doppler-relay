@@ -138,6 +138,68 @@ class TD02CSettingsGateTests(unittest.TestCase):
             with self.subTest(change=change):
                 self.assertFalse(self.active(**change).allowed)
 
+    def test_expected_request_id_defaults_to_module_constant(self):
+        result = evaluate_effective_settings(
+            engine_enabled=True,
+            canary_enabled=True,
+            request_allowlist=CANARY_REQUEST_ID,
+            user_allowlist="1",
+            max_rows=20,
+            allow_external_template_lookup=False,
+            expect_active=True,
+        )
+        self.assertTrue(result.allowed)
+
+    def test_expected_request_id_override_changes_match(self):
+        self.assertFalse(
+            self.active(expected_request_id="different-request-id").allowed
+        )
+        self.assertTrue(
+            self.active(
+                request_allowlist="different-request-id",
+                expected_request_id="different-request-id",
+            ).allowed
+        )
+
+    def test_expected_user_id_override_changes_match(self):
+        self.assertFalse(self.active(expected_user_id=2).allowed)
+        self.assertTrue(
+            self.active(user_allowlist="2", expected_user_id=2).allowed
+        )
+
+    def test_expected_request_id_and_user_id_are_keyword_only(self):
+        with self.assertRaises(TypeError):
+            evaluate_effective_settings(
+                True,
+                True,
+                CANARY_REQUEST_ID,
+                "1",
+                20,
+                False,
+                True,
+            )
+
+    def test_django_settings_adapter_accepts_expected_id_overrides(self):
+        settings = SimpleNamespace(
+            BULK_PROCESSING_ENGINE_V2=True,
+            BULK_PROCESSING_V2_CANARY_ENABLED=True,
+            BULK_PROCESSING_V2_CANARY_REQUEST_IDS="override-request-id",
+            BULK_PROCESSING_V2_CANARY_USER_IDS="7",
+            BULK_PROCESSING_V2_CANARY_MAX_ROWS=20,
+            BULK_PROCESSING_V2_ALLOW_EXTERNAL_TEMPLATE_LOOKUP=False,
+        )
+        self.assertFalse(
+            evaluate_django_settings(settings, expect_active=True).allowed
+        )
+        self.assertTrue(
+            evaluate_django_settings(
+                settings,
+                expect_active=True,
+                expected_request_id="override-request-id",
+                expected_user_id=7,
+            ).allowed
+        )
+
     def test_regression_raw_strings_are_not_compared_to_sets(self):
         settings = SimpleNamespace(
             BULK_PROCESSING_ENGINE_V2=True,

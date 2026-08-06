@@ -18,7 +18,7 @@ These two pairs touch different files and have no dependency on each other;
 they can be done in parallel. Both must land before Phase 1, because the new
 client wires one `CanaryProfile` into both.
 
-- [ ] **1. [Test-first, parallel with 3] Extend `ops/tests/test_td02c_settings_gate.py`**
+- [x] **1. [Test-first, parallel with 3] Extend `ops/tests/test_td02c_settings_gate.py`**
       Add cases asserting `evaluate_effective_settings` accepts new
       keyword-only `expected_request_id` / `expected_user_id`, defaulting to
       the current `CANARY_REQUEST_ID` / `CANARY_USER_ID` constants (existing
@@ -27,14 +27,14 @@ client wires one `CanaryProfile` into both.
       Run: `python -m unittest ops.tests.test_td02c_settings_gate -v` → RED
       (new cases fail, module not yet changed).
 
-- [ ] **2. [Impl, after 1] Modify `ops/td02c_settings_gate.py`**
+- [x] **2. [Impl, after 1] Modify `ops/td02c_settings_gate.py`**
       Add keyword-only `expected_request_id: str = CANARY_REQUEST_ID` and
       `expected_user_id: int = CANARY_USER_ID` to `evaluate_effective_settings`
       (threaded through by `evaluate_django_settings`, unchanged signature).
       Run: `python -m unittest ops.tests.test_td02c_settings_gate -v` → GREEN,
       all prior tests unchanged.
 
-- [ ] **3. [Test-first, parallel with 1] Extend `ops/tests/test_td02c_http_client.py`**
+- [x] **3. [Test-first, parallel with 1] Extend `ops/tests/test_td02c_http_client.py`**
       Update the two existing `write_post_curl_config` call sites (currently
       relying on hardcoded TD-02C literals at lines 407–413) to pass explicit
       `client_request_id` / `template_id` / `template_name` / `subject`
@@ -43,7 +43,7 @@ client wires one `CanaryProfile` into both.
       `safe_curl_argv`. Covers design D2.
       Run: `python -m unittest ops.tests.test_td02c_http_client -v` → RED.
 
-- [ ] **4. [Impl, after 3] Modify `ops/td02c_http_client.py`**
+- [x] **4. [Impl, after 3] Modify `ops/td02c_http_client.py`**
       `write_post_curl_config` takes `client_request_id`, `template_id`,
       `template_name`, `subject` as required keyword arguments, replacing the
       hardcoded literals; `send_now=False` / empty `scheduled_at` stay

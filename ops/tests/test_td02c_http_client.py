@@ -196,6 +196,10 @@ class Td02cHttpClientTests(unittest.TestCase):
                 target=target,
                 csrf_token="secret-csrf-token",
                 csv_path=csv_path,
+                client_request_id="td02c-canary-import-v1-20260731",
+                template_id="td02c-canary-import-only",
+                template_name="TD-02C Canary Import Only",
+                subject="TD-02C Canary Import Only",
             )
             argv = safe_curl_argv(config)
             joined = " ".join(argv)
@@ -217,6 +221,10 @@ class Td02cHttpClientTests(unittest.TestCase):
                 target=target,
                 csrf_token="csrf-token",
                 csv_path=csv_path,
+                client_request_id="td02c-canary-import-v1-20260731",
+                template_id="td02c-canary-import-only",
+                template_name="TD-02C Canary Import Only",
+                subject="TD-02C Canary Import Only",
             ).read_text(encoding="utf-8")
 
             self.assertIn('url = "https://canary.example.com/api/bulk-sends/"', config)
@@ -224,6 +232,54 @@ class Td02cHttpClientTests(unittest.TestCase):
             self.assertIn('header = "Host: canary.example.com"', config)
             self.assertIn('header = "Origin: https://canary.example.com"', config)
             self.assertIn('header = "Referer: https://canary.example.com/app/"', config)
+
+    def test_post_curl_config_uses_supplied_client_profile_fields(self):
+        with secure_cookie_workspace() as directory:
+            csv_path = directory / "canary.csv"
+            csv_path.write_text("email\nsynthetic@example.invalid\n", encoding="utf-8")
+            target = discover_canary_target(
+                nginx_config("canary.example.com"), "/run/django.sock"
+            )
+            config_path = write_post_curl_config(
+                directory,
+                target=target,
+                csrf_token="csrf-token",
+                csv_path=csv_path,
+                client_request_id="custom-request-id-9",
+                template_id="custom-template-id",
+                template_name="Custom Template Name",
+                subject="Custom Subject Line",
+            )
+            config = config_path.read_text(encoding="utf-8")
+
+            self.assertIn('form = "client_request_id=custom-request-id-9"', config)
+            self.assertIn('form = "template_id=custom-template-id"', config)
+            self.assertIn('form = "template_name=Custom Template Name"', config)
+            self.assertIn('form = "subject=Custom Subject Line"', config)
+            self.assertIn('form = "send_now=False"', config)
+            self.assertIn('form = "scheduled_at="', config)
+            if os.name != "nt":
+                self.assertEqual(stat.S_IMODE(config_path.stat().st_mode), 0o600)
+
+            argv = safe_curl_argv(config_path)
+            joined = " ".join(argv)
+            self.assertNotIn("csrf-token", joined)
+            self.assertNotIn("custom-request-id-9", joined)
+
+    def test_post_curl_config_requires_client_profile_keyword_arguments(self):
+        with secure_cookie_workspace() as directory:
+            csv_path = directory / "canary.csv"
+            csv_path.write_text("email\nsynthetic@example.invalid\n", encoding="utf-8")
+            target = discover_canary_target(
+                nginx_config("canary.example.com"), "/run/django.sock"
+            )
+            with self.assertRaises(TypeError):
+                write_post_curl_config(
+                    directory,
+                    target=target,
+                    csrf_token="csrf-token",
+                    csv_path=csv_path,
+                )
 
     def test_cookie_jar_cleanup_occurs_on_exception(self):
         with self.assertRaisesRegex(RuntimeError, "stop"):

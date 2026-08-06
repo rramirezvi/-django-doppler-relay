@@ -372,6 +372,10 @@ def write_post_curl_config(
     target: NginxTarget,
     csrf_token: str,
     csv_path: Path,
+    client_request_id: str,
+    template_id: str,
+    template_name: str,
+    subject: str,
 ) -> Path:
     """Write secret-bearing curl options to a mode-0600 file, never argv."""
     cookie_jar = directory / "cookies.txt"
@@ -404,10 +408,10 @@ def write_post_curl_config(
         'silent',
         'show-error',
         'form = "engine_version=v2"',
-        'form = "client_request_id=td02c-canary-import-v1-20260731"',
-        'form = "template_id=td02c-canary-import-only"',
-        'form = "template_name=TD-02C Canary Import Only"',
-        'form = "subject=TD-02C Canary Import Only"',
+        f'form = "client_request_id={client_request_id}"',
+        f'form = "template_id={template_id}"',
+        f'form = "template_name={template_name}"',
+        f'form = "subject={subject}"',
         'form = "send_now=False"',
         'form = "scheduled_at="',
         'form = "variables={\\\"name\\\":\\\"name\\\",\\\"amount\\\":\\\"amount\\\",\\\"code\\\":\\\"code\\\",\\\"note\\\":\\\"note\\\"}"',
