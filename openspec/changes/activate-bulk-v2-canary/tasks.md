@@ -52,7 +52,7 @@ client wires one `CanaryProfile` into both.
 
 ## Phase 1 — Canary execution client (depends on Task 2 and Task 4)
 
-- [ ] **5. [Test-first] Write `ops/tests/test_bulk_v2_canary_client.py`**
+- [x] **5. [Test-first] Write `ops/tests/test_bulk_v2_canary_client.py`**
       One test module, all scenarios RED before Task 6. Itemized by spec
       requirement (`bulk-v2-canary-execution` unless noted):
       - Gate-Guarded Execution Refusal: gate pass → proceeds to build/send;
@@ -86,7 +86,7 @@ client wires one `CanaryProfile` into both.
       Run: `python -m unittest ops.tests.test_bulk_v2_canary_client -v` → RED
       (module does not exist yet).
 
-- [ ] **6. [Impl, after 5] Create `ops/bulk_v2_canary_client.py`**
+- [x] **6. [Impl, after 5] Create `ops/bulk_v2_canary_client.py`**
       Composition layer only (design's stated non-negotiable): reuse
       `CurlOperations`, `DjangoState`, `validate_credential_file`,
       `delete_exact_file`, `validate_module_entrypoint` from
@@ -156,7 +156,7 @@ runbook story.
 
 ## Phase 3 — Final consistency check (sequential, after all of the above)
 
-- [ ] **10. Run the full `ops/` isolated-profile suite**
+- [x] **10. Run the full `ops/` isolated-profile suite**
       `python -m unittest discover -s ops/tests -p "test_*.py" -v`
       Confirm all green, including Phase 0/1 additions, with no regression in
       any other `ops/tests/test_*.py` module. Record the pass count against
@@ -166,11 +166,11 @@ runbook story.
       it as part of this change unless the count increase is itself the
       change being reviewed in that commit.
 
-- [ ] **11. Static checks per `ops/README.md`'s "Local validation" section**
+- [x] **11. Static checks per `ops/README.md`'s "Local validation" section**
       `python -m py_compile ops/bulk_v2_canary_client.py ops/td02c_http_client.py ops/td02c_settings_gate.py`
       `git diff --check`
 
-- [ ] **12. Confirm scope containment**
+- [x] **12. Confirm scope containment**
       `git diff --stat -- relay/ config/settings.py` must return empty,
       matching the proposal's affected-areas table (`relay/`,
       `config/settings.py` — Unchanged) and design's explicit non-negotiable
