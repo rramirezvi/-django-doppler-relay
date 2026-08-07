@@ -824,6 +824,31 @@ def classify_restart_requirement(changed_files: list[str]) -> str:
     return "web_runtime_required"
 
 
+_DJANGO_SERVICE_UNIT = "django.service"
+_DJANGO_SERVICE_RESTART_SUDO_ARGV = (
+    "/usr/bin/sudo", "-n", "/usr/bin/systemctl", "restart", _DJANGO_SERVICE_UNIT,
+)
+
+
+def _restart_unit_argv(unit: str, *, effective_uid: int | None = None) -> list[str]:
+    """Return the exact argv needed to restart ``unit``.
+
+    Unchanged from before this bridge existed, in every case but one:
+    when the current process is not root and ``unit`` is exactly
+    "django.service", route through the single, closed sudoers grant
+    installed at /etc/sudoers.d/td02c-django-restart (NOPASSWD, NOEXEC,
+    fixed arguments only -- see ops/README.md). Root never needs
+    escalation. No unit besides django.service is covered by that grant,
+    so any other unit keeps using the plain, unprivileged systemctl call
+    it always has -- this bridge widens nothing beyond the one unit it
+    names by literal string equality, never a prefix or pattern match.
+    """
+    uid = os.geteuid() if effective_uid is None else effective_uid
+    if unit == _DJANGO_SERVICE_UNIT and uid != 0:
+        return list(_DJANGO_SERVICE_RESTART_SUDO_ARGV)
+    return ["systemctl", "restart", unit]
+
+
 def snapshot_git_state(
     runner: Runner, cwd: Path, remote: str, user: str
 ) -> GitStateSnapshot:
@@ -1589,7 +1614,7 @@ def targeted_rollback(
             if actual_metadata != expected_metadata:
                 raise DeploymentError(f"Runtime metadata changed during rollback: {name}")
     for unit in restarted_units:
-        runner.run(["systemctl", "restart", unit])
+        runner.run(_restart_unit_argv(unit))
 
 
 def execute_deployment(
@@ -1670,10 +1695,10 @@ def execute_deployment(
             if not args.restart_web:
                 raise DeploymentError("--restart-web is required for an executable deployment")
             restarted_units.append(context.service.unit)
-            runner.run(["systemctl", "restart", context.service.unit])
+            runner.run(_restart_unit_argv(context.service.unit))
             for unit in args.restart_unit:
                 restarted_units.append(unit)
-                runner.run(["systemctl", "restart", unit])
+                runner.run(_restart_unit_argv(unit))
 
             for unit in restarted_units:
                 state = runner.run(["systemctl", "is-active", unit]).stdout.strip()

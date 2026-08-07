@@ -54,6 +54,8 @@ from ops.deployment_hardening import (
     build_parser,
     changed_runtime_intersections,
     classify_restart_requirement,
+    _restart_unit_argv,
+    _DJANGO_SERVICE_RESTART_SUDO_ARGV,
     current_main_pid,
     is_ops_only_allowlisted_path,
     delete_temporary_target_ref,
@@ -2727,7 +2729,11 @@ class RollbackRepositoryTests(unittest.TestCase):
         class ExecutionRunner(LocalRunner):
             def run(inner, args, **kwargs):
                 calls.append(list(args))
-                if args[:2] == ["systemctl", "restart"]:
+                is_bare_restart = args[:2] == ["systemctl", "restart"]
+                is_bridged_restart = list(args) == list(
+                    _DJANGO_SERVICE_RESTART_SUDO_ARGV
+                )
+                if is_bare_restart or is_bridged_restart:
                     if not failed_once["value"]:
                         failed_once["value"] = True
                         raise DeploymentError("simulated restart failure")
@@ -2742,7 +2748,16 @@ class RollbackRepositoryTests(unittest.TestCase):
                 execute_deployment(self._execute_args(backup), ExecutionRunner(), context)
         self._assert_runtime_baseline(context)
         self.assertEqual(self._git("rev-parse", "HEAD").stdout.strip(), self.old)
-        restarts = [call[2] for call in calls if call[:2] == ["systemctl", "restart"]]
+        # Extract the restarted unit regardless of which of the two argv
+        # shapes was used (bare, or bridged through sudo -n for
+        # django.service specifically -- both are still exactly two
+        # restart attempts of the same one unit, never any other).
+        restarts = [
+            call[2] if call[:2] == ["systemctl", "restart"] else call[4]
+            for call in calls
+            if call[:2] == ["systemctl", "restart"]
+            or list(call) == list(_DJANGO_SERVICE_RESTART_SUDO_ARGV)
+        ]
         self.assertEqual(restarts, ["django.service", "django.service"])
         self.assertNotIn("nginx.service", restarts)
         self.assertNotIn("postgresql.service", restarts)
@@ -2755,7 +2770,9 @@ class RollbackRepositoryTests(unittest.TestCase):
         class ExecutionRunner(LocalRunner):
             def run(inner, args, **kwargs):
                 calls.append(list(args))
-                if args[:2] == ["systemctl", "restart"]:
+                if args[:2] == ["systemctl", "restart"] or list(args) == list(
+                    _DJANGO_SERVICE_RESTART_SUDO_ARGV
+                ):
                     return subprocess.CompletedProcess(args, 0, "", "")
                 if args[:2] == ["systemctl", "is-active"]:
                     return subprocess.CompletedProcess(args, 0, "active\n", "")
@@ -2834,21 +2851,36 @@ class _FakeRestartClassificationRunner(LocalRunner):
     """
 
     def __init__(self, context, *, main_pid=None, forbid_restart=False,
-                 wrong_root_status=None):
+                 wrong_root_status=None, sudo_restart_exit=0):
         self.context = context
         self.main_pid = main_pid
         self.forbid_restart = forbid_restart
         self.wrong_root_status = wrong_root_status
+        self.sudo_restart_exit = sudo_restart_exit
         self.calls = []
 
     def run(self, args, **kwargs):
         self.calls.append(list(args))
         context = self.context
-        if args[:2] == ["systemctl", "restart"]:
+        is_direct_restart = args[:2] == ["systemctl", "restart"]
+        is_sudo_bridge_restart = list(args) == list(
+            _DJANGO_SERVICE_RESTART_SUDO_ARGV
+        )
+        if is_direct_restart or is_sudo_bridge_restart:
             if self.forbid_restart:
                 raise AssertionError(
                     "systemctl restart must never be called on the "
                     "ops_only_no_restart path"
+                )
+            if is_sudo_bridge_restart and self.sudo_restart_exit:
+                # Mirror Runner.run()'s real check=True behavior: a
+                # nonzero exit becomes a DeploymentError, it is never
+                # silently returned as a completed process for the
+                # caller to inspect.
+                raise DeploymentError(
+                    f"command_failed: Command failed ({self.sudo_restart_exit}): "
+                    + " ".join(args)
+                    + "\nsudo: a password is required"
                 )
             return subprocess.CompletedProcess(args, 0, "", "")
         if (
@@ -3089,15 +3121,21 @@ class RestartClassificationExecutionTests(unittest.TestCase):
                     self._execute_args(backup, restart_web=False), runner, context
                 )
 
-    def test_web_runtime_required_diff_still_restarts_unchanged(self):
+    @unittest.skipUnless(os.name == "posix", "POSIX os.geteuid semantics")
+    def test_web_runtime_required_diff_as_root_restarts_directly_unchanged(self):
         # Regression proof: the pre-existing, already-proven restart
-        # contract for a runtime-affecting diff is untouched.
+        # contract for a runtime-affecting diff, when already running as
+        # root, is untouched by the django-restart privilege bridge --
+        # root never needs escalation, so the direct systemctl argv is
+        # exactly what it always was.
         changed_files = ["relay_stub.py"]
         context = self._execution_context(changed_files)
         runner = _FakeRestartClassificationRunner(
             context, main_pid=str(context.service.main_pid),
         )
-        with tempfile.TemporaryDirectory() as backup:
+        with tempfile.TemporaryDirectory() as backup, patch(
+            "ops.deployment_hardening.os.geteuid", return_value=0
+        ):
             result = execute_deployment(
                 self._execute_args(backup, restart_web=True), runner, context
             )
@@ -3108,7 +3146,151 @@ class RestartClassificationExecutionTests(unittest.TestCase):
             [["systemctl", "restart", "django.service"]],
         )
         self.assertEqual(
+            [c for c in runner.calls if list(c) == list(_DJANGO_SERVICE_RESTART_SUDO_ARGV)],
+            [],
+        )
+        self.assertEqual(
             [c for c in runner.calls if c[:2] == ["systemctl", "show"]], []
+        )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX os.geteuid semantics")
+    def test_web_runtime_required_diff_as_non_root_uses_sudo_bridge(self):
+        # The one behavior this bridge actually changes: a non-root
+        # invocation restarting exactly django.service must go through
+        # the closed sudoers grant, with the exact fixed argv, never a
+        # bare unprivileged systemctl call that would just fail.
+        changed_files = ["relay_stub.py"]
+        context = self._execution_context(changed_files)
+        runner = _FakeRestartClassificationRunner(
+            context, main_pid=str(context.service.main_pid),
+        )
+        with tempfile.TemporaryDirectory() as backup, patch(
+            "ops.deployment_hardening.os.geteuid", return_value=1000
+        ):
+            result = execute_deployment(
+                self._execute_args(backup, restart_web=True), runner, context
+            )
+        self.assertEqual(result["restart_classification"], "web_runtime_required")
+        self.assertEqual(result["restarted_units"], ["django.service"])
+        self.assertEqual(
+            [c for c in runner.calls if list(c) == list(_DJANGO_SERVICE_RESTART_SUDO_ARGV)],
+            [list(_DJANGO_SERVICE_RESTART_SUDO_ARGV)],
+        )
+        self.assertEqual(
+            [c for c in runner.calls if c[:2] == ["systemctl", "restart"]], []
+        )
+        self.assertEqual(
+            list(_DJANGO_SERVICE_RESTART_SUDO_ARGV),
+            ["/usr/bin/sudo", "-n", "/usr/bin/systemctl", "restart", "django.service"],
+        )
+
+    @unittest.skipUnless(os.name == "posix", "POSIX os.geteuid semantics")
+    def test_sudo_bridge_rejected_aborts_deployment_and_rolls_back(self):
+        # sudo -n failing (no password available, no NOPASSWD rule
+        # installed yet, etc.) must fail the deployment closed. The
+        # pre-existing, unmodified rollback then runs as it always does:
+        # git-level restoration (asserted below via HEAD) completes
+        # first and independently of the service; only its own trailing
+        # restart-back attempt hits the identical permission problem,
+        # which is why this is classified ROLLBACK_INCOMPLETE rather
+        # than ROLLBACK_COMPLETED -- an honest signal that the code was
+        # reverted but the running service could not be confirmed to
+        # match it, exactly the case an operator must know about. Both
+        # attempts (the original restart and rollback's restart-back)
+        # use -n -- neither ever falls back to an interactive prompt or
+        # drops the flag.
+        changed_files = ["relay_stub.py"]
+        context = self._execution_context(changed_files)
+        runner = _FakeRestartClassificationRunner(
+            context, main_pid=str(context.service.main_pid), sudo_restart_exit=1,
+        )
+        with tempfile.TemporaryDirectory() as backup, patch(
+            "ops.deployment_hardening.os.geteuid", return_value=1000
+        ):
+            with self.assertRaisesRegex(
+                DeploymentError, "DEPLOYMENT_FAILED; ROLLBACK_INCOMPLETE"
+            ):
+                execute_deployment(
+                    self._execute_args(backup, restart_web=True), runner, context
+                )
+        self.assertEqual(
+            self._git("rev-parse", "HEAD").stdout.strip(), self.old,
+            "git-level rollback must complete even when the service "
+            "restart-back cannot be verified",
+        )
+        sudo_calls = [
+            c for c in runner.calls if list(c) == list(_DJANGO_SERVICE_RESTART_SUDO_ARGV)
+        ]
+        self.assertEqual(
+            len(sudo_calls), 2,
+            "exactly the original attempt plus rollback's own restart-back "
+            "-- never more, and every one of them carries -n",
+        )
+
+
+class DjangoRestartPrivilegeBridgeArgvTests(unittest.TestCase):
+    """Pure, injectable coverage for _restart_unit_argv, independent of
+    execute_deployment -- the source of truth for exactly which argv gets
+    built for which (unit, effective_uid) combination."""
+
+    def test_non_root_django_service_uses_sudo_bridge(self):
+        argv = _restart_unit_argv("django.service", effective_uid=1000)
+        self.assertEqual(
+            argv,
+            ["/usr/bin/sudo", "-n", "/usr/bin/systemctl", "restart", "django.service"],
+        )
+
+    def test_root_django_service_uses_direct_argv_unchanged(self):
+        argv = _restart_unit_argv("django.service", effective_uid=0)
+        self.assertEqual(argv, ["systemctl", "restart", "django.service"])
+
+    def test_non_root_other_unit_is_not_bridged(self):
+        # The bridge names exactly one unit; nothing else widens.
+        argv = _restart_unit_argv("doppler-background-jobs.service", effective_uid=1000)
+        self.assertEqual(
+            argv, ["systemctl", "restart", "doppler-background-jobs.service"]
+        )
+
+    def test_root_other_unit_uses_direct_argv(self):
+        argv = _restart_unit_argv("nginx.service", effective_uid=0)
+        self.assertEqual(argv, ["systemctl", "restart", "nginx.service"])
+
+    def test_sudo_bridge_argv_has_exactly_five_fixed_elements(self):
+        # Proves no extra argument can ever be appended by this function:
+        # the tuple is a fixed literal, never built by concatenation with
+        # caller-supplied data beyond the unit-name equality check above.
+        argv = _restart_unit_argv("django.service", effective_uid=1000)
+        self.assertEqual(len(argv), 5)
+        self.assertEqual(
+            argv, list(_DJANGO_SERVICE_RESTART_SUDO_ARGV)
+        )
+
+    def test_sudo_bridge_argv_uses_only_absolute_paths(self):
+        argv = _restart_unit_argv("django.service", effective_uid=1000)
+        self.assertTrue(argv[0].startswith("/"))
+        self.assertTrue(argv[2].startswith("/"))
+
+    def test_sudo_bridge_argv_is_a_plain_list_never_a_shell_string(self):
+        # Runner.run always calls subprocess.run(..., shell=False); this
+        # asserts the argv this function returns is shaped for that
+        # calling convention -- a list of discrete tokens, not one string
+        # that could be misinterpreted if shell=True were ever introduced.
+        argv = _restart_unit_argv("django.service", effective_uid=1000)
+        self.assertIsInstance(argv, list)
+        for token in argv:
+            self.assertIsInstance(token, str)
+            self.assertNotIn(" ", token)
+
+    @unittest.skipUnless(os.name == "posix", "POSIX os.geteuid semantics")
+    def test_default_effective_uid_reads_os_geteuid(self):
+        with patch("ops.deployment_hardening.os.geteuid", return_value=0):
+            argv = _restart_unit_argv("django.service")
+        self.assertEqual(argv, ["systemctl", "restart", "django.service"])
+        with patch("ops.deployment_hardening.os.geteuid", return_value=1000):
+            argv = _restart_unit_argv("django.service")
+        self.assertEqual(
+            argv,
+            ["/usr/bin/sudo", "-n", "/usr/bin/systemctl", "restart", "django.service"],
         )
 
 
