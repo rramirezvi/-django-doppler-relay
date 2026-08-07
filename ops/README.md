@@ -356,8 +356,9 @@ Post-update performs:
 
 Before deciding whether to restart anything, `execute_deployment` classifies
 the deployment's changed files with `classify_restart_requirement`. A diff
-whose files are all under `ops/` and/or `openspec/changes/` classifies as
-`ops_only_no_restart`: `--restart-web` is not required, and no
+whose files are all under `ops/` and/or `openspec/changes/`, and/or are
+exactly the one-time `sdd-init` scaffold file `openspec/config.yaml`,
+classifies as `ops_only_no_restart`: `--restart-web` is not required, and no
 `systemctl restart` is ever issued. Instead the procedure proves the web
 unit's `MainPID` is unchanged since preflight, the unit is still `active`,
 and every changed `ops/` module still imports cleanly as the service user

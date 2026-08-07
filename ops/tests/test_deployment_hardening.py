@@ -1775,6 +1775,73 @@ class RestartClassificationTests(unittest.TestCase):
         parameters = list(inspect.signature(classify_restart_requirement).parameters)
         self.assertEqual(parameters, ["changed_files"])
 
+    def test_ops_and_exact_openspec_config_yaml_classify_no_restart(self):
+        # openspec/config.yaml is a one-time sdd-init scaffold file that
+        # lives at the openspec/ root, outside openspec/changes/. It is
+        # allowlisted as an exact path, not a prefix.
+        self.assertEqual(
+            classify_restart_requirement(
+                [
+                    "ops/deployment_hardening.py",
+                    "openspec/changes/activate-bulk-v2-canary/tasks.md",
+                    "openspec/config.yaml",
+                ]
+            ),
+            "ops_only_no_restart",
+        )
+
+    def test_openspec_root_paths_other_than_exact_config_yaml_fail_closed(self):
+        # Fail-closed for every other path under openspec/ that isn't
+        # already covered by openspec/changes/ or the exact
+        # openspec/config.yaml allowlist entry. Includes a near-miss case
+        # (a filename that merely starts with "openspec/config" but is not
+        # the literal string) to prove this is exact-match, not a prefix
+        # match.
+        for changed in (
+            ["openspec/specs/foo.md"],
+            ["openspec/other-root-file.yaml"],
+            ["openspec/config.yaml.bak"],
+            ["openspec/config.yaml.d/foo"],
+        ):
+            with self.subTest(changed=changed):
+                self.assertEqual(
+                    classify_restart_requirement(changed),
+                    "web_runtime_required",
+                )
+
+
+class RestartClassificationRealDeploymentAcceptanceTests(unittest.TestCase):
+    def test_activate_bulk_v2_canary_deployment_range_classifies_no_restart(self):
+        # The real 16-file changed-files list from the
+        # activate-bulk-v2-canary deployment range (commits 8212a4e..
+        # 11926ea) that surfaced this bug: openspec/config.yaml matched
+        # neither allowlist prefix and forced the entire range to
+        # web_runtime_required despite every other file being legitimately
+        # ops/** or openspec/changes/**.
+        changed_files = [
+            "openspec/changes/activate-bulk-v2-canary/design.md",
+            "openspec/changes/activate-bulk-v2-canary/proposal.md",
+            "openspec/changes/activate-bulk-v2-canary/specs/bulk-v2-canary-activation/spec.md",
+            "openspec/changes/activate-bulk-v2-canary/specs/bulk-v2-canary-execution/spec.md",
+            "openspec/changes/activate-bulk-v2-canary/tasks.md",
+            "openspec/changes/archive/.gitkeep",
+            "openspec/config.yaml",
+            "ops/README.md",
+            "ops/bulk_v2_canary_client.py",
+            "ops/deployment_hardening.py",
+            "ops/td02c_http_client.py",
+            "ops/td02c_settings_gate.py",
+            "ops/tests/test_bulk_v2_canary_client.py",
+            "ops/tests/test_deployment_hardening.py",
+            "ops/tests/test_td02c_http_client.py",
+            "ops/tests/test_td02c_settings_gate.py",
+        ]
+        self.assertEqual(len(changed_files), 16)
+        self.assertEqual(
+            classify_restart_requirement(changed_files),
+            "ops_only_no_restart",
+        )
+
 
 class RecordingRunner:
     def __init__(self, output="__DEPLOY_SMOKE__403", returncode=0):
