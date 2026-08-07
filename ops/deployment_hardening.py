@@ -788,29 +788,38 @@ NO_RESTART_ALLOWLIST_PREFIXES = ("ops/", "openspec/changes/")
 NO_RESTART_ALLOWLIST_EXACT_PATHS = frozenset({"openspec/config.yaml"})
 
 
+def is_ops_only_allowlisted_path(name: str) -> bool:
+    """Single source of truth for the ops-only authorized-path surface.
+
+    A path is in scope only when it starts with an allowlisted prefix
+    (``NO_RESTART_ALLOWLIST_PREFIXES``) or is exactly equal to one of the
+    allowlisted exact paths (``NO_RESTART_ALLOWLIST_EXACT_PATHS`` -- string
+    equality only, never a prefix match, so e.g. ``openspec/config.yaml.bak``
+    still fails closed). Both ``classify_restart_requirement`` (restart-skip
+    classification) and ``_validate_bootstrap_existing_paths``
+    (--bootstrap-existing-component scope validation) call this exact
+    function so the two policies can never diverge again. No parameter,
+    flag, or override of any kind may widen this surface.
+    """
+    return name.startswith(NO_RESTART_ALLOWLIST_PREFIXES) or name in NO_RESTART_ALLOWLIST_EXACT_PATHS
+
+
 def classify_restart_requirement(changed_files: list[str]) -> str:
     """Classify whether a deployment's changed files can possibly affect the
     running web process, returning exactly one of two literal strings.
 
     Returns ``"ops_only_no_restart"`` only when ``changed_files`` is
-    non-empty and every entry either starts with an allowlisted prefix
-    (``NO_RESTART_ALLOWLIST_PREFIXES``) or is exactly equal to one of the
-    allowlisted exact paths (``NO_RESTART_ALLOWLIST_EXACT_PATHS`` -- string
-    equality only, never a prefix match, so e.g. ``openspec/config.yaml.bak``
-    still fails closed). Otherwise returns ``"web_runtime_required"`` --
-    fail-closed, including for an empty list: an empty diff is not evidence
-    of anything and must not skip the restart. There is no third
-    "ambiguous" outcome and no parameter of any kind that can flip either
-    result; this function's return value is the single source of truth and
-    nothing downstream may override it.
+    non-empty and every entry passes ``is_ops_only_allowlisted_path``.
+    Otherwise returns ``"web_runtime_required"`` -- fail-closed, including
+    for an empty list: an empty diff is not evidence of anything and must
+    not skip the restart. There is no third "ambiguous" outcome and no
+    parameter of any kind that can flip either result; this function's
+    return value is the single source of truth and nothing downstream may
+    override it.
     """
     if not changed_files:
         return "web_runtime_required"
-    if all(
-        name.startswith(NO_RESTART_ALLOWLIST_PREFIXES)
-        or name in NO_RESTART_ALLOWLIST_EXACT_PATHS
-        for name in changed_files
-    ):
+    if all(is_ops_only_allowlisted_path(name) for name in changed_files):
         return "ops_only_no_restart"
     return "web_runtime_required"
 
@@ -1982,7 +1991,7 @@ def validate_bootstrap_post_merge(
     return head
 
 
-_BOOTSTRAP_EXISTING_PATH = re.compile(r"ops/[A-Za-z0-9_][A-Za-z0-9_./-]*")
+_SAFE_PATH_CHARACTERS = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*")
 
 
 def _validate_bootstrap_existing_paths(authorized_paths: tuple[str, ...]) -> None:
@@ -1993,7 +2002,8 @@ def _validate_bootstrap_existing_paths(authorized_paths: tuple[str, ...]) -> Non
     seen: set[str] = set()
     for path in authorized_paths:
         if (
-            not _BOOTSTRAP_EXISTING_PATH.fullmatch(path)
+            not _SAFE_PATH_CHARACTERS.fullmatch(path)
+            or not is_ops_only_allowlisted_path(path)
             or ".." in path.split("/")
             or path in seen
         ):

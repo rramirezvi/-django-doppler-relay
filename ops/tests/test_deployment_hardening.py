@@ -47,6 +47,7 @@ from ops.deployment_hardening import (
     Runner,
     ServiceMetadata,
     _resolve_git_binary,
+    _validate_bootstrap_existing_paths,
     acquire_target_object,
     bootstrap_existing_component_deployment,
     bootstrap_module_deployment,
@@ -54,6 +55,7 @@ from ops.deployment_hardening import (
     changed_runtime_intersections,
     classify_restart_requirement,
     current_main_pid,
+    is_ops_only_allowlisted_path,
     delete_temporary_target_ref,
     deployment_plan,
     discover_and_validate_nginx,
@@ -1841,6 +1843,128 @@ class RestartClassificationRealDeploymentAcceptanceTests(unittest.TestCase):
             classify_restart_requirement(changed_files),
             "ops_only_no_restart",
         )
+
+
+class SharedAllowlistPredicateTests(unittest.TestCase):
+    """Proves classify_restart_requirement and
+    _validate_bootstrap_existing_paths are defined in terms of the exact
+    same underlying predicate (is_ops_only_allowlisted_path), so a
+    regression between the two policies is structurally impossible rather
+    than merely coincidentally passing both today."""
+
+    ACCEPTED_REPRESENTATIVE_PATHS = (
+        "ops/deployment_hardening.py",
+        "openspec/changes/activate-bulk-v2-canary/tasks.md",
+        "openspec/config.yaml",
+    )
+    REJECTED_REPRESENTATIVE_PATHS = (
+        "openspec/config.yaml.bak",
+        "openspec/specs/anything.md",
+        "relay/anything.py",
+        "config/anything.py",
+    )
+
+    def test_both_entry_points_accept_the_same_paths(self):
+        for path in self.ACCEPTED_REPRESENTATIVE_PATHS:
+            with self.subTest(path=path):
+                self.assertTrue(is_ops_only_allowlisted_path(path))
+                self.assertEqual(
+                    classify_restart_requirement([path]), "ops_only_no_restart"
+                )
+                _validate_bootstrap_existing_paths((path,))  # must not raise
+
+    def test_both_entry_points_reject_the_same_paths(self):
+        for path in self.REJECTED_REPRESENTATIVE_PATHS:
+            with self.subTest(path=path):
+                self.assertFalse(is_ops_only_allowlisted_path(path))
+                self.assertEqual(
+                    classify_restart_requirement([path]), "web_runtime_required"
+                )
+                with self.assertRaisesRegex(DeploymentError, "Unsafe or duplicated"):
+                    _validate_bootstrap_existing_paths((path,))
+
+
+class ValidateBootstrapExistingPathsTests(unittest.TestCase):
+    """Unit-level coverage of
+    ops.deployment_hardening._validate_bootstrap_existing_paths, the static
+    shape/scope gate for --bootstrap-existing-component authorized_paths.
+    Complements BootstrapExistingComponentTests, which exercises the same
+    gate indirectly through the full bootstrap_existing_component_deployment
+    flow."""
+
+    def test_ops_only_paths_are_accepted(self):
+        _validate_bootstrap_existing_paths((
+            "ops/deployment_hardening.py", "ops/bulk_v2_canary_client.py",
+        ))  # must not raise
+
+    def test_ops_and_openspec_changes_paths_are_accepted(self):
+        _validate_bootstrap_existing_paths((
+            "ops/deployment_hardening.py",
+            "openspec/changes/activate-bulk-v2-canary/tasks.md",
+        ))  # must not raise
+
+    def test_ops_and_exact_openspec_config_yaml_are_accepted(self):
+        _validate_bootstrap_existing_paths((
+            "ops/deployment_hardening.py", "openspec/config.yaml",
+        ))  # must not raise
+
+    def test_real_activate_bulk_v2_canary_16_path_range_is_accepted(self):
+        # Reproduces the exact authorized-paths list from the aborted
+        # --bootstrap-existing-component attempt against the
+        # activate-bulk-v2-canary deployment range
+        # (8212a4ed4606ac074c16bae8e4cb4e77db5c816a..8ad518600e3c04336
+        # 2c27d9d66c1d656fb8033f6): this is the direct acceptance proof
+        # that the shared-predicate fix closes the real gap the old
+        # ops/-only regex left open, not merely a synthetic scenario.
+        authorized_paths = (
+            "openspec/changes/activate-bulk-v2-canary/design.md",
+            "openspec/changes/activate-bulk-v2-canary/proposal.md",
+            "openspec/changes/activate-bulk-v2-canary/specs/bulk-v2-canary-activation/spec.md",
+            "openspec/changes/activate-bulk-v2-canary/specs/bulk-v2-canary-execution/spec.md",
+            "openspec/changes/activate-bulk-v2-canary/tasks.md",
+            "openspec/changes/archive/.gitkeep",
+            "openspec/config.yaml",
+            "ops/README.md",
+            "ops/bulk_v2_canary_client.py",
+            "ops/deployment_hardening.py",
+            "ops/td02c_http_client.py",
+            "ops/td02c_settings_gate.py",
+            "ops/tests/test_bulk_v2_canary_client.py",
+            "ops/tests/test_deployment_hardening.py",
+            "ops/tests/test_td02c_http_client.py",
+            "ops/tests/test_td02c_settings_gate.py",
+        )
+        self.assertEqual(len(authorized_paths), 16)
+        _validate_bootstrap_existing_paths(authorized_paths)  # must not raise
+
+    def test_near_miss_openspec_config_yaml_bak_is_rejected(self):
+        # Near-miss: proves the exact-path allowlist entry is exact-match,
+        # not a prefix match.
+        with self.assertRaisesRegex(DeploymentError, "Unsafe or duplicated"):
+            _validate_bootstrap_existing_paths(("openspec/config.yaml.bak",))
+
+    def test_openspec_specs_path_is_rejected(self):
+        with self.assertRaisesRegex(DeploymentError, "Unsafe or duplicated"):
+            _validate_bootstrap_existing_paths(("openspec/specs/anything.md",))
+
+    def test_relay_path_is_rejected(self):
+        with self.assertRaisesRegex(DeploymentError, "Unsafe or duplicated"):
+            _validate_bootstrap_existing_paths(("relay/anything.py",))
+
+    def test_config_path_is_rejected(self):
+        with self.assertRaisesRegex(DeploymentError, "Unsafe or duplicated"):
+            _validate_bootstrap_existing_paths(("config/anything.py",))
+
+    def test_unrecognized_top_level_path_is_rejected(self):
+        with self.assertRaisesRegex(DeploymentError, "Unsafe or duplicated"):
+            _validate_bootstrap_existing_paths(("somebrandnewtoplevel/module.py",))
+
+    # Scenario 10 (bootstrap_existing_component_deployment-level:
+    # authorized_paths with one path more/fewer than context.changed_files
+    # is still rejected by the existing exact-match unauthorized/missing checks,
+    # which this fix does not touch) is already covered by
+    # BootstrapExistingComponentTests.test_unauthorized_path_in_range_is_rejected
+    # and BootstrapExistingComponentTests.test_allowlist_wider_than_the_changed_set_is_rejected.
 
 
 class RecordingRunner:
