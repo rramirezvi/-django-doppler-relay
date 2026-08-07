@@ -346,10 +346,29 @@ Post-update performs:
    interpreter, service user and working directory;
 3. structured warning comparison;
 4. migration/static diff gate;
-5. only explicitly authorized restarts;
+5. a restart-requirement classification, then only explicitly authorized
+   restarts when one is required (see below);
 6. objective application-readiness polling;
 7. baseline and security smoke tests;
 8. runtime SHA256 verification.
+
+### Restart-requirement classification
+
+Before deciding whether to restart anything, `execute_deployment` classifies
+the deployment's changed files with `classify_restart_requirement`. A diff
+whose files are all under `ops/` and/or `openspec/changes/` classifies as
+`ops_only_no_restart`: `--restart-web` is not required, and no
+`systemctl restart` is ever issued. Instead the procedure proves the web
+unit's `MainPID` is unchanged since preflight, the unit is still `active`,
+and every changed `ops/` module still imports cleanly as the service user
+(plus a `--help` check for any changed module that defines a CLI
+entrypoint). Any other diff -- including a mix of `ops/`/`openspec/changes/`
+with any other path, or an empty changed-files list -- classifies as
+`web_runtime_required` and keeps exactly the restart-and-verify behavior
+described above; there is no way to override the classification. Readiness
+polling and smoke tests still run unconditionally in both cases.
+`deployment_plan()` reports `restart_classification` and the resulting
+`restart_units` before any execution.
 
 ## Application readiness
 

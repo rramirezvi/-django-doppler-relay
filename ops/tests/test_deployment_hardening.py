@@ -52,7 +52,10 @@ from ops.deployment_hardening import (
     bootstrap_module_deployment,
     build_parser,
     changed_runtime_intersections,
+    classify_restart_requirement,
+    current_main_pid,
     delete_temporary_target_ref,
+    deployment_plan,
     discover_and_validate_nginx,
     discover_nginx_target,
     discover_service,
@@ -1716,6 +1719,63 @@ class WarningParsingTests(unittest.TestCase):
         )
 
 
+class RestartClassificationTests(unittest.TestCase):
+    def test_ops_only_changes_classify_no_restart(self):
+        self.assertEqual(
+            classify_restart_requirement(
+                ["ops/deployment_hardening.py", "ops/bulk_v2_canary_client.py"]
+            ),
+            "ops_only_no_restart",
+        )
+
+    def test_ops_and_openspec_changes_mixed_still_classify_no_restart(self):
+        self.assertEqual(
+            classify_restart_requirement(
+                [
+                    "ops/deployment_hardening.py",
+                    "openspec/changes/activate-bulk-v2-canary/tasks.md",
+                    "openspec/changes/activate-bulk-v2-canary/design.md",
+                ]
+            ),
+            "ops_only_no_restart",
+        )
+
+    def test_relay_changes_require_restart(self):
+        self.assertEqual(
+            classify_restart_requirement(["relay/views.py"]),
+            "web_runtime_required",
+        )
+
+    def test_config_changes_require_restart(self):
+        self.assertEqual(
+            classify_restart_requirement(["config/settings.py"]),
+            "web_runtime_required",
+        )
+
+    def test_unrecognized_top_level_path_fails_closed_to_restart_required(self):
+        self.assertEqual(
+            classify_restart_requirement(["somebrandnewtoplevel/module.py"]),
+            "web_runtime_required",
+        )
+
+    def test_mixed_ops_and_relay_requires_restart_all_paths_must_be_allowlisted(self):
+        self.assertEqual(
+            classify_restart_requirement(
+                ["ops/deployment_hardening.py", "relay/views.py"]
+            ),
+            "web_runtime_required",
+        )
+
+    def test_empty_changed_files_fails_closed_to_restart_required(self):
+        self.assertEqual(classify_restart_requirement([]), "web_runtime_required")
+
+    def test_classification_has_no_override_parameter(self):
+        # Scenario 8: nothing besides changed_files can influence the
+        # result -- there is no bypass flag, env var, or kwarg.
+        parameters = list(inspect.signature(classify_restart_requirement).parameters)
+        self.assertEqual(parameters, ["changed_files"])
+
+
 class RecordingRunner:
     def __init__(self, output="__DEPLOY_SMOKE__403", returncode=0):
         self.calls = []
@@ -2569,6 +2629,331 @@ class RollbackRepositoryTests(unittest.TestCase):
                 )
         self.assertEqual(restart_calls, [])
         self.assertEqual(self._git("rev-parse", "HEAD").stdout.strip(), self.old)
+
+
+class _FakeRestartClassificationRunner(LocalRunner):
+    """Shared fake for restart-classification execution tests: answers
+    every systemctl/test/curl/python probe execute_deployment needs
+    post-merge, while recording every call so tests can assert exactly
+    which commands were (or were not) issued.
+
+    ``forbid_restart`` makes any ``systemctl restart`` call fail the test
+    immediately -- used to prove the ops_only_no_restart path never issues
+    one, under any condition, including during its own rollback.
+    """
+
+    def __init__(self, context, *, main_pid=None, forbid_restart=False,
+                 wrong_root_status=None):
+        self.context = context
+        self.main_pid = main_pid
+        self.forbid_restart = forbid_restart
+        self.wrong_root_status = wrong_root_status
+        self.calls = []
+
+    def run(self, args, **kwargs):
+        self.calls.append(list(args))
+        context = self.context
+        if args[:2] == ["systemctl", "restart"]:
+            if self.forbid_restart:
+                raise AssertionError(
+                    "systemctl restart must never be called on the "
+                    "ops_only_no_restart path"
+                )
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if (
+            args[:2] == ["systemctl", "show"]
+            and len(args) >= 4
+            and args[3] == "--property=MainPID"
+        ):
+            return subprocess.CompletedProcess(
+                args, 0, f"MainPID={self.main_pid}\n", ""
+            )
+        if args[:2] == ["systemctl", "is-active"]:
+            return subprocess.CompletedProcess(args, 0, "active\n", "")
+        if args[:2] == ["test", "-S"]:
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if args[:2] == ["test", "-O"]:
+            return subprocess.CompletedProcess(args, 0, "", "")
+        if args and str(args[0]) == str(context.service.python):
+            return subprocess.CompletedProcess(
+                args, 0, "System check identified no issues", ""
+            )
+        if args and args[0] == "curl":
+            url = args[-1]
+            method = args[args.index("--request") + 1]
+            if url.endswith("/relay/send/"):
+                status = "405" if method == "GET" else "403"
+            elif url.endswith("/admin/login/"):
+                status = "200"
+            elif url.endswith("/app/"):
+                status = "302"
+            else:
+                status = self.wrong_root_status or "200"
+            return subprocess.CompletedProcess(
+                args, 0, "__DEPLOY_SMOKE__" + status, ""
+            )
+        return super().run(args, **kwargs)
+
+
+class RestartClassificationExecutionTests(unittest.TestCase):
+    """Integration coverage for classify_restart_requirement wired into
+    execute_deployment: an ops_only_no_restart diff must never call
+    systemctl restart while still completing readiness/smoke checks, and a
+    web_runtime_required diff must keep its existing, already-proven
+    restart contract unchanged."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.repo = Path(self.tmp.name)
+        isolate_git_environment(self, self.repo)
+        self.runner = LocalRunner()
+        self._git("init")
+        self._git("config", "user.email", "test@example.invalid")
+        self._git("config", "user.name", "Test")
+        self._git("config", "core.autocrlf", "false")
+        (self.repo / "runtime.txt").write_text("runtime base\n")
+        (self.repo / "relay_stub.py").write_text("old\n")
+        ops_dir = self.repo / "ops"
+        ops_dir.mkdir()
+        (ops_dir / "__init__.py").write_text("")
+        (ops_dir / "sample_module.py").write_text("value = 1\n")
+        tests_dir = ops_dir / "tests"
+        tests_dir.mkdir()
+        (tests_dir / "test_sample.py").write_text("value = 1\n")
+        self._git("add", ".")
+        self._git("commit", "-m", "old")
+        self.old = self._git("rev-parse", "HEAD").stdout.strip()
+
+        (ops_dir / "sample_module.py").write_text("value = 2\n")
+        (ops_dir / "cli_module.py").write_text(
+            "def main(argv=None):\n"
+            "    return 0\n"
+            "\n\n"
+            'if __name__ == "__main__":\n'
+            "    raise SystemExit(main())\n"
+        )
+        (tests_dir / "test_sample.py").write_text("value = 2\n")
+        (self.repo / "relay_stub.py").write_text("new\n")
+        self._git("add", "-A")
+        self._git("commit", "-m", "target")
+        self.target = self._git("rev-parse", "HEAD").stdout.strip()
+
+        (self.repo / "runtime.txt").write_text("runtime local\n")
+        self.runtime_hash = __import__("hashlib").sha256(
+            (self.repo / "runtime.txt").read_bytes()
+        ).hexdigest()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _git(self, *args):
+        return subprocess.run(
+            ["git", *args], cwd=self.repo, text=True, capture_output=True, check=True
+        )
+
+    def _execution_context(self, changed_files, main_pid=4242):
+        branch = self._git("branch", "--show-current").stdout.strip()
+        self._git("restore", "--source", self.old, "--staged", "--worktree",
+                  "--", *changed_files)
+        self._git("update-ref", f"refs/heads/{branch}", self.old, self.target)
+        self._git("update-ref", f"refs/remotes/origin/{branch}", self.target)
+        wrapper = self.repo / "python3"
+        wrapper.write_text("binary")
+        fragment = self.repo / "django.service"
+        fragment.write_text("[Service]\n")
+        service = ServiceMetadata(
+            unit="django.service", working_directory=self.repo,
+            exec_start_path=wrapper, exec_start_raw="--bind unix:/run/app.sock",
+            python=wrapper, user="svc", group="svc", main_pid=main_pid,
+            fragment_path=fragment, environment_files=(),
+        )
+        return DeploymentContext(
+            service=service,
+            nginx=NginxTarget(
+                "x", 443, str(Path.cwd().anchor + "run/django/django.sock"), None
+            ),
+            old_sha=self.old, target_sha=self.target, repository=self.repo,
+            branch=branch, remote="origin", changed_files=changed_files,
+            runtime_files=["runtime.txt"], intersections=[],
+            runtime_hashes={"runtime.txt": self.runtime_hash},
+            baseline_smoke={
+                "/": {"method": "GET", "path": "/", "status": "200"},
+                "/app/": {"method": "GET", "path": "/app/", "status": "302"},
+                "/admin/login/": {
+                    "method": "GET", "path": "/admin/login/", "status": "200"
+                },
+            },
+            baseline_warning_codes=set(),
+        )
+
+    def _execute_args(self, backup_root, *, restart_web=False):
+        return Namespace(
+            backup_root=str(backup_root),
+            branch=self._git("branch", "--show-current").stdout.strip(),
+            allowed_warning=[], restart_web=restart_web, restart_unit=[],
+            readiness_timeout=5.0, readiness_poll_interval=0.01,
+        )
+
+    # -- scenario 1/2 style: pure classification is exercised directly in
+    # RestartClassificationTests; these prove execute_deployment obeys it.
+
+    def test_ops_only_diff_never_restarts_and_completes_readiness_and_smoke(self):
+        changed_files = ["ops/sample_module.py"]
+        context = self._execution_context(changed_files)
+        runner = _FakeRestartClassificationRunner(
+            context, main_pid=str(context.service.main_pid), forbid_restart=True,
+        )
+        with tempfile.TemporaryDirectory() as backup:
+            result = execute_deployment(self._execute_args(backup), runner, context)
+        self.assertEqual(result["restart_classification"], "ops_only_no_restart")
+        self.assertEqual(result["restarted_units"], [])
+        self.assertTrue(result["readiness"]["ready"])
+        self.assertEqual(
+            [c for c in runner.calls if c[:2] == ["systemctl", "restart"]], []
+        )
+
+    def test_ops_only_diff_ignores_restart_web_flag_true(self):
+        # Scenario 8: passing --restart-web has zero effect on the
+        # classification result or on whether a restart happens.
+        changed_files = ["ops/sample_module.py"]
+        context = self._execution_context(changed_files)
+        runner = _FakeRestartClassificationRunner(
+            context, main_pid=str(context.service.main_pid), forbid_restart=True,
+        )
+        with tempfile.TemporaryDirectory() as backup:
+            result = execute_deployment(
+                self._execute_args(backup, restart_web=True), runner, context
+            )
+        self.assertEqual(result["restart_classification"], "ops_only_no_restart")
+        self.assertEqual(result["restarted_units"], [])
+
+    def test_ops_only_diff_verifies_changed_modules_import_and_cli_help(self):
+        changed_files = [
+            "ops/sample_module.py", "ops/cli_module.py", "ops/tests/test_sample.py",
+        ]
+        context = self._execution_context(changed_files)
+        runner = _FakeRestartClassificationRunner(
+            context, main_pid=str(context.service.main_pid), forbid_restart=True,
+        )
+        with tempfile.TemporaryDirectory() as backup:
+            execute_deployment(self._execute_args(backup), runner, context)
+        python = str(context.service.python)
+        self.assertIn([python, "-c", "import ops.sample_module"], runner.calls)
+        self.assertIn([python, "-c", "import ops.cli_module"], runner.calls)
+        self.assertNotIn(
+            [python, "-c", "import ops.tests.test_sample"], runner.calls
+        )
+        self.assertIn([python, "-m", "ops.cli_module", "--help"], runner.calls)
+        self.assertNotIn(
+            [python, "-m", "ops.sample_module", "--help"], runner.calls
+        )
+
+    def test_unexpected_restart_detected_when_mainpid_changes(self):
+        changed_files = ["ops/sample_module.py"]
+        context = self._execution_context(changed_files, main_pid=4242)
+        runner = _FakeRestartClassificationRunner(
+            context, main_pid="9999", forbid_restart=True,
+        )
+        with tempfile.TemporaryDirectory() as backup:
+            with self.assertRaisesRegex(
+                DeploymentError, "unexpected_restart_detected"
+            ):
+                execute_deployment(self._execute_args(backup), runner, context)
+        self.assertEqual(
+            [c for c in runner.calls if c[:2] == ["systemctl", "restart"]], []
+        )
+        self.assertEqual(self._git("rev-parse", "HEAD").stdout.strip(), self.old)
+
+    def test_late_smoke_failure_after_ops_only_no_restart_rolls_back_without_restart(self):
+        # Scenario 7: targeted_rollback must not assume restarted_units is
+        # non-empty and must not itself attempt a restart that was never
+        # part of an ops-only deployment.
+        changed_files = ["ops/sample_module.py"]
+        context = self._execution_context(changed_files)
+        runner = _FakeRestartClassificationRunner(
+            context, main_pid=str(context.service.main_pid), forbid_restart=True,
+            wrong_root_status="500",
+        )
+        with tempfile.TemporaryDirectory() as backup:
+            with self.assertRaisesRegex(
+                DeploymentError, "Smoke baseline changed"
+            ):
+                execute_deployment(self._execute_args(backup), runner, context)
+        self.assertEqual(
+            [c for c in runner.calls if c[:2] == ["systemctl", "restart"]], []
+        )
+        self.assertEqual(self._git("rev-parse", "HEAD").stdout.strip(), self.old)
+
+    def test_web_runtime_required_diff_still_requires_restart_web_flag(self):
+        changed_files = ["relay_stub.py"]
+        context = self._execution_context(changed_files)
+        runner = _FakeRestartClassificationRunner(
+            context, main_pid=str(context.service.main_pid),
+        )
+        with tempfile.TemporaryDirectory() as backup:
+            with self.assertRaisesRegex(
+                DeploymentError, "--restart-web is required"
+            ):
+                execute_deployment(
+                    self._execute_args(backup, restart_web=False), runner, context
+                )
+
+    def test_web_runtime_required_diff_still_restarts_unchanged(self):
+        # Regression proof: the pre-existing, already-proven restart
+        # contract for a runtime-affecting diff is untouched.
+        changed_files = ["relay_stub.py"]
+        context = self._execution_context(changed_files)
+        runner = _FakeRestartClassificationRunner(
+            context, main_pid=str(context.service.main_pid),
+        )
+        with tempfile.TemporaryDirectory() as backup:
+            result = execute_deployment(
+                self._execute_args(backup, restart_web=True), runner, context
+            )
+        self.assertEqual(result["restart_classification"], "web_runtime_required")
+        self.assertEqual(result["restarted_units"], ["django.service"])
+        self.assertEqual(
+            [c for c in runner.calls if c[:2] == ["systemctl", "restart"]],
+            [["systemctl", "restart", "django.service"]],
+        )
+        self.assertEqual(
+            [c for c in runner.calls if c[:2] == ["systemctl", "show"]], []
+        )
+
+
+class DeploymentPlanRestartClassificationTests(unittest.TestCase):
+    def _context(self, changed_files):
+        service = ServiceMetadata(
+            unit="django.service", working_directory=Path("/srv/app"),
+            exec_start_path=Path("/srv/app/python3"), exec_start_raw="",
+            python=Path("/srv/app/python3"), user="svc", group="svc",
+            main_pid=1, fragment_path=Path("/etc/systemd/system/django.service"),
+            environment_files=(),
+        )
+        return DeploymentContext(
+            service=service,
+            nginx=NginxTarget("example.test", 443, "/run/app.sock", None),
+            old_sha="a" * 40, target_sha="b" * 40, repository=Path("/srv/app"),
+            branch="main", remote="origin", changed_files=changed_files,
+            runtime_files=[], intersections=[], runtime_hashes={},
+            baseline_smoke={}, baseline_warning_codes=set(),
+        )
+
+    def test_plan_shows_no_restart_units_for_ops_only_diff_without_flag(self):
+        context = self._context(["ops/deployment_hardening.py"])
+        args = Namespace(execute=False, restart_unit=[])
+        plan = deployment_plan(args, context)
+        self.assertEqual(plan["restart_classification"], "ops_only_no_restart")
+        self.assertEqual(plan["restart_units"], [])
+
+    def test_plan_shows_restart_units_for_web_runtime_diff(self):
+        context = self._context(["relay/views.py"])
+        args = Namespace(execute=False, restart_unit=["celery.service"])
+        plan = deployment_plan(args, context)
+        self.assertEqual(plan["restart_classification"], "web_runtime_required")
+        self.assertEqual(
+            plan["restart_units"], ["django.service", "celery.service"]
+        )
 
 
 class ControlledFetchTests(unittest.TestCase):

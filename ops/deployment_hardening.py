@@ -419,6 +419,16 @@ def discover_service(runner: Runner, unit: str) -> ServiceMetadata:
     )
 
 
+def current_main_pid(runner: Runner, unit: str) -> int:
+    """Re-fetch a unit's current MainPID using the exact ``systemctl show``
+    property pattern ``discover_service`` uses, so callers can prove a unit
+    was never restarted by comparing this value against a previously
+    captured ``ServiceMetadata.main_pid``."""
+    result = runner.run(["systemctl", "show", unit, "--property=MainPID"])
+    values = parse_systemd_show(result.stdout)
+    return int(values.get("MainPID", "0") or "0")
+
+
 def application_bind_from_exec_start(raw: str) -> str:
     match = re.search(r"(?:--bind(?:=|\s+))(?P<bind>unix:)?(?P<path>/[^\s;]+)", raw)
     if not match:
@@ -772,6 +782,29 @@ def changed_runtime_intersections(
     changed_files: list[str], runtime_files: list[str]
 ) -> list[str]:
     return sorted(set(changed_files) & set(runtime_files))
+
+
+NO_RESTART_ALLOWLIST_PREFIXES = ("ops/", "openspec/changes/")
+
+
+def classify_restart_requirement(changed_files: list[str]) -> str:
+    """Classify whether a deployment's changed files can possibly affect the
+    running web process, returning exactly one of two literal strings.
+
+    Returns ``"ops_only_no_restart"`` only when ``changed_files`` is
+    non-empty and every entry starts with an allowlisted prefix
+    (``NO_RESTART_ALLOWLIST_PREFIXES``). Otherwise returns
+    ``"web_runtime_required"`` -- fail-closed, including for an empty list:
+    an empty diff is not evidence of anything and must not skip the
+    restart. There is no third "ambiguous" outcome and no parameter of any
+    kind that can flip either result; this function's return value is the
+    single source of truth and nothing downstream may override it.
+    """
+    if not changed_files:
+        return "web_runtime_required"
+    if all(name.startswith(NO_RESTART_ALLOWLIST_PREFIXES) for name in changed_files):
+        return "ops_only_no_restart"
+    return "web_runtime_required"
 
 
 def snapshot_git_state(
@@ -1190,6 +1223,39 @@ def wait_for_application_ready(
     )
 
 
+def _ops_module_name(name: str) -> str:
+    return name[: -len(".py")].replace("/", ".")
+
+
+def verify_ops_only_changed_modules(
+    runner: Runner, service: ServiceMetadata, changed_files: list[str]
+) -> None:
+    """For an ``ops_only_no_restart`` deployment, prove each changed
+    ``ops/`` Python module still imports cleanly in a clean process as the
+    service user, and that any changed module's CLI entrypoint is still
+    wired, without restarting or executing any real behaviour. Modules
+    under ``ops/tests/`` are excluded -- they are never a CLI entrypoint
+    and never imported by the running web process."""
+    cwd = service.working_directory
+    for name in changed_files:
+        if not name.startswith("ops/") or not name.endswith(".py"):
+            continue
+        if name.startswith("ops/tests/"):
+            continue
+        module = _ops_module_name(name)
+        runner.run(
+            [str(service.python), "-c", f"import {module}"],
+            cwd=cwd, user=service.user,
+        )
+        path = safe_repo_path(cwd, name, must_exist=True)
+        content = path.read_text(encoding="utf-8")
+        if "def main(" in content and '__name__ == "__main__"' in content:
+            runner.run(
+                [str(service.python), "-m", module, "--help"],
+                cwd=cwd, user=service.user,
+            )
+
+
 def preflight(
     args: argparse.Namespace,
     runner: Runner,
@@ -1582,18 +1648,42 @@ def execute_deployment(
                 "Unexpected deploy warning codes: " + ", ".join(sorted(new_codes))
             )
 
-        if not args.restart_web:
-            raise DeploymentError("--restart-web is required for an executable deployment")
-        restarted_units.append(context.service.unit)
-        runner.run(["systemctl", "restart", context.service.unit])
-        for unit in args.restart_unit:
-            restarted_units.append(unit)
-            runner.run(["systemctl", "restart", unit])
+        restart_classification = classify_restart_requirement(context.changed_files)
+        if restart_classification == "web_runtime_required":
+            if not args.restart_web:
+                raise DeploymentError("--restart-web is required for an executable deployment")
+            restarted_units.append(context.service.unit)
+            runner.run(["systemctl", "restart", context.service.unit])
+            for unit in args.restart_unit:
+                restarted_units.append(unit)
+                runner.run(["systemctl", "restart", unit])
 
-        for unit in restarted_units:
-            state = runner.run(["systemctl", "is-active", unit]).stdout.strip()
+            for unit in restarted_units:
+                state = runner.run(["systemctl", "is-active", unit]).stdout.strip()
+                if state != "active":
+                    raise DeploymentError(f"Restarted unit is not active: {unit}")
+        else:
+            # "ops_only_no_restart": the classification -- not --restart-web
+            # -- is authoritative. No systemctl restart is issued here under
+            # any condition, even if the operator passed --restart-web.
+            post_merge_pid = current_main_pid(runner, context.service.unit)
+            if post_merge_pid != context.service.main_pid:
+                raise DeploymentError(
+                    "unexpected_restart_detected: "
+                    f"{context.service.unit} MainPID changed from "
+                    f"{context.service.main_pid} to {post_merge_pid} during an "
+                    "ops-only deployment that must not restart the web service"
+                )
+            state = runner.run(
+                ["systemctl", "is-active", context.service.unit]
+            ).stdout.strip()
             if state != "active":
-                raise DeploymentError(f"Restarted unit is not active: {unit}")
+                raise DeploymentError(
+                    f"Service unit is not active: {context.service.unit}"
+                )
+            verify_ops_only_changed_modules(
+                runner, context.service, context.changed_files
+            )
 
         readiness = wait_for_application_ready(
             runner,
@@ -1625,6 +1715,7 @@ def execute_deployment(
         return {
             "backup": str(backup),
             "head": head,
+            "restart_classification": restart_classification,
             "restarted_units": restarted_units,
             "readiness": readiness,
             "smoke": smoke,
@@ -1653,7 +1744,12 @@ def execute_deployment(
 
 
 def deployment_plan(args: argparse.Namespace, context: DeploymentContext) -> dict[str, object]:
-    restart_units = [context.service.unit, *args.restart_unit] if args.restart_web else []
+    restart_classification = classify_restart_requirement(context.changed_files)
+    restart_units = (
+        [context.service.unit, *args.restart_unit]
+        if restart_classification == "web_runtime_required"
+        else []
+    )
     return {
         "mode": "execute" if args.execute else "read-only",
         "repository": str(context.repository),
@@ -1671,6 +1767,7 @@ def deployment_plan(args: argparse.Namespace, context: DeploymentContext) -> dic
         "vhost": context.nginx.server_name,
         "preflight_readiness": context.preflight_readiness,
         "restart_units": restart_units,
+        "restart_classification": restart_classification,
         "steps": [
             "Preflight: discovery and environment validation",
             "Preflight: current-code manage.py check",
