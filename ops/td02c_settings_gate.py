@@ -9,7 +9,7 @@ values behind normalization.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Sequence
 
 from relay.services.bulk_v2_canary import normalize_allowlist
 
@@ -36,16 +36,26 @@ def evaluate_effective_settings(
     expect_active: bool,
     expected_request_id: str = CANARY_REQUEST_ID,
     expected_user_id: int = CANARY_USER_ID,
+    expected_request_ids: Sequence[str] = (),
+    expected_user_ids: Sequence[int] = (),
 ) -> SettingsGateResult:
     """Validate the exact active or inactive operational configuration."""
     reasons: list[str] = []
 
     request_ids, request_error = normalize_allowlist(request_allowlist)
     user_ids, user_error = normalize_allowlist(user_allowlist, integer=True)
-    expected_requests = (expected_request_id,) if expect_active else ()
-    expected_users = (expected_user_id,) if expect_active else ()
-    expected_request_raw = expected_request_id if expect_active else ""
-    expected_user_raw = str(expected_user_id) if expect_active else ""
+    declared_requests = (
+        tuple(expected_request_ids) if expected_request_ids else (expected_request_id,)
+    )
+    declared_users = (
+        tuple(expected_user_ids) if expected_user_ids else (expected_user_id,)
+    )
+    expected_requests = declared_requests if expect_active else ()
+    expected_users = declared_users if expect_active else ()
+    expected_request_raw = ",".join(declared_requests) if expect_active else ""
+    expected_user_raw = (
+        ",".join(str(user) for user in declared_users) if expect_active else ""
+    )
 
     if request_error or request_ids != expected_requests:
         reasons.append("request_allowlist_mismatch")
@@ -83,6 +93,8 @@ def evaluate_django_settings(
     expect_active: bool,
     expected_request_id: str = CANARY_REQUEST_ID,
     expected_user_id: int = CANARY_USER_ID,
+    expected_request_ids: Sequence[str] = (),
+    expected_user_ids: Sequence[int] = (),
 ) -> SettingsGateResult:
     """Read the six effective values from a Django settings object."""
     return evaluate_effective_settings(
@@ -97,4 +109,6 @@ def evaluate_django_settings(
         expect_active=expect_active,
         expected_request_id=expected_request_id,
         expected_user_id=expected_user_id,
+        expected_request_ids=expected_request_ids,
+        expected_user_ids=expected_user_ids,
     )

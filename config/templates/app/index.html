@@ -255,6 +255,16 @@
       return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
     }
 
+    // Pure, DOM-free: extracted so it can be exercised in isolation.
+    // Standard fragment key=value parsing, URL-decoded via URLSearchParams.
+    // Absent hash, absent key, or an empty value all resolve to "".
+    function parsePilotTokenFromHash(hash) {
+      const fragment = String(hash || "").replace(/^#/, "");
+      if (!fragment) return "";
+      const params = new URLSearchParams(fragment);
+      return params.get("pilot_token") || "";
+    }
+
     function NewBulkForm({onCreated, onCancel, setToast}) {
       const [senders, setSenders] = React.useState([]);
       const [defaultSender, setDefaultSender] = React.useState({label: "Usar correo predeterminado"});
@@ -272,6 +282,7 @@
       const [templateSearch, setTemplateSearch] = React.useState("");
       const [templateOpen, setTemplateOpen] = React.useState(false);
       const [clientRequestId, setClientRequestId] = React.useState(newClientRequestId);
+      const [pilotToken] = React.useState(() => parsePilotTokenFromHash(window.location.hash));
 
       React.useEffect(() => {
         api("/api/senders/").then(data => {
@@ -386,6 +397,8 @@
         }
         submitLock.current = true;
         setSubmitting(true);
+        const pilotTokenActive = v2Available && form.engine_version === "v2" && !!pilotToken;
+        const effectiveClientRequestId = pilotTokenActive ? pilotToken : clientRequestId;
         const fd = new FormData();
         fd.append("template_id", form.template_id);
         fd.append("subject", form.subject);
@@ -394,7 +407,7 @@
         fd.append("scheduled_at", form.scheduled_at || "");
         fd.append("send_now", form.scheduled_at ? "0" : (form.send_now ? "1" : "0"));
         fd.append("engine_version", form.engine_version);
-        fd.append("client_request_id", clientRequestId);
+        fd.append("client_request_id", effectiveClientRequestId);
         fd.append("recipients_file", file);
         try {
           const data = await api("/api/bulk-sends/", {method: "POST", body: fd});
@@ -486,6 +499,9 @@
                 v2Available ? e("option", {value: "v2"}, "V2 - solo importar") : null
               )
             ),
+            (v2Available && form.engine_version === "v2" && pilotToken) ? e("label", null, "Token de piloto",
+              e("input", {readOnly: true, value: pilotToken})
+            ) : null,
             e("label", {className: "full"}, "Asunto",
               e("input", {value: form.subject, onChange: ev => setForm({...form, subject: ev.target.value}), placeholder: "Opcional; puede venir de la plantilla"})
             ),

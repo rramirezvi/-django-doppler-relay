@@ -247,6 +247,311 @@ No `EmailMessage` row exists to dispose of: the import-only client never
 sends. If one appeared for this run, that is a V1/V2 firewall breach to
 escalate, not a disposition item to delete.
 
+## Bulk Processing Engine V2 Stage 1 internal pilot (production)
+
+Stage 1 changes three variables at once relative to the two canary cycles
+above: **many users instead of one**, **real staff identities instead of a
+technical account**, and **a browser instead of a headless client**. It
+reuses the same flags-only activation mechanism, the same settings gate, and
+the same directed-disposition discipline; nothing here introduces a new
+mechanism. `MAX_ROWS` stays `20`, import-only stays absolute, and V1 stays
+the default engine throughout.
+
+This section is written as **instructions for a future authorized operator**
+running Stage 1. Writing this documentation performs none of it: no flag is
+activated, no `.env` is edited, no service is restarted, no production
+system is accessed, and no import is run as part of producing this section.
+Selecting the 3-5 pilot users, distributing tokens, editing production
+`.env`, restarting `django.service`, running the gate against production,
+capturing production evidence, and executing disposition deletes all
+require separate, explicit owner authorization outside this change.
+
+### Cohort and token format
+
+Both allowlist variables are canonical, comma-separated strings with no
+spaces, no trailing comma, no duplicates, and no wildcard characters.
+Canonicality is load-bearing: `ops/td02c_settings_gate.py` compares the raw
+env string with `!=` against an expected literal, so spacing and order
+matter exactly as much as membership.
+
+- `BULK_PROCESSING_V2_CANARY_USER_IDS` — pilot user primary keys, **ascending
+  numeric order**, **3-5 entries**.
+- `BULK_PROCESSING_V2_CANARY_REQUEST_IDS` — one token per planned import,
+  **grouped by user** in the same ascending user order, then **ascending
+  sequence within a user**.
+
+Token shape: `stage1-c<cycle>-u<pk>-<nn>` (for example `stage1-c1-u41-03`),
+subject to:
+
+- no `* ? [ ]`, no `,`, no whitespace;
+- at most 64 characters (`client_request_id` is truncated to 64 by
+  `relay/api.py`; a truncated token would silently fall off the allowlist);
+- unique across the whole list.
+
+**Over-provision 5 tokens per pilot user** at activation time. `client_request_id`
+is the idempotency key, so one token equals exactly one import, permanently —
+adding tokens mid-window requires a `.env` edit plus a `django.service`
+restart. Unused tokens are inert: `evaluate_canary` requires both the
+request-id and the user-id to match, so a spare token authorizes nothing on
+its own.
+
+```
+BULK_PROCESSING_V2_CANARY_USER_IDS=41,52,67
+BULK_PROCESSING_V2_CANARY_REQUEST_IDS=stage1-c1-u41-01,stage1-c1-u41-02,...,stage1-c1-u67-05
+```
+
+**Fail-closed rule, load-bearing for the whole pilot:** a single malformed
+entry in either allowlist (duplicate, empty, wildcard, non-positive, or
+non-canonical spacing/order) poisons the **entire** list, not just the
+malformed entry — `normalize_allowlist` returns `()` and every user then
+fails with `canary_config_invalid`. A typo in one pilot user's token disables
+the whole pilot rather than partially enabling it.
+
+Every pilot user must already satisfy `can_operate_bulk_sends` (`is_active`,
+`is_staff`, `relay.change_bulksend` via the `Operadores UI` group) before
+being added to the allowlist. Allowlist membership is an additional gate on
+top of that, never a substitute — onboarding a pilot user never grants a
+permission they lacked.
+
+### Notice before opening a window
+
+`relay/api.py`'s `capabilities.bulk_processing_v2_create` flag does not
+consult the allowlist — while the pilot window is open, the V2 engine option
+is visible in the UI to **every** `Operadores UI` member, not only pilot
+users. A non-pilot member who selects V2 gets a clean HTTP 409
+(`user_not_allowed`) with **no row created**. Before step 4 of the runbook
+below, notify all `Operadores UI` members that the V2 option will be visible
+but authorized only for the named pilot cohort for the duration of the
+window.
+
+### Activation / deactivation / rollback runbook
+
+**Flags first, always.** `ops/td02c_deployment_runner.py`'s `_django_state()`
+hardcodes `evaluate_django_settings(settings, expect_active=False)` before
+every deployment preflight. While any pilot flag is active, **every** future
+`ops/` deployment fails closed. Step 10 below is never optional and never
+deferred past the window, independent of whether step 11 (disposition) has
+happened yet.
+
+| # | Step | Verification before continuing |
+|---|---|---|
+| 0 | Notify all `Operadores UI` members that V2 will be visible but authorized only for the named pilot cohort | notice sent |
+| 1 | Read effective state | `evaluate_django_settings(settings, expect_active=False)` → `allowed=True` |
+| 2 | Confirm no residue from a prior cycle | `(jobs, v2, ledger) == (0, 0, 0)` |
+| 3 | Compose canonical raw values: `_USER_IDS` ascending; `_REQUEST_IDS` grouped by user, over-provisioned to 5 tokens/user | no spaces, no duplicates, no wildcards, each token ≤ 64 chars |
+| 4 | Apply the `.env` edit (operator): `BULK_PROCESSING_ENGINE_V2=True`, `BULK_PROCESSING_V2_CANARY_ENABLED=True`, both allowlists set. `BULK_PROCESSING_V2_CANARY_MAX_ROWS` stays `20`; `BULK_PROCESSING_V2_ALLOW_EXTERNAL_TEMPLATE_LOOKUP` stays `False` | prior line values recorded verbatim, so rollback is a literal revert |
+| 5 | Restart `django.service` | existing `td02c_worker_gate` pre/post checks + `validate_readiness_layers` PASS |
+| 6 | Prove ON | `evaluate_django_settings(settings, expect_active=True, expected_request_ids=[...], expected_user_ids=[...])` → `allowed=True`, `code="canary_settings_active"` |
+| 7 | Distribute one token per planned import to each pilot user, out of band | tokens delivered; raw tokens never logged |
+| 8 | Window opens: pilot users import via the browser (`config/templates/app/index.html` reads `#pilot_token=<token>` from the URL fragment and uses it verbatim as `client_request_id`) | per-execution promote criteria checked for each import |
+| 9 | Capture evidence for every execution, **before** any deletion | evidence record complete per the schema below |
+| 10 | Close window: `.env` → `False`/empty, restart | `evaluate_django_settings(settings, expect_active=False)` → `allowed=True` |
+| 11 | Dispose (see below) | `(jobs, v2, ledger) == (0, 0, 0)`; media files removed |
+
+Steps 10 and 11 always run — on success or abort. Abort at any failed step.
+
+#### Rollback layers
+
+| Layer | Trigger | Mechanism | Verification |
+|---|---|---|---|
+| Flags | any abort after step 4, or normal window close | literal `.env` revert to the recorded prior values + restart | `expect_active=False` → `allowed=True` |
+| Cohort (partial) | per-user abort | remove that pk and its unused tokens from the allowlists; restart | `expect_active=True` against the **reduced** canonical list → `allowed=True` |
+| Data | whenever any V2 row exists | directed disposition (below) | `(jobs, v2, ledger) == (0, 0, 0)` |
+| Code | only if the Phase 0/1 code (`ops/td02c_settings_gate.py` and/or `config/templates/app/index.html`) is implicated | revert that commit | existing runner evidence |
+
+V1 is unaffected throughout: once an import has started, `relay/models.py`
+blocks any further mutation of `engine_version`, so nothing in this runbook
+can touch V1 data.
+
+### Entry, promote, and abort criteria
+
+#### Entry — per user, before adding a pk to `_USER_IDS`
+
+- `is_active`, `is_staff`, and `can_operate_bulk_sends(user) is True`;
+- member of `Operadores UI`;
+- explicit owner authorization naming the user;
+- the user has been briefed: import-only, ≤ 20 rows, one token per import,
+  rows will be deleted after the cycle.
+
+#### Entry — per cycle, before flipping any flag
+
+- `evaluate_django_settings(settings, expect_active=False)` → `allowed=True`;
+- `(jobs, v2, ledger) == (0, 0, 0)` — no residue from the prior cycle;
+- the exact canonical raw values for both env variables are written down, and
+  the prior values recorded verbatim so rollback is a literal revert;
+- no `ops/` deployment is in flight or scheduled inside the window.
+
+#### Promote — per execution
+
+An execution counts toward the PASS threshold only when all hold:
+
+- gate reported `canary_settings_active`;
+- the operator received HTTP 201 with `import_status` in `{ready,
+  ready_with_errors}`;
+- application log shows `bulk_v2_canary decision=canary_allowed` for the
+  matching request fingerprint;
+- `BackgroundJob.objects.filter(state__in=("queued","running")).count()`
+  delta `== 0`;
+- `EmailMessage.objects.count()` delta `== 0`;
+- `BulkSend` delta `== +1`, `BulkSend(engine_version="v2")` delta `== +1`,
+  `BulkSendRecipient` delta `>= 1`;
+- the parity oracle (below) matched;
+- `get_bulk_import_progress(bulk, reconcile=True).reconciled is True`.
+
+#### Abort — two distinct blast radii
+
+Classification vocabulary is reused verbatim from
+`ops/bulk_v2_canary_client.py::ERROR_CODES` — `firewall_breach`,
+`unexpected_row_delta`, `disposition_required`, `settings_gate_failed` — even
+though the client itself is not executed for Stage 1. Reusing the taxonomy
+keeps Stage 1 evidence comparable with the two prior canary records.
+
+| Trigger | Blast radius | Action |
+|---|---|---|
+| Sustained validation or usability defect reproducible **only** for one user's data/workflow | **Per-user** (`disposition_required` for that user's rows) | Remove that pk from `_USER_IDS` **and** their unused tokens from `_REQUEST_IDS`, restart, re-verify `expect_active=True` against the reduced canonical list. The pilot continues for the rest of the cohort. |
+| `firewall_breach` — nonzero jobs delta or nonzero `EmailMessage` delta | **Full pilot** | All four flags off, restart, verify `expect_active=False`, dispose, escalate. No retry. |
+| `unexpected_row_delta` — `BulkSend` / `BulkSend v2` / `BulkSendRecipient` deltas outside the expected shape | **Full pilot** | as above |
+| `settings_gate_failed` — gate returns any non-empty `reasons` at any point | **Full pilot** | as above |
+| A V2 `BulkSend` reaches `import_status=error` for input the operator judged valid | **Full pilot**, pending diagnosis | as above |
+| Any enqueue, send, or scheduled send attributable to a V2 bulk | **Full pilot** | as above — this is the structural firewall failing |
+
+A per-user removal never converts into a full abort implicitly, and a full
+abort never degrades into a per-user removal. Decide the blast radius before
+the window opens, not during an incident.
+
+### Evidence schema and read-only ORM snippets
+
+No new logging and no new `ops/` module. Every field below is either a
+one-line read-only ORM query, run once per cycle boundary, or a copy from the
+HTTP response body the operator already sees.
+
+```
+cycle, request_fingerprint, user_pk, bulk_id,
+gate_before, gate_after,
+expected: {valid_rows, invalid_rows, import_status},
+observed: {total_rows, valid_rows, invalid_rows, import_status, reconciled},
+deltas:   {bulk_sends, bulk_sends_v2, recipients, jobs, messages},
+duration_ms, disposition: {deleted_recipients, deleted_bulk_sends, media_removed},
+classification
+```
+
+Sourcing, all read-only:
+
+- `request_fingerprint` — `sha256(client_request_id)[:12]` from the
+  `bulk_v2_canary decision=...` log line (never the raw token);
+- `user_pk` — `BulkSend.objects.get(pk=bulk_id).scheduled_by_id`;
+- `gate_before` / `gate_after` — `evaluate_django_settings(...).code` read
+  immediately before and after the execution;
+- `expected.*` — written down by the operator **before** submitting, never
+  derived after the fact;
+- `observed.total_rows/valid_rows/invalid_rows/import_status` — the HTTP 201
+  response body (`import.{status,total_rows,valid_rows,invalid_rows}`), or
+  equivalently `BulkSend.objects.get(pk=bulk_id).{imported_rows,valid_rows,
+  invalid_rows,import_status}`;
+- `observed.reconciled` — `get_bulk_import_progress(bulk, reconcile=True).reconciled`;
+- `deltas.bulk_sends` — `BulkSend.objects.count()` before/after;
+- `deltas.bulk_sends_v2` — `BulkSend.objects.filter(engine_version="v2").count()` before/after;
+- `deltas.recipients` — `BulkSendRecipient.objects.count()` before/after;
+- `deltas.jobs` — `BackgroundJob.objects.filter(state__in=("queued","running")).count()` before/after;
+- `deltas.messages` — `EmailMessage.objects.count()` before/after;
+- `duration_ms` — the `bulk_v2_import ... duration_ms=...` log line;
+- `disposition.*` — counts recorded while performing the deletes below;
+- `classification` — from the `ERROR_CODES` vocabulary above, or "clean" when
+  every promote criterion held.
+
+**Never record** the raw `client_request_id` or recipient row content — the
+existing fingerprint-only convention applies unchanged. `user_pk` **is**
+recorded, because per-user abort is impossible without it and it is not a
+secret.
+
+#### The parity oracle
+
+A direct row-level V1-versus-V2 comparison is structurally impossible in
+Stage 1: `get_bulk_import_progress` returns all-zero for any non-V2 engine,
+since V1 has no import phase (it validates inline during send, which is out
+of scope). The Stage 1 oracle is therefore **pre-declared expectation
+matching**:
+
+1. Before submitting, the operator writes down the expected `valid_rows`,
+   `invalid_rows`, and `import_status` for their CSV.
+2. After submitting, the response body must match all three exactly.
+3. Independently, `get_bulk_import_progress(bulk, reconcile=True)` must
+   return `reconciled=True` — the denormalized counters agree with the
+   ledger recomputed from `BulkSendRecipient.status`.
+
+Step 3 is a free, already-implemented integrity oracle. Step 1 must be
+recorded **before** submission, or it is rationalization rather than
+evidence.
+
+### Disposition of pilot-created rows
+
+Same "retention is not viable" reasoning as the canary section above: any
+retained V2 row makes `(jobs, v2, ledger) != (0, 0, 0)` and permanently
+blocks every future `ops/` deployment. Dispose per cycle, after evidence
+capture, never before. Order, scoped and identity-verified **per pilot
+`BulkSend`**:
+
+1. `BulkSendRecipient` rows for that `BulkSend`;
+2. the parent `BulkSend` (`engine_version="v2"`), matched by its exact
+   `client_request_id` token **and** `scheduled_by_id` — both together, never
+   one alone;
+3. the `recipients_file` media artifact under `bulk_recipients/` — deleting
+   the row does not remove the file from disk.
+
+Then re-verify `(jobs, v2, ledger) == (0, 0, 0)`, restoring deployability.
+
+No `EmailMessage` row should ever exist for a pilot execution. If one does,
+escalate it as a `firewall_breach` — never quietly delete it.
+
+### The `MAX_ROWS=20` binding constraint
+
+`ops/td02c_settings_gate.py`'s `max_rows != 20` check runs **unconditionally**,
+outside any `expect_active` branch, and is invoked before every future
+`ops/` deployment preflight. **No engineer may change
+`BULK_PROCESSING_V2_CANARY_MAX_ROWS` in any environment, and no engineer may
+modify the `max_rows != 20` check in `ops/td02c_settings_gate.py`, for the
+duration of Stage 1.** Raising the cap is a Stage 2 prerequisite that must be
+preceded by parametrizing that check; designing that parametrization is out
+of scope here.
+
+### V1/V2 coexistence
+
+V1 remains the default engine and is completely unaffected throughout this
+pilot. `relay/models.py` blocks `engine_version` mutation once an import has
+started, so nothing in this runbook — activation, the pilot window, abort,
+or disposition — can touch V1 data.
+
+### PASS threshold
+
+Stage 1 is declared **PASS** only when **all nine** of the following hold —
+there is no partial promotion, the same rule the canary section above
+already states:
+
+| # | Criterion |
+|---|---|
+| 1 | ≥ 12 successful pilot imports total |
+| 2 | ≥ 3 distinct pilot users participated, each with ≥ 3 successful imports |
+| 3 | ≥ 1 `ready` **and** ≥ 1 `ready_with_errors` outcome per participating user |
+| 4 | ≥ 3 completed activation cycles, each window ≤ 3 business days |
+| 5 | ≥ 10 business days elapsed from first activation to final deactivation |
+| 6 | 0 full-pilot aborts |
+| 7 | ≤ 1 per-user removal, and only for a demonstrably user-specific cause |
+| 8 | 100% of executions satisfy the parity oracle and report `reconciled=True` |
+| 9 | Every cycle ended with `(jobs, v2, ledger) == (0, 0, 0)` and flags off |
+
+### The pilot window is a deployment freeze
+
+`ops/td02c_deployment_runner.py`'s `_validate_operational_gates` raises
+`unexpected_active_work` unless `(jobs, v2, ledger) == (0, 0, 0)`, and
+`_django_state()` additionally requires
+`evaluate_django_settings(..., expect_active=False)` to pass. While flags are
+on **or** any V2 row exists, **every** `ops/` deployment fails closed. An
+open pilot window is therefore a deployment freeze — the dominant cost of
+Stage 1. This is why the runbook prescribes several short windows (≤ 3
+business days each, criterion 4 above) rather than one long window: each
+cycle closes and disposes before the next one opens, so ordinary delivery is
+never blocked for long.
+
 ## Phases
 
 ### Preflight â€” before fast-forward
