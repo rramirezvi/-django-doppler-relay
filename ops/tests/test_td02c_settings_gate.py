@@ -215,6 +215,64 @@ class TD02CSettingsGateTests(unittest.TestCase):
         self.assertNotEqual(settings.BULK_PROCESSING_V2_CANARY_USER_IDS, {1})
         self.assertTrue(evaluate_django_settings(settings, expect_active=True).allowed)
 
+    def test_multi_entry_expected_ids_pass_when_canonical(self):
+        result = self.active(
+            request_allowlist="stage1-c1-u41-01,stage1-c1-u41-02",
+            user_allowlist="41,52",
+            expected_request_ids=("stage1-c1-u41-01", "stage1-c1-u41-02"),
+            expected_user_ids=(41, 52),
+        )
+        self.assertTrue(result.allowed)
+        self.assertEqual(result.code, "canary_settings_active")
+
+    def test_multi_entry_wrong_order_is_not_canonical(self):
+        result = self.active(
+            request_allowlist="stage1-c1-u41-02,stage1-c1-u41-01",
+            user_allowlist="52,41",
+            expected_request_ids=("stage1-c1-u41-01", "stage1-c1-u41-02"),
+            expected_user_ids=(41, 52),
+        )
+        self.assertFalse(result.allowed)
+        self.assertIn("request_allowlist_not_canonical", result.reasons)
+        self.assertIn("user_allowlist_not_canonical", result.reasons)
+
+    def test_multi_entry_duplicates_wildcards_and_nonpositive_are_mismatched(self):
+        for change in (
+            {
+                "request_allowlist": "stage1-c1-u41-01,stage1-c1-u41-01",
+                "expected_request_ids": ("stage1-c1-u41-01", "stage1-c1-u41-02"),
+            },
+            {
+                "request_allowlist": "stage1-c1-u41-01,bad*",
+                "expected_request_ids": ("stage1-c1-u41-01", "stage1-c1-u41-02"),
+            },
+            {
+                "user_allowlist": "41,0",
+                "expected_user_ids": (41, 52),
+            },
+            {
+                "user_allowlist": "41,-52",
+                "expected_user_ids": (41, 52),
+            },
+        ):
+            with self.subTest(change=change):
+                self.assertFalse(self.active(**change).allowed)
+
+    def test_expect_active_false_ignores_multi_entry_expected_ids(self):
+        result = evaluate_effective_settings(
+            engine_enabled=False,
+            canary_enabled=False,
+            request_allowlist="",
+            user_allowlist="",
+            max_rows=20,
+            allow_external_template_lookup=False,
+            expect_active=False,
+            expected_request_ids=("stage1-c1-u41-01", "stage1-c1-u41-02"),
+            expected_user_ids=(41, 52),
+        )
+        self.assertTrue(result.allowed)
+        self.assertEqual(result.code, "canary_settings_inactive")
+
 
 if __name__ == "__main__":
     unittest.main()

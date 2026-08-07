@@ -78,3 +78,65 @@ class BulkV2CanaryPolicyTests(SimpleTestCase):
             self.decision(import_only=False).code,
             "import_only_required",
         )
+
+    def test_multi_entry_allowlist_admits_every_listed_pair(self):
+        request_allowlist = "stage1-c1-u41-01,stage1-c1-u52-01,stage1-c1-u67-01"
+        user_allowlist = "41,52,67"
+        for user_id, client_request_id in (
+            (41, "stage1-c1-u41-01"),
+            (52, "stage1-c1-u52-01"),
+            (67, "stage1-c1-u67-01"),
+        ):
+            with self.subTest(user_id=user_id, client_request_id=client_request_id):
+                decision = self.decision(
+                    request_allowlist=request_allowlist,
+                    user_allowlist=user_allowlist,
+                    client_request_id=client_request_id,
+                    user_id=user_id,
+                )
+                self.assertTrue(decision.allowed)
+                self.assertEqual(decision.code, "canary_allowed")
+
+    def test_multi_entry_allowlist_rejects_user_not_on_the_list(self):
+        decision = self.decision(
+            request_allowlist="stage1-c1-u41-01,stage1-c1-u52-01,stage1-c1-u67-01",
+            user_allowlist="41,52,67",
+            client_request_id="stage1-c1-u41-01",
+            user_id=99,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.code, "user_not_allowed")
+
+    def test_multi_entry_allowlist_rejects_request_not_on_the_list(self):
+        decision = self.decision(
+            request_allowlist="stage1-c1-u41-01,stage1-c1-u52-01,stage1-c1-u67-01",
+            user_allowlist="41,52,67",
+            client_request_id="not-registered",
+            user_id=41,
+        )
+        self.assertFalse(decision.allowed)
+        self.assertEqual(decision.code, "request_not_allowed")
+
+    def test_multi_entry_malformed_entry_disables_the_entire_list(self):
+        base = {
+            "request_allowlist": "stage1-c1-u41-01,stage1-c1-u52-01",
+            "user_allowlist": "41,52",
+        }
+        for changes in (
+            {"request_allowlist": "stage1-c1-u41-01,stage1-c1-u52-01,stage1-c1-u41-01"},
+            {"request_allowlist": "stage1-c1-u41-01,stage1-c1-u52-*"},
+            {"user_allowlist": "41,52,41"},
+            {"user_allowlist": "41,52,0"},
+        ):
+            allowlists = dict(base, **changes)
+            with self.subTest(changes=changes):
+                for user_id, client_request_id in (
+                    (41, "stage1-c1-u41-01"),
+                    (52, "stage1-c1-u52-01"),
+                ):
+                    decision = self.decision(
+                        client_request_id=client_request_id,
+                        user_id=user_id,
+                        **allowlists,
+                    )
+                    self.assertEqual(decision.code, "canary_config_invalid")
