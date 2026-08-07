@@ -153,7 +153,7 @@ task, then passes (GREEN) after. Two exceptions, both explicit per design D0:
 
 ### Phase 2 — Documentation (can be drafted in parallel with Phase 0/1, finalize after)
 
-- [ ] **5. Doc: `ops/README.md` new section — "Bulk Processing Engine V2
+- [x] **5. Doc: `ops/README.md` new section — "Bulk Processing Engine V2
       Stage 1 internal pilot (production)"**
       Add as a new `##` section (matching the existing `## Bulk Processing
       Engine V2 canary activation (production)` section at line 73, placed
