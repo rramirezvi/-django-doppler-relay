@@ -277,7 +277,7 @@
       const [submitting, setSubmitting] = React.useState(false);
       const [v2Available, setV2Available] = React.useState(false);
       const submitLock = React.useRef(false);
-      const [form, setForm] = React.useState({template_id: "", subject: "", sender_id: "", variables: "{}", send_now: true, scheduled_at: "", engine_version: "legacy"});
+      const [form, setForm] = React.useState({template_id: "", template_name: "", subject: "", sender_id: "", variables: "{}", send_now: true, scheduled_at: "", engine_version: "legacy"});
       const [file, setFile] = React.useState(null);
       const [templateSearch, setTemplateSearch] = React.useState("");
       const [templateOpen, setTemplateOpen] = React.useState(false);
@@ -318,6 +318,7 @@
         setForm({
           ...form,
           template_id: templateId,
+          template_name: tpl?.name || "",
           subject: tpl?.subject || "",
         });
         setTemplateSearch(tpl?.label || tpl?.name || templateId || "");
@@ -395,12 +396,17 @@
           setToast("Adjunta un CSV antes de crear el envío.");
           return;
         }
+        if (form.engine_version === "v2" && !form.template_name) {
+          setToast("Selecciona una plantilla de la lista (con nombre conocido) antes de crear un envío v2.");
+          return;
+        }
         submitLock.current = true;
         setSubmitting(true);
         const pilotTokenActive = v2Available && form.engine_version === "v2" && !!pilotToken;
         const effectiveClientRequestId = pilotTokenActive ? pilotToken : clientRequestId;
         const fd = new FormData();
         fd.append("template_id", form.template_id);
+        fd.append("template_name", form.template_name || "");
         fd.append("subject", form.subject);
         fd.append("sender_id", form.sender_id);
         fd.append("variables", form.variables || "{}");
@@ -447,7 +453,7 @@
                 onChange: ev => {
                   setTemplateSearch(ev.target.value);
                   setTemplateOpen(true);
-                  if (form.template_id) setForm({...form, template_id: "", subject: ""});
+                  if (form.template_id) setForm({...form, template_id: "", template_name: "", subject: ""});
                 },
                 onKeyDown: ev => {
                   if (ev.key === "Escape") setTemplateOpen(false);
@@ -479,7 +485,7 @@
               )
             ),
             templatesError ? e("label", {className: "full"}, "ID de plantilla manual",
-              e("input", {value: form.template_id, onChange: ev => setForm({...form, template_id: ev.target.value}), placeholder: "Escribe el ID si no aparece en la lista"})
+              e("input", {value: form.template_id, onChange: ev => setForm({...form, template_id: ev.target.value, template_name: ""}), placeholder: "Escribe el ID si no aparece en la lista"})
             ) : null,
             templatesError ? e("div", {className: "field full"}, e("strong", null, "Plantillas"), templatesError) : null,
             e("label", null, "Motor",
