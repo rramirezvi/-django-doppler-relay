@@ -291,7 +291,7 @@ their own follow-up commit) rather than deferring discovery.
 
 ### PR2a — Schema and state module
 
-- [ ] **PR2a-T1** — Migration file
+- [x] **PR2a-T1** — Migration file
   `relay/migrations/20260808120000_bulk_v2_real_send_state.py`, with
   `dependencies = [("relay", "20260514150001_bulk_processing_v2_ledger")]`
   (confirmed current head migration on disk), per design §13. Operations,
@@ -311,7 +311,7 @@ their own follow-up commit) rather than deferring discovery.
   `bulk_recipient_order_idx` (design §2.6). ~40-60 lines. Traces: spec
   `bulk-v2-send-state-machine` / "Migration Is Additive And Reversible".
 
-- [ ] **PR2a-T2** — Add the nine new fields to `BulkSendRecipient` in
+- [x] **PR2a-T2** — Add the nine new fields to `BulkSendRecipient` in
   `relay/models.py`, plus the class-level status constants, exact per
   design §2.1:
   ```python
@@ -346,7 +346,7 @@ their own follow-up commit) rather than deferring discovery.
   snapshot field — only classified `send_error_code` and
   `send_error_message = str(exc)[:255]` are ever persisted. ~35 lines.
 
-- [ ] **PR2a-T3** — Add the six `CheckConstraint`s to
+- [x] **PR2a-T3** — Add the six `CheckConstraint`s to
   `BulkSendRecipient.Meta.constraints`, verbatim per design §2.4:
   `bulk_recipient_valid_send_status`,
   `bulk_recipient_invalid_never_sends`,
@@ -358,7 +358,7 @@ their own follow-up commit) rather than deferring discovery.
   forms, not one-directional checks). Append after the four existing
   constraints without modifying them. ~45 lines.
 
-- [ ] **PR2a-T4** — Add the `save()` terminal-state guard to
+- [x] **PR2a-T4** — Add the `save()` terminal-state guard to
   `BulkSendRecipient`, mirroring the existing immutability convention at
   `relay/models.py:369-382`, extended per design §2.5 point 1: read
   `previous = type(self).objects.filter(pk=self.pk).values(...)`
@@ -370,7 +370,7 @@ their own follow-up commit) rather than deferring discovery.
   mechanism — the primary mechanism is the compare-and-set `UPDATE` in
   `bulk_v2_send_state.py` (PR2a-T5). ~15-20 lines.
 
-- [ ] **PR2a-T5** — New module `relay/services/bulk_v2_send_state.py`
+- [x] **PR2a-T5** — New module `relay/services/bulk_v2_send_state.py`
   containing, exact names per design §3/§4/§5/§6/§14:
   - `SendStateTransitionError` (exception class).
   - `STALE_SENDING_AFTER = timedelta(seconds=10 * settings.DOPPLER_RELAY["TIMEOUT"])`
@@ -418,7 +418,7 @@ their own follow-up commit) rather than deferring discovery.
   codebase occurs only in this module (grep-provable, verified by
   PR2a-T9). ~130-160 lines.
 
-- [ ] **PR2a-T6** — State-machine unit tests,
+- [x] **PR2a-T6** — State-machine unit tests,
   `relay/tests/test_bulk_v2_send_state.py`: one test per invariant in
   design §2.3's table (6 invariants), each attempting the forbidden
   state/transition directly and asserting rejection (constraint
@@ -450,7 +450,7 @@ their own follow-up commit) rather than deferring discovery.
   reachable"). ~110-140 lines. Traces: spec `bulk-v2-send-state-machine`
   / all six companion-data and transition-graph requirements.
 
-- [ ] **PR2a-T7** — `claim_next_recipient` unit tests: successful claim
+- [x] **PR2a-T7** — `claim_next_recipient` unit tests: successful claim
   transitions `not_started -> sending` with `send_started_at` set and
   `send_attempt_number` incremented to 1, committed (verifiable by a
   fresh query in the same test); claim returns `None` when no eligible
@@ -463,7 +463,7 @@ their own follow-up commit) rather than deferring discovery.
   compare-and-set rejects on a lost race, backend-independent per design
   §17 risk 4). ~50-70 lines.
 
-- [ ] **PR2a-T8** — `describe_send_ledger` unit tests: one test per
+- [x] **PR2a-T8** — `describe_send_ledger` unit tests: one test per
   classification bucket (7 buckets) using rows constructed to land in
   exactly one bucket each, asserting mutual exclusivity across a
   multi-row `BulkSend` fixture containing one row per bucket
@@ -473,7 +473,7 @@ their own follow-up commit) rather than deferring discovery.
   (`send_started_at = now - 1s`) landing in `in_flight`, proving the
   300s boundary is applied correctly. ~40-60 lines.
 
-- [ ] **PR2a-T9** — Grep-provable structural test: assert that
+- [x] **PR2a-T9** — Grep-provable structural test: assert that
   `send_status=` (as an assignment target, i.e. `send_status=...` in an
   `.update(...)` call or `self.send_status = ...`) appears only in
   `relay/services/bulk_v2_send_state.py` and the migration file
@@ -490,6 +490,41 @@ already close to a full reviewable budget; if it proves too large in
 practice, PR2a-T1..T4 (schema) may be landed as its own sub-commit ahead
 of PR2a-T5..T9 (state module), per design §17 risk 8's suggested further
 split.
+
+**PR2a-T1..T9 complete.** Files: `relay/models.py` (+105/-1, diff only —
+9 fields + 6 constraints + 1 index on `BulkSendRecipient`, `save()`
+terminal-state guard, `BackgroundJob.TYPE_CHOICES` widened by one tuple),
+`relay/migrations/20260808120000_bulk_v2_real_send_state.py` (new, 149
+lines), `relay/services/bulk_v2_send_state.py` (new, 344 lines),
+`relay/tests/test_bulk_v2_send_state.py` (new, 633 lines, 33 tests),
+`relay/tests/test_bulk_v2_send_state_postgresql.py` (new, 86 lines, 1
+PostgreSQL-only test). Actual total ≈ 1230 lines (higher than the
+~545-595 estimate; test volume in particular exceeded the estimate
+because the invariant/claim/ledger/structural-boundary/import-safety
+coverage each grew its own dedicated test class rather than sharing
+fixtures, per the orchestrator's explicit per-item test requirements for
+this task — no coverage was skipped to fit the budget).
+
+Two implementation notes, both mechanical consequences of design.md's own
+operations list, not deviations from it:
+1. `BackgroundJob.TYPE_CHOICES` (`relay/models.py`) needed the literal
+   `("bulk_send_v2_real", "Bulk send V2 real")` tuple added so that
+   `makemigrations --check` matches the migration's `AlterField` — the
+   named `TYPE_BULK_SEND_V2_REAL` Python constant and its dispatch branch
+   remain PR2b scope (design §14), only the choices tuple (which the
+   migration's own `AlterField` already specifies verbatim) was added
+   here.
+2. Two of the six `CheckConstraint`s
+   (`bulk_recipient_send_started_at_consistent`,
+   `bulk_recipient_send_attempt_number_consistent`) required their `Q()`
+   kwargs written in Django's internal alphabetically-sorted order inside
+   the migration file (Django's `Q(**kwargs)` sorts kwargs on
+   construction) to match the autodetector's comparison of the model
+   state — confirmed via `makemigrations --check --dry-run` returning "No
+   changes detected in app 'relay'" after the fix. The model's own
+   `condition=` source order is unaffected (identical boolean semantics
+   either way); only the migration file's literal tuple order needed
+   adjusting.
 
 ### PR2b — Worker, Doppler single-attempt, dispatcher, command, runbook
 

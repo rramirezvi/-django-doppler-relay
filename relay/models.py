@@ -259,6 +259,11 @@ class BackgroundJob(models.Model):
     TYPE_CHOICES = (
         (TYPE_BULK_SEND, "Bulk send"),
         (TYPE_POST_REPORT, "Post-send report"),
+        # bulk-v2-real-send-canary (design.md §13): choices-only widening,
+        # no DB CHECK on job_type (CharField, plain max_length=32). The
+        # TYPE_BULK_SEND_V2_REAL named constant and its executable dispatch
+        # branch are PR2b scope (design §14) — deliberately not added here.
+        ("bulk_send_v2_real", "Bulk send V2 real"),
     )
 
     STATE_QUEUED = "queued"
@@ -306,6 +311,24 @@ class BulkSendRecipient(models.Model):
         (STATUS_INVALID, "Invalid"),
     )
 
+    # bulk-v2-real-send-canary (design.md §2.1): independent send-progress
+    # lifecycle, never reused from `status` above (`status` stays import-only
+    # per design §2.6).
+    SEND_NOT_STARTED = "not_started"
+    SEND_SENDING = "sending"
+    SEND_SENT = "sent"
+    SEND_FAILED = "send_failed"
+    SEND_AMBIGUOUS = "ambiguous"
+    SEND_STATUS_CHOICES = (
+        (SEND_NOT_STARTED, "Not started"),
+        (SEND_SENDING, "Sending"),
+        (SEND_SENT, "Sent"),
+        (SEND_FAILED, "Send failed"),
+        (SEND_AMBIGUOUS, "Ambiguous"),
+    )
+    SEND_TERMINAL = frozenset({SEND_SENT, SEND_FAILED, SEND_AMBIGUOUS})
+    SEND_STARTED = frozenset({SEND_SENDING, SEND_SENT, SEND_FAILED, SEND_AMBIGUOUS})
+
     bulk_send = models.ForeignKey(
         BulkSend,
         on_delete=models.CASCADE,
@@ -325,6 +348,23 @@ class BulkSendRecipient(models.Model):
     )
     last_error_code = models.CharField(max_length=64, blank=True, default="")
     last_error_message = models.CharField(max_length=255, blank=True, default="")
+
+    # bulk-v2-real-send-canary (design.md §2.1): nine additive fields, all
+    # nullable or scalar-defaulted. `send_job_id` is deliberately a plain
+    # BigIntegerField, NOT a ForeignKey — BackgroundJob is orchestration,
+    # not the source of truth for the send ledger (design §2.1 rationale).
+    send_status = models.CharField(
+        max_length=16, choices=SEND_STATUS_CHOICES, default=SEND_NOT_STARTED
+    )
+    send_attempt_number = models.PositiveIntegerField(default=0)
+    send_started_at = models.DateTimeField(null=True, blank=True)
+    sent_at = models.DateTimeField(null=True, blank=True)
+    send_error_code = models.CharField(max_length=64, blank=True, default="")
+    send_error_message = models.CharField(max_length=255, blank=True, default="")
+    send_message_id = models.CharField(max_length=128, blank=True, default="")
+    send_location = models.CharField(max_length=255, blank=True, default="")
+    send_job_id = models.BigIntegerField(null=True, blank=True)
+
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
@@ -348,6 +388,50 @@ class BulkSendRecipient(models.Model):
                 condition=models.Q(source_row_number__gte=1),
                 name="bulk_recipient_source_row_gte_1",
             ),
+            # bulk-v2-real-send-canary (design.md §2.4) — six new invariants,
+            # verbatim, appended after the four existing constraints above.
+            models.CheckConstraint(
+                condition=models.Q(send_status__in=[
+                    "not_started", "sending", "sent", "send_failed", "ambiguous"
+                ]),
+                name="bulk_recipient_valid_send_status",
+            ),
+            models.CheckConstraint(
+                # status=invalid can never progress past not_started.
+                condition=models.Q(send_status="not_started") | ~models.Q(status="invalid"),
+                name="bulk_recipient_invalid_never_sends",
+            ),
+            models.CheckConstraint(
+                # not_started <=> send_started_at IS NULL
+                condition=(
+                    models.Q(send_status="not_started", send_started_at__isnull=True)
+                    | (~models.Q(send_status="not_started") & models.Q(send_started_at__isnull=False))
+                ),
+                name="bulk_recipient_send_started_at_consistent",
+            ),
+            models.CheckConstraint(
+                # not_started <=> attempt 0; every started state has >= 1 attempt.
+                condition=(
+                    models.Q(send_status="not_started", send_attempt_number=0)
+                    | (~models.Q(send_status="not_started") & models.Q(send_attempt_number__gte=1))
+                ),
+                name="bulk_recipient_send_attempt_number_consistent",
+            ),
+            models.CheckConstraint(
+                # sent <=> sent_at IS NOT NULL
+                condition=(
+                    models.Q(send_status="sent", sent_at__isnull=False)
+                    | (~models.Q(send_status="sent") & models.Q(sent_at__isnull=True))
+                ),
+                name="bulk_recipient_sent_requires_sent_at",
+            ),
+            models.CheckConstraint(
+                condition=(
+                    ~models.Q(send_status__in=["send_failed", "ambiguous"])
+                    | ~models.Q(send_error_code="")
+                ),
+                name="bulk_recipient_send_outcome_requires_error_code",
+            ),
         ]
         indexes = [
             models.Index(
@@ -357,6 +441,10 @@ class BulkSendRecipient(models.Model):
             models.Index(
                 fields=["bulk_send", "import_version", "source_row_number"],
                 name="bulk_recipient_order_idx",
+            ),
+            models.Index(
+                fields=["bulk_send", "send_status"],
+                name="bulk_recipient_send_status_idx",
             ),
         ]
 
@@ -369,7 +457,7 @@ class BulkSendRecipient(models.Model):
     def save(self, *args, **kwargs):
         if self.pk:
             previous = type(self).objects.filter(pk=self.pk).values(
-                "bulk_send_id", "import_version", "source_row_number"
+                "bulk_send_id", "import_version", "source_row_number", "send_status"
             ).first()
             if previous and (
                 previous["bulk_send_id"] != self.bulk_send_id
@@ -378,6 +466,22 @@ class BulkSendRecipient(models.Model):
             ):
                 raise ValueError(
                     "La posicion logica y version de una ocurrencia son inmutables."
+                )
+            # bulk-v2-real-send-canary (design.md §2.5 point 1): defensive
+            # net against ORM-object writes originating outside
+            # relay/services/bulk_v2_send_state.py, which is the primary
+            # transition mechanism (compare-and-set UPDATE). Not atomic,
+            # costs one extra query per save — intentional, per design.
+            if previous and (
+                (previous["send_status"] == self.SEND_SENT and self.send_status != self.SEND_SENT)
+                or (
+                    previous["send_status"] in self.SEND_TERMINAL
+                    and self.send_status != previous["send_status"]
+                )
+            ):
+                raise ValueError(
+                    "send_status no puede retroceder desde un estado terminal "
+                    "(bulk-v2-real-send-canary design.md §2.5)."
                 )
         super().save(*args, **kwargs)
 
