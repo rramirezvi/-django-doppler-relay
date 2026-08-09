@@ -862,3 +862,35 @@ no programa y no consulta Doppler. `template_name` debe suministrarse
 explicitamente. La activacion productiva requiere un procedimiento separado y
 aprobacion operativa; desplegar este codigo debe mantener ambos flags en
 `False`.
+
+# bulk-v2-real-send-canary: superficie de autorizacion de envio real (PR1)
+
+Seis flags independientes, sin relacion con `BULK_PROCESSING_V2_CANARY_*`
+(ese bloque solo autoriza importacion; este bloque autorizaria un envio real
+saliente a Doppler). Todos los defaults son inertes/fail-closed. Ninguno de
+estos flags se activa por este cambio; activarlos requiere una autorizacion
+explicita y posterior, fuera de este cambio SDD.
+
+Variables:
+
+- `BULK_PROCESSING_V2_REAL_SEND_ENABLED=False`
+- `BULK_PROCESSING_V2_REAL_SEND_USER_IDS=`
+- `BULK_PROCESSING_V2_REAL_SEND_REQUEST_IDS=`
+- `BULK_PROCESSING_V2_REAL_SEND_TEMPLATE_IDS=`
+- `BULK_PROCESSING_V2_REAL_SEND_RECIPIENT_DOMAINS=`
+- `BULK_PROCESSING_V2_REAL_SEND_MAX_ROWS=1`
+
+`BULK_PROCESSING_V2_REAL_SEND_MAX_ROWS` se valida como exactamente el entero
+`1` (no `<=1`): cualquier otro valor, incluido `0`, `2` o un valor no entero,
+es rechazado como configuracion invalida. Este PR (PR1) no agrega ningun
+codigo capaz de alcanzar Doppler: solo la funcion pura de autorizacion
+(`relay/services/bulk_v2_real_send.py`) y el `LOGGING` dict que enruta el
+logger `relay` a stderr/journald.
+
+Nota de entorno: este repositorio referencia `.env.example` como plantilla
+para crear `.env` (ver seccion 19 mas arriba), pero el acceso directo de
+lectura/escritura a rutas con patron `.env*` esta bloqueado por el sistema de
+permisos de esta sesion de `sdd-apply`, incluso para `.env.example`. Por eso
+estas seis variables se documentan aqui, en el mismo lugar y formato que el
+bloque `BULK_PROCESSING_V2_CANARY_*` de arriba, en vez de en
+`.env.example`. Ningun `.env` real fue leido ni modificado.

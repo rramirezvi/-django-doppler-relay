@@ -150,6 +150,32 @@ DOPPLER_REPORTS = {
     "POLL_TOTAL_TIMEOUT": int(env("DOPPLER_REPORTS_POLL_TOTAL_TIMEOUT", default=15 * 60)),
 }
 
+# bulk-v2-real-send-canary (design.md §12.1): additive over Django's own
+# DEFAULT_LOGGING. No root key, no django logger override — only a
+# dedicated `relay` logger at INFO reaching stderr (journald under systemd).
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "relay_kv": {"format": "%(levelname)s %(name)s %(message)s"},
+    },
+    "handlers": {
+        "relay_stderr": {
+            "class": "logging.StreamHandler",
+            "stream": "ext://sys.stderr",
+            "level": "INFO",
+            "formatter": "relay_kv",
+        },
+    },
+    "loggers": {
+        "relay": {
+            "handlers": ["relay_stderr"],
+            "level": "INFO",
+            "propagate": False,
+        },
+    },
+}
+
 # TD-02A imports a persistent occurrence ledger only. Existing and default
 # campaigns remain on the legacy engine.
 BULK_PROCESSING_ENGINE_V2 = env.bool(
@@ -167,6 +193,32 @@ BULK_PROCESSING_V2_CANARY_USER_IDS = env(
 BULK_PROCESSING_V2_CANARY_MAX_ROWS = env.int(
     "BULK_PROCESSING_V2_CANARY_MAX_ROWS", default=20
 )
+
+# bulk-v2-real-send-canary (design.md §9): independent real-send authorization
+# surface, deliberately separate from the BULK_PROCESSING_V2_CANARY_* flags
+# above (canary = import-only; these gate an actual outbound Doppler send).
+# All defaults are fail-closed/inert: disabled, empty allowlists, MAX_ROWS=1.
+# No flag here is activated by this change. Activating any of them requires
+# separate, later, explicit owner authorization outside this SDD change.
+BULK_PROCESSING_V2_REAL_SEND_ENABLED = env.bool(
+    "BULK_PROCESSING_V2_REAL_SEND_ENABLED", default=False
+)
+BULK_PROCESSING_V2_REAL_SEND_USER_IDS = env(
+    "BULK_PROCESSING_V2_REAL_SEND_USER_IDS", default=""
+)
+BULK_PROCESSING_V2_REAL_SEND_REQUEST_IDS = env(
+    "BULK_PROCESSING_V2_REAL_SEND_REQUEST_IDS", default=""
+)
+BULK_PROCESSING_V2_REAL_SEND_TEMPLATE_IDS = env(
+    "BULK_PROCESSING_V2_REAL_SEND_TEMPLATE_IDS", default=""
+)
+BULK_PROCESSING_V2_REAL_SEND_RECIPIENT_DOMAINS = env(
+    "BULK_PROCESSING_V2_REAL_SEND_RECIPIENT_DOMAINS", default=""
+)
+BULK_PROCESSING_V2_REAL_SEND_MAX_ROWS = env.int(
+    "BULK_PROCESSING_V2_REAL_SEND_MAX_ROWS", default=1
+)
+
 BULK_PROCESSING_V2_ALLOW_EXTERNAL_TEMPLATE_LOOKUP = env.bool(
     "BULK_PROCESSING_V2_ALLOW_EXTERNAL_TEMPLATE_LOOKUP", default=False
 )
