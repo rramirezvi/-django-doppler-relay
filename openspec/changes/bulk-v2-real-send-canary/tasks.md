@@ -528,7 +528,7 @@ operations list, not deviations from it:
 
 ### PR2b — Worker, Doppler single-attempt, dispatcher, command, runbook
 
-- [ ] **PR2b-T1** — New module `relay/services/bulk_v2_send.py`
+- [x] **PR2b-T1** — New module `relay/services/bulk_v2_send.py`
   containing `process_bulk_id_v2` and `build_single_attempt_client`,
   exact per design §10/§14. `process_bulk_id_v2` must NOT be added to
   `relay/services/bulk_processing.py` — that file must remain a
@@ -558,7 +558,7 @@ operations list, not deviations from it:
      transition commits.
   ~70-90 lines.
 
-- [ ] **PR2b-T2** — Two-line change to
+- [x] **PR2b-T2** — Two-line change to
   `relay/services/doppler_relay.py`, exact per design §10:
   1. `DopplerRelayClient.__init__` gains keyword `max_attempts: int = 3`,
      stored as `self.max_attempts = max(int(max_attempts), 1)`.
@@ -571,7 +571,7 @@ operations list, not deviations from it:
   retry bound, backoff (`min(0.8 * 2**retry_count, 8)`), and logging are
   unchanged. ~2 lines changed.
 
-- [ ] **PR2b-T3** — Implement the outcome classifier inside
+- [x] **PR2b-T3** — Implement the outcome classifier inside
   `bulk_v2_send.py` (or a small helper it calls), exact mapping per
   design §10.1's table:
   - 2xx + parsed body → `sent` (even with empty `send_message_id` — the
@@ -603,7 +603,7 @@ operations list, not deviations from it:
   `exc.payload` (which contains `request_headers`/`Authorization`) is
   never read, logged, or persisted. ~30-40 lines.
 
-- [ ] **PR2b-T4** — One additive `elif` branch in `dispatch_background_job`
+- [x] **PR2b-T4** — One additive `elif` branch in `dispatch_background_job`
   (`relay/services/jobs.py`, after the existing check at line 48):
   ```python
   if job.job_type == BackgroundJob.TYPE_BULK_SEND_V2_REAL:
@@ -616,7 +616,7 @@ operations list, not deviations from it:
   class constant alongside the existing `TYPE_BULK_SEND`/`TYPE_POST_REPORT`
   (this is the choice widened by PR2a-T1's `AlterField`). ~6-10 lines.
 
-- [ ] **PR2b-T5** — Implement the three log events inside
+- [x] **PR2b-T5** — Implement the three log events inside
   `bulk_v2_send.py` (attempt/result) and `bulk_v2_real_send.py`
   (decision — note: `evaluate_real_send` itself stays pure per PR1-T3;
   the decision event is emitted by its **caller**, the management
@@ -640,7 +640,7 @@ operations list, not deviations from it:
 
 ### Management command
 
-- [ ] **PR2b-T6** — New file
+- [x] **PR2b-T6** — New file
   `relay/management/commands/bulk_v2_real_send.py`. Argument surface,
   exact per design §8.1: `--bulk-send-id` (`type=int`, `required=True`,
   no default, no `--latest`, no `--all`, no positional fallback) and
@@ -649,7 +649,7 @@ operations list, not deviations from it:
   literal), no `--template`, no `--file`, no `--limit`. ~15-20 lines for
   `add_arguments`.
 
-- [ ] **PR2b-T7** — Implement the 14 ordered checks in the command's
+- [x] **PR2b-T7** — Implement the 14 ordered checks in the command's
   `handle()`, first failure wins, exact codes/exits per design §8.2's
   table:
   | # | Check | Code | Exit |
@@ -684,7 +684,7 @@ operations list, not deviations from it:
   `run_claimed_job(job)` — never `run_background_job(job_id)` (design
   §7's bypass gap). ~90-120 lines.
 
-- [ ] **PR2b-T8** — Ambiguous-handling behavior (design §8.3), as its own
+- [x] **PR2b-T8** — Ambiguous-handling behavior (design §8.3), as its own
   checkable sub-item of PR2b-T7: on finding a `blocked_ambiguous` row,
   the command reports it (`idempotency_key`, `send_started_at`,
   `send_attempt_number`, `send_error_code`, `send_message_id`,
@@ -696,52 +696,52 @@ operations list, not deviations from it:
 
 ### Management command verification tasks (each individually checkable)
 
-- [ ] **PR2b-T9** — Test: command requires explicit `--bulk-send-id`; no
+- [x] **PR2b-T9** — Test: command requires explicit `--bulk-send-id`; no
   `--latest`/`--all`/positional fallback exists; invoking without it
   fails via argparse before any DB read (spec "Command invoked without
   bulk_send_id fails before touching any row").
-- [ ] **PR2b-T10** — Test: command accepts only `engine_version == v2`
+- [x] **PR2b-T10** — Test: command accepts only `engine_version == v2`
   bulks; a `legacy`-engine `BulkSend` is refused at check 4 before any
   gate evaluation or Doppler call.
-- [ ] **PR2b-T11** — Test: real-send gate checked twice — (a) cheap
+- [x] **PR2b-T11** — Test: real-send gate checked twice — (a) cheap
   kill-switch check at check 2 with the flag `False`, asserting **zero
   DB queries** executed (via `django.test.utils.CaptureQueriesContext`
   or `assertNumQueries(0)`); (b) the full `evaluate_real_send` at check
   12 with the flag `True` but an allowlist mismatch, asserting DB reads
   did occur but the send was still refused.
-- [ ] **PR2b-T12** — Test: exact-match requirement on user, request_id,
+- [x] **PR2b-T12** — Test: exact-match requirement on user, request_id,
   template_id, and domain allowlists — four separate test cases, one per
   dimension, each with every other dimension matching and exactly one
   mismatching, asserting refusal names the correct dimension's code.
-- [ ] **PR2b-T13** — Test: command processes at most 1 recipient;
+- [x] **PR2b-T13** — Test: command processes at most 1 recipient;
   `MAX_ROWS` validated `== 1` (not `<=1`) via the gate call, and a
   fixture with 2 eligible rows is refused with `real_send_row_limit_exceeded`.
-- [ ] **PR2b-T14** — Test: command's `parser._actions` does NOT include a
+- [x] **PR2b-T14** — Test: command's `parser._actions` does NOT include a
   `--force` dest.
-- [ ] **PR2b-T15** — Test: command's `parser._actions` does NOT include a
+- [x] **PR2b-T15** — Test: command's `parser._actions` does NOT include a
   `--retry-ambiguous` dest.
-- [ ] **PR2b-T16** — Test: command's `parser._actions` does NOT include
+- [x] **PR2b-T16** — Test: command's `parser._actions` does NOT include
   any recipient wildcard or literal recipient dest (no `--recipient`,
   no `--email`, no positional recipient argument).
-- [ ] **PR2b-T17** — Test: command never parses/reads the CSV — run the
+- [x] **PR2b-T17** — Test: command never parses/reads the CSV — run the
   command (mocked Doppler) against a `BulkSend` whose `recipients_file`
   is deleted from disk before invocation, and assert identical behavior
   (exit code and DB end-state) versus a run with the file present. Also
   assert `csv` is not imported by the command module and
   `recipients_file`/`BulkImportService` are not referenced (grep-provable,
   matching design §6/§8.1).
-- [ ] **PR2b-T18** — Test: command aborts (exit 3) if it finds an
+- [x] **PR2b-T18** — Test: command aborts (exit 3) if it finds an
   `ambiguous` row, touching nothing — assert the row's fields are
   byte-identical before and after the command run.
-- [ ] **PR2b-T19** — Test: command aborts (exit 4) if it finds a stale
+- [x] **PR2b-T19** — Test: command aborts (exit 4) if it finds a stale
   `sending` row (`send_started_at` older than `STALE_SENDING_AFTER`),
   touching nothing — assert the row's fields are byte-identical before
   and after.
-- [ ] **PR2b-T20** — Test: command never issues more than one Doppler
+- [x] **PR2b-T20** — Test: command never issues more than one Doppler
   call per invocation — assert the mocked transport's call count is at
   most 1 across every branch of the 14-check sequence, including the
   success path.
-- [ ] **PR2b-T21** — Test: exact closed argument surface per design §8.1
+- [x] **PR2b-T21** — Test: exact closed argument surface per design §8.1
   — assert `{a.dest for a in parser._actions}` equals
   `{"help", "bulk_send_id", "dry_run"}` plus Django `BaseCommand`'s
   standard defaults (`version`, `verbosity`, `settings`, `pythonpath`,
@@ -762,7 +762,7 @@ path depends on the original CSV (proven by deleting/omitting the CSV
 during the scenario and confirming behavior is unaffected). Not every
 scenario proves all four — each task states exactly which apply.
 
-- [ ] **PR2b-T22 — Scenario 1: Worker dies before the outbound Doppler
+- [x] **PR2b-T22 — Scenario 1: Worker dies before the outbound Doppler
   call.** Commit a row's transition to `not_started -> sending` via
   `claim_next_recipient` (simulating the durable pre-call state), then
   simulate crash by never calling the mocked Doppler transport at all in
@@ -774,7 +774,7 @@ scenario proves all four — each task states exactly which apply.
   deleted before the assertion to additionally establish (d) for this
   scenario. `relay/tests/test_bulk_v2_crash_scenarios.py`. ~20-30 lines.
 
-- [ ] **PR2b-T23 — Scenario 2: Worker dies during the outbound call.**
+- [x] **PR2b-T23 — Scenario 2: Worker dies during the outbound call.**
   Mock the Doppler transport to raise mid-call (e.g. a mocked
   `requests.Timeout`) after the `sending` transition is already
   committed. Assert the classifier maps this to `ambiguous` via
@@ -784,7 +784,7 @@ scenario proves all four — each task states exactly which apply.
   `ambiguous` (grep-provable per PR2b-T29, cross-referenced here).
   Delete the CSV before running to establish (d). ~25-35 lines.
 
-- [ ] **PR2b-T24 — Scenario 3: Doppler may have accepted the message but
+- [x] **PR2b-T24 — Scenario 3: Doppler may have accepted the message but
   the process dies before persisting `sent`.** The scenario this whole
   design exists for. Mock the transport to return a successful response,
   but simulate the crash by not calling `mark_sent` at all (i.e., assert
@@ -798,7 +798,7 @@ scenario proves all four — each task states exactly which apply.
   silently reported as `sent` on assumption, only on persisted evidence.
   ~25-35 lines.
 
-- [ ] **PR2b-T25 — Scenario 4: Crash after persisting `sent` (clean
+- [x] **PR2b-T25 — Scenario 4: Crash after persisting `sent` (clean
   no-op on recovery, exit 0).** Persist `send_status == "sent"` with
   `sent_at` set via `mark_sent`, then re-run the management command
   (mocked transport asserting zero calls) against the same
@@ -806,7 +806,7 @@ scenario proves all four — each task states exactly which apply.
   equivalent all-terminal ledger state), and zero Doppler calls made on
   the second run. Proves (a): `sent` never re-sends. ~20-25 lines.
 
-- [ ] **PR2b-T26 — Scenario 5: Service restart with a recipient row left
+- [x] **PR2b-T26 — Scenario 5: Service restart with a recipient row left
   in `sending`.** Persist a `sending` row (as in Scenario 1), then
   simulate "restart" by constructing a fresh `describe_send_ledger` call
   in a new test-level "process" boundary (no in-memory state carried
@@ -817,7 +817,7 @@ scenario proves all four — each task states exactly which apply.
   management command runs automatically) touches it. Proves (c)
   explicitly. ~20-25 lines.
 
-- [ ] **PR2b-T27 — Scenario 6: Two concurrent workers race for the same
+- [x] **PR2b-T27 — Scenario 6: Two concurrent workers race for the same
   row (PostgreSQL-only).** New file
   `relay/tests/test_bulk_v2_real_send_postgresql.py`, decorated
   `@skipUnless(connection.vendor == "postgresql", "Requiere PostgreSQL")`
@@ -831,7 +831,7 @@ scenario proves all four — each task states exactly which apply.
   requirement generally (not conditioned on `MAX_ROWS == 1`, per spec).
   ~40-60 lines.
 
-- [ ] **PR2b-T28 — Scenario 7: The same `BackgroundJob` executed twice
+- [x] **PR2b-T28 — Scenario 7: The same `BackgroundJob` executed twice
   (via `run_background_job` bypass path).** Create a `BackgroundJob` of
   type `bulk_send_v2_real`, call `run_background_job(job.id)` twice in
   sequence (the exact bypass path identified at `jobs.py:68-69` that
@@ -842,7 +842,7 @@ scenario proves all four — each task states exactly which apply.
   the per-recipient compare-and-set is the actual safety boundary, not
   job-level locking (design §7). ~30-40 lines.
 
-- [ ] **PR2b-T29 — Scenario 8: The management command executed
+- [x] **PR2b-T29 — Scenario 8: The management command executed
   repeatedly against the same `bulk_send_id` (idempotent no-op on the
   second run, exit 0 per `real_send_nothing_to_send`).** Run the full
   command successfully once (mocked transport, one eligible row reaches
@@ -862,7 +862,7 @@ never auto-returns to not_started; ambiguous never auto-retries."
 
 ### V1 pre-existing defect — register as debt, absorb, do NOT fix
 
-- [ ] **PR2b-T30** — Add a code comment / docstring note (NOT a fix) in
+- [x] **PR2b-T30** — Add a code comment / docstring note (NOT a fix) in
   `relay/services/doppler_relay.py` near `_request`'s terminal wrapper
   (currently lines 286-293), documenting the discovered defect exactly:
   `getattr(last_error, 'response', {}).status_code` fails with
@@ -879,7 +879,7 @@ never auto-returns to not_started; ambiguous never auto-retries."
   project issue tracker reference (whichever this repo's convention
   uses) — a note, not a code change. ~5-10 lines (comment only).
 
-- [ ] **PR2b-T31 — Dedicated test proving fail-closed absorption of the
+- [x] **PR2b-T31 — Dedicated test proving fail-closed absorption of the
   V1 defect.** In `relay/tests/test_bulk_v2_crash_scenarios.py` (or
   `test_doppler_single_attempt.py`), mock the Doppler transport/client
   call site to raise a bare `AttributeError` directly (simulating
@@ -900,7 +900,7 @@ never auto-returns to not_started; ambiguous never auto-retries."
 
 ### Doppler correlation constants — explicit, no false assumptions
 
-- [ ] **PR2b-T32** — Add the two correlation constants as documented
+- [x] **PR2b-T32** — Add the two correlation constants as documented
   module-level comments in `relay/services/bulk_v2_send_state.py` (near
   `send_message_id`/`send_location` field usage) or as a docstring on
   `mark_sent`, verbatim:
@@ -916,7 +916,7 @@ never auto-returns to not_started; ambiguous never auto-retries."
   ```
   ~8-12 lines (comment only).
 
-- [ ] **PR2b-T33 — Structural test asserting zero `ambiguous -> sent` /
+- [x] **PR2b-T33 — Structural test asserting zero `ambiguous -> sent` /
   `ambiguous -> retry` code path exists anywhere.** Implemented as a
   grep-provable test: walk `relay/services/bulk_v2_send_state.py` and
   `relay/services/bulk_v2_send.py` source, and assert no function
@@ -935,7 +935,7 @@ never auto-returns to not_started; ambiguous never auto-retries."
 
 ### `doppler_relay.py` behavior-preservation tests
 
-- [ ] **PR2b-T34** — `relay/tests/test_doppler_single_attempt.py`: (a)
+- [x] **PR2b-T34** — `relay/tests/test_doppler_single_attempt.py`: (a)
   assert `DopplerRelayClient()`'s default `max_attempts == 3`; (b) a
   mocked transport that always raises is invoked exactly 3 times for a
   default-constructed client and exactly 1 time for a
@@ -949,7 +949,7 @@ never auto-returns to not_started; ambiguous never auto-retries."
 
 ### Test-infrastructure — no real HTTP call anywhere
 
-- [ ] **PR2b-T35** — Suite-wide assertion/fixture proving no test in
+- [x] **PR2b-T35** — Suite-wide assertion/fixture proving no test in
   this change's added test files constructs a `DopplerRelayClient`
   against a non-mocked transport. Implementable as: (a) a shared test
   fixture/base class used by every new PR2 test file that patches
@@ -964,7 +964,7 @@ never auto-returns to not_started; ambiguous never auto-retries."
 
 ### Runbook
 
-- [ ] **PR2b-T36** — Add the real-send runbook section to
+- [x] **PR2b-T36** — Add the real-send runbook section to
   `ops/README.md`, covering activation (which flags, which allowlist
   values, in what order), the single execution (`manage.py
   bulk_v2_real_send --bulk-send-id N`, then without `--dry-run`),
@@ -994,6 +994,75 @@ correlation + single-attempt + no-real-HTTP fixture, ~600 lines,
 zero new implementation) as a second commit/PR reviewed primarily as
 test coverage over already-reviewed code. PR2b-T30/T32 (comments) and
 PR2b-T36 (runbook) can ride with either half.
+
+**PR2b-T1..T36 complete.** Files: `relay/services/bulk_v2_send.py` (new,
+~300 lines incl. docstrings), `relay/services/doppler_relay.py` (+~20/-2,
+two functional lines per design §10 plus the debt comment PR2b-T30),
+`relay/models.py` (+7/-3, `TYPE_BULK_SEND_V2_REAL` named constant),
+`relay/services/jobs.py` (+13, one additive elif branch with
+function-local import), `relay/management/commands/bulk_v2_real_send.py`
+(new, ~300 lines, 14 ordered checks), `relay/services/bulk_v2_send_state.py`
+(+7, PR2b-T32's correlation-constants comment only — no PR2b write to its
+transition functions), `relay/tests/_bulk_v2_real_send_support.py` (new,
+shared fixtures/no-real-HTTP base), `relay/tests/test_bulk_v2_real_send_command.py`
+(new, 16 tests), `relay/tests/test_bulk_v2_crash_scenarios.py` (new, 8
+tests — scenarios 1-5, 7-8, plus the T31 defect-absorption test),
+`relay/tests/test_bulk_v2_real_send_postgresql.py` (new, 1 PostgreSQL-only
+test, skipped on this Windows/SQLite dev machine), `relay/tests/test_doppler_single_attempt.py`
+(new, 5 tests), `relay/tests/test_bulk_v2_real_send_structural.py` (new, 5
+tests: T33 + T35(b)), `ops/README.md` (+~140 lines, PR2b-T36 runbook,
+written only, never executed).
+
+Five deviations/discoveries, each flagged explicitly, none silently
+resolved:
+1. **`send_location` is always empty.** `send_template_message`'s
+   TRANSFORMED return value (`{"ok":..., "resultados":..., "total":...}`)
+   never exposes the raw `Location` response header — only a per-recipient
+   `message_id` survives the transformation (design.md §11.1's code excerpt
+   reads `response.json()` directly, which is not what the unmodified,
+   already-existing function returns to a caller). Not fixed, since fixing
+   it would mean touching `send_template_message`'s body beyond the
+   approved two-line boundary. `send_message_id` is still populated and
+   used for the `sent` classification per design §11.5.
+2. **`evaluate_real_send`'s `user_id` input has no reliable source for a
+   bare `manage.py` invocation.** `BulkSend` has no "owner"/created-by
+   field; its only `User` FK is `scheduled_by`, which V2 real-send scope
+   forbids populating (zero scheduling). The command's closed argument
+   surface forbids a `--user-id` flag. Resolved conservatively as
+   `bulk.scheduled_by_id` (documented inline in the command and in
+   `ops/README.md`), which will be `None` for essentially every real V2
+   bulk — a fail-closed gap, not a weakened one: the gate simply refuses
+   more often than the allowlist alone would suggest, until a follow-up
+   resolves the association.
+3. **`requests.Timeout`/`ConnectionError` observably classify as
+   `ambiguous`/`dispatch_exception`, not `ambiguous`/`timeout`/`connection_error`,
+   for the single-attempt client** — an emergent, test-proven interaction
+   between design §9's `max_attempts=1` and the pre-existing V1 `_request`
+   terminal-wrapper defect (§10.1/§17 risk 2): with `max_retries=1`, the
+   retry loop exhausts on the very first failure and always takes the
+   defective terminal-wrapper branch, so a raw `requests.RequestException`
+   never reaches `bulk_v2_send.py`'s classifier un-wrapped — it always
+   arrives as `AttributeError` first. The classifier's dedicated
+   Timeout/ConnectionError/RequestException branches remain in the code
+   (correct per design's literal table, and would fire if the V1 defect is
+   ever fixed separately or if a future call site skips `_request`'s
+   wrapping), but are currently unreachable dead code for this specific
+   call path. Both outcomes are `ambiguous`, so no safety property is
+   affected — only which specific `error_code` string an operator sees in
+   the log for a network failure.
+4. **`_build_recipients_model`'s from_email/from_name source is not
+   specified by design.md.** Resolved conservatively using the existing
+   `DOPPLER_RELAY["DEFAULT_FROM_EMAIL"/"DEFAULT_FROM_NAME"]` fallback (the
+   same fallback V1 itself already uses, `relay/views.py:423-424`), reading
+   only already-persisted `BulkSend`/`BulkSendRecipient` fields — no new
+   business logic, no duplicated payload builder.
+5. **PR2b-T1's "Loop: claim_next_recipient(...); if None, stop" pseudocode**
+   was implemented literally as a `while True` loop (not a single claim),
+   matching the state-machine spec's requirement that safety properties
+   hold generally, not conditioned on `MAX_ROWS == 1`. In practice the
+   loop claims at most one row for this canary, because `MAX_ROWS == 1` is
+   enforced upstream by `evaluate_real_send` and the command's ledger
+   checks before `process_bulk_id_v2` is ever invoked.
 
 ---
 

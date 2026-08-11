@@ -62,6 +62,21 @@ def dispatch_background_job(job: BackgroundJob) -> object:
         )
         return "Reporte procesado"
 
+    # bulk-v2-real-send-canary (design.md §7/§14, PR2b-T4): one additive
+    # elif branch. Function-local import so the existing module-level
+    # `process_bulk_id` import above is untouched. This job type MUST only
+    # ever reach dispatch through the LOCKED claim path (management
+    # command -> select_for_update -> run_claimed_job), never through
+    # run_background_job's bypass (design §7) — but the per-recipient
+    # compare-and-set inside claim_next_recipient is the actual safety
+    # boundary regardless of which path calls in here (design §7's central
+    # point, proven by PR2b-T28's same-job-executed-twice test).
+    if job.job_type == BackgroundJob.TYPE_BULK_SEND_V2_REAL:
+        if not job.bulk_id:
+            raise ValueError("BackgroundJob bulk_send_v2_real sin bulk_id")
+        from relay.services.bulk_v2_send import process_bulk_id_v2
+        return process_bulk_id_v2(job.bulk_id, job_id=job.id)
+
     raise ValueError(f"Tipo de job no soportado: {job.job_type}")
 
 

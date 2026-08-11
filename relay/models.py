@@ -256,14 +256,16 @@ class BulkSend(models.Model):
 class BackgroundJob(models.Model):
     TYPE_BULK_SEND = "bulk_send"
     TYPE_POST_REPORT = "post_report"
+    # bulk-v2-real-send-canary (design.md §13/§14, PR2b-T4): named constant
+    # for the choice value widened by PR2a's migration (choices-only, no DB
+    # CHECK on job_type). The executable dispatch branch lives in
+    # relay/services/jobs.py::dispatch_background_job (function-local import
+    # of process_bulk_id_v2, per design §14).
+    TYPE_BULK_SEND_V2_REAL = "bulk_send_v2_real"
     TYPE_CHOICES = (
         (TYPE_BULK_SEND, "Bulk send"),
         (TYPE_POST_REPORT, "Post-send report"),
-        # bulk-v2-real-send-canary (design.md §13): choices-only widening,
-        # no DB CHECK on job_type (CharField, plain max_length=32). The
-        # TYPE_BULK_SEND_V2_REAL named constant and its executable dispatch
-        # branch are PR2b scope (design §14) — deliberately not added here.
-        ("bulk_send_v2_real", "Bulk send V2 real"),
+        (TYPE_BULK_SEND_V2_REAL, "Bulk send V2 real"),
     )
 
     STATE_QUEUED = "queued"

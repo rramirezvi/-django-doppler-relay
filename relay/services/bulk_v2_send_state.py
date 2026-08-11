@@ -104,6 +104,14 @@ def claim_next_recipient(bulk_send_id: int, *, job_id: int) -> int | None:
     return row                   # <- commit happened at the end of the with-block
 
 
+# DOPPLER_SERVER_SIDE_IDEMPOTENCY = NOT_DOCUMENTED
+# DOPPLER_AMBIGUOUS_RECONCILIATION = NOT_PROVEN
+#
+# Neither send_message_id nor the Location header's trailing segment is
+# confirmed to enable a safe retry. No code in this change queries Doppler
+# to resolve an ambiguous row, and no automatic or manual ambiguous ->
+# sent or ambiguous -> retry transition exists anywhere in this module or
+# in bulk_v2_send.py. See design.md §11.
 def mark_sent(
     row_pk: int, *, message_id: str, location: str, now: datetime | None = None
 ) -> None:

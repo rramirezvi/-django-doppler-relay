@@ -1292,3 +1292,155 @@ El único rol permitido para un wrapper Bash externo es transportar esa copia
 y ejecutar la invocación de un solo módulo versionado de arriba; no puede
 reconstruir merge, rollback, readiness, settings, evidencia ni ningún otro
 paso — las mismas restricciones que ya aplican al resto del orquestador.
+
+## bulk-v2-real-send-canary: runbook de envío real (PR2b)
+
+**Este runbook se documenta pero NO se ejecuta como parte de `sdd-apply`.**
+Activar cualquiera de los seis flags, elegir un destinatario real e invocar
+`bulk_v2_real_send` contra un `BulkSend` real requieren autorización
+explícita y posterior del owner, fuera de este cambio SDD (design.md §14,
+§11.4). Al completarse `sdd-apply` para PR2b,
+`BULK_PROCESSING_V2_REAL_SEND_ENABLED` permanece `False`, las cuatro
+allowlists permanecen vacías, y no se realizó ningún envío ni llamada real
+a Doppler.
+
+### Prerrequisito de evidencia (B), antes de cualquier ejecución real
+
+Antes de la primera ejecución real, un operador autorizado debe (design.md
+§11.4 — no es una tarea de `sdd-apply`, es un prerrequisito de (B)):
+
+1. Capturar, de un envío real ya existente vía el pipeline V1 (que ya envía
+   correo productivo), la respuesta HTTP exacta: `status`, header `Location`
+   completo, y el cuerpo JSON completo.
+2. Confirmar cuál de `message_id` / segmento final de `Location` está
+   realmente poblado.
+3. Confirmar que `get_delivery(account_id, <ese identificador>)` retorna un
+   registro, o que el identificador aparece en `list_deliveries` /
+   `list_events` de forma que identifique exactamente un mensaje.
+
+Si el paso 3 falla, (B) puede continuar igualmente — el canary corre con el
+entendimiento de que un resultado `ambiguous` sería permanentemente
+irresoluble y terminaría el canary en un abort. Ese es ya el comportamiento
+diseñado; nada cambia estructuralmente (design.md §11.3).
+
+### Activación (orden de los seis flags)
+
+Los seis flags son independientes de `BULK_PROCESSING_V2_CANARY_*` (ese
+bloque solo autoriza importación) y de los seis flags PR1 ya documentados
+más arriba en este archivo, que este bloque reitera con sus valores
+*activos* de ejemplo:
+
+| Flag | Valor inactivo (default) | Valor activo (ejemplo) |
+|---|---|---|
+| `BULK_PROCESSING_V2_REAL_SEND_ENABLED` | `False` | `True` |
+| `BULK_PROCESSING_V2_REAL_SEND_USER_IDS` | `` | un único user id autorizado |
+| `BULK_PROCESSING_V2_REAL_SEND_REQUEST_IDS` | `` | un único `client_request_id` fresco |
+| `BULK_PROCESSING_V2_REAL_SEND_TEMPLATE_IDS` | `` | el `template_id` exacto del canary |
+| `BULK_PROCESSING_V2_REAL_SEND_RECIPIENT_DOMAINS` | `` | el dominio exacto del destinatario autorizado |
+| `BULK_PROCESSING_V2_REAL_SEND_MAX_ROWS` | `1` | `1` (nunca cambia) |
+
+`MAX_ROWS` se valida como exactamente el entero `1`; no se activa ni se
+amplía por entorno. El `BulkSend` objetivo debe ser `engine_version=v2`,
+`import_status` en `{ready, ready_with_errors}`, con exactamente una fila
+`BulkSendRecipient` elegible (`status=pending`, `send_status=not_started`)
+cuyo dominio coincida con el allowlist.
+
+**Nota (gap descubierto, documentado explícitamente, no resuelto aquí)**:
+`evaluate_real_send` requiere un `user_id`, pero `BulkSend` no tiene un
+campo propio de "owner". El comando usa `bulk.scheduled_by_id` (el único FK
+a `User` que el modelo tiene), que normalmente es `None` para un envío V2
+sin programación — el gate por tanto rechaza con `real_send_user_not_allowed`
+hasta que se resuelva esta asociación (por ejemplo agregando un campo owner
+a `BulkSend`, o revisando el contrato del comando). Esto es fail-closed, no
+una debilidad de seguridad: el gate simplemente rechaza con más frecuencia
+de lo que sugeriría el allowlist por sí solo. Ver el comentario en
+`relay/management/commands/bulk_v2_real_send.py` check 12.
+
+### Ejecución única
+
+```bash
+# Reporte únicamente, no reclama ninguna fila:
+python manage.py bulk_v2_real_send --bulk-send-id <N> --dry-run
+
+# Ejecución real (una única llamada a Doppler, como máximo):
+python manage.py bulk_v2_real_send --bulk-send-id <N>
+```
+
+El comando no acepta `--force`, `--retry-ambiguous`, `--yes`, ni ningún
+argumento de destinatario (comodín o literal). Nunca lee el CSV original.
+Catorce chequeos ordenados (design.md §8.2); el primero que falla detiene
+todo, sin tocar ninguna fila y sin ninguna llamada a Doppler:
+
+| Código de salida | Significado |
+|---|---|
+| `0` | Éxito, dry-run, o no-op limpio (`real_send_nothing_to_send`) |
+| `2` | Problema estructural (args, engine, import no listo) |
+| `3` | **Fila ambiguous presente — requiere resolución humana, canary abortado** |
+| `4` | Fila in-flight, stale, o job duplicado — requiere inspección humana |
+| `5` | Autorización rechazada (kill switch o cualquier dimensión del allowlist) |
+
+### Inspección manual de una fila `sending` envejecida
+
+Sin ejecutar el comando, una fila `sending` envejecida (`send_started_at`
+más antiguo que 300s = 10× `DOPPLER_RELAY["TIMEOUT"]`) es identificable
+únicamente con estas dos columnas, sin CSV ni logs (design.md §5):
+
+```python
+from relay.models import BulkSendRecipient
+BulkSendRecipient.objects.filter(
+    bulk_send_id=<N>, send_status="sending"
+).values("pk", "idempotency_key", "send_started_at", "send_attempt_number", "send_job_id")
+```
+
+### Resolución manual de una fila `ambiguous`
+
+No existe ningún comando de reconciliación ni ninguna transición automática
+`ambiguous -> sent` o `ambiguous -> retry` en el código (design.md §11.3;
+verificado estructuralmente por `relay/tests/test_bulk_v2_real_send_structural.py`).
+Resolver una fila `ambiguous` es una escritura humana directa a la base de
+datos, después de reunir evidencia (correlacionar `send_message_id` /
+`send_location` contra `get_delivery`/`list_deliveries`/`list_events`, per
+§11.1-§11.2), nunca una funcionalidad del sistema:
+
+```python
+from django.utils import timezone
+from relay.models import BulkSendRecipient
+# Solo después de confirmar manualmente el resultado real en Doppler:
+BulkSendRecipient.objects.filter(pk=<row_pk>, send_status="ambiguous").update(
+    send_status="sent",  # o "send_failed", segun la evidencia confirmada
+    sent_at=timezone.now(),
+    updated_at=timezone.now(),
+)
+```
+
+Esta escritura manual está deliberadamente fuera de cualquier función de
+`bulk_v2_send_state.py` — es una intervención humana documentada, no un
+código de reconciliación automática.
+
+### Desactivación
+
+Después de la ejecución (éxito, abort, o cualquier resultado), limpiar
+`BULK_PROCESSING_V2_REAL_SEND_ENABLED=False` y las cuatro allowlists
+(`USER_IDS`, `REQUEST_IDS`, `TEMPLATE_IDS`, `RECIPIENT_DOMAINS` todas
+vacías), y reiniciar `django.service`. `MAX_ROWS` permanece en `1` en
+ambos estados. La desactivación es tan importante en éxito como en abort —
+ningún run debe dejar los flags activos.
+
+### V1 defect absorbido, no corregido (registro de deuda técnica)
+
+`doppler_relay.py`'s `_request` tiene un defecto preexistente (descubierto
+durante el diseño de este cambio, design.md §10.1/§17 riesgo 2):
+`getattr(last_error, 'response', {}).status_code` falla con `AttributeError`
+(no `DopplerRelayError`) en un `requests.Timeout`/`ConnectionError`, porque
+`last_error.response` **existe y es `None`**, así que el default de
+`getattr` nunca aplica y `None.status_code` lanza. No corregido aquí — V1
+debe permanecer inalterado. El path V2 (`bulk_v2_send.py`) absorbe esto
+clasificando cualquier excepción posterior al despacho, incluyendo
+`AttributeError`, como `ambiguous`/`dispatch_exception` — verificado
+empíricamente por `relay/tests/test_bulk_v2_crash_scenarios.py`'s
+`test_v1_attribute_error_defect_is_absorbed_as_ambiguous` y por el hallazgo
+de que, con `max_attempts=1`, este es en la práctica el path que toman
+`requests.Timeout`/`ConnectionError` también (ver el comentario en
+`test_scenario2_worker_dies_during_outbound_call`). Seguimiento pendiente:
+corregir el defecto en una PR separada que toque explícitamente V1, con su
+propia caracterización de regresión.

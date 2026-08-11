@@ -92,11 +92,18 @@ class DopplerRelayError(RuntimeError):
 
 
 class DopplerRelayClient:
-    def __init__(self, *, api_key: str | None = None, base_url: str | None = None, auth_scheme: str | None = None, timeout: int | None = None):
+    def __init__(self, *, api_key: str | None = None, base_url: str | None = None, auth_scheme: str | None = None, timeout: int | None = None, max_attempts: int = 3):
         cfg = settings.DOPPLER_RELAY
         self.base_url = (base_url or cfg.get(
             "BASE_URL", DEFAULT_BASE_URL)).rstrip("/") + "/"
         self.timeout = timeout or cfg.get("TIMEOUT", 30)
+        # bulk-v2-real-send-canary (design.md §10/D9): every existing V1
+        # construction site calls DopplerRelayClient() with no
+        # max_attempts, so self.max_attempts == 3 there and V1's retry
+        # bound/backoff/logging are unchanged. V2's real-send path obtains
+        # a client via bulk_v2_send.build_single_attempt_client(), which
+        # passes max_attempts=1.
+        self.max_attempts = max(int(max_attempts), 1)
         self.session = requests.Session()
 
         # Usar 'token' como esquema de autorización por defecto
@@ -224,7 +231,7 @@ class DopplerRelayClient:
     def _request(self, method: str, path: str, **kwargs) -> requests.Response:
         """Realiza una petición HTTP a la API de Doppler Relay."""
         url = self._url(path)
-        max_retries = 3
+        max_retries = self.max_attempts  # was: max_retries = 3 (design.md §10/D9)
         retry_count = 0
         last_error = None
 
@@ -283,6 +290,18 @@ class DopplerRelayClient:
         if isinstance(last_error, DopplerRelayError):
             raise last_error
         else:
+            # KNOWN PRE-EXISTING V1 DEFECT (discovered during
+            # bulk-v2-real-send-canary design, design.md §10.1 / §17 risk 2):
+            # for a requests.Timeout/ConnectionError, `last_error.response`
+            # EXISTS and is None, so `getattr(last_error, 'response', {})`
+            # returns None (the {} default only applies when the attribute
+            # is MISSING, not when it is None) and `None.status_code` raises
+            # AttributeError instead of the DopplerRelayError this branch
+            # intends to construct. NOT FIXED HERE — V1 must stay
+            # byte-identical. relay/services/bulk_v2_send.py's outcome
+            # classifier absorbs this by treating any post-dispatch
+            # exception, explicitly including AttributeError, as
+            # send_status="ambiguous" (error_code="dispatch_exception").
             raise DopplerRelayError(
                 f"Error después de {max_retries} intentos: {str(last_error)}",
                 status=getattr(last_error, 'response', {}).status_code,
