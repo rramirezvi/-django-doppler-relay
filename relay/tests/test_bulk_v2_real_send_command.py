@@ -220,7 +220,9 @@ class BulkV2RealSendCommandTests(RealSendFixtureMixin, NoRealDopplerCallTestCase
         self.assertEqual(before, after)
         self._transport_mock.assert_not_called()
 
-    # --- PR2b-T20: at most one Doppler call per invocation -----------------
+    # --- PR2b-T20: at most one SEND call per invocation (fix-bulk-v2-
+    # template-variable-validation: distinct from the read-only, per-
+    # BulkSend template-discovery GET, which is not a send attempt) -------
 
     def test_at_most_one_doppler_call_across_every_branch(self):
         user = self.make_user()
@@ -231,9 +233,14 @@ class BulkV2RealSendCommandTests(RealSendFixtureMixin, NoRealDopplerCallTestCase
         self.mock_transport(return_value=FakeDopplerResponse())
         with override_settings(**self.authorized_settings(user=user, bulk=bulk)):
             call_command("bulk_v2_real_send", bulk_send_id=bulk.pk)
-        self.assertLessEqual(self._transport_mock.call_count, 1)
+        # fix-bulk-v2-template-variable-validation: `_send_mock` (the SEND
+        # call specifically), not `_transport_mock` (all traffic, which now
+        # also includes the read-only template-discovery GET).
+        self.assertLessEqual(self._send_mock.call_count, 1)
 
-        # Branch: dry-run (must claim/call nothing).
+        # Branch: dry-run (must claim/call nothing — dry-run stops before
+        # `process_bulk_id_v2`/the gate are ever reached, so this remains a
+        # zero-Doppler-calls-of-any-kind branch, `_transport_mock` unchanged).
         calls_before = self._transport_mock.call_count
         bulk2 = self.make_bulk(user=user)
         self.make_occurrence(bulk2)

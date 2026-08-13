@@ -16,17 +16,41 @@ checks referenced inline below:
     modified — this module is intentionally separate (design §14's
     refinement of the proposal), so the legacy guard at
     `bulk_processing.py:39-42` is untouched by inspection.
-  - Exactly one Doppler call maximum per recipient per invocation of
-    `process_bulk_id_v2`: the single-attempt client
-    (`build_single_attempt_client`) already prevents transport-layer retry
-    (doppler_relay.py's `_request` loop runs once for `max_attempts=1`);
-    this module adds no retry loop of its own on top of that.
+  - Transport invariant (fix-bulk-v2-template-variable-validation
+    formalizes what "exactly one Doppler call" meant pre-gate — that
+    phrase alone is no longer precise, since a successful run now makes
+    TWO distinct HTTP calls, of two different kinds, at two different
+    scopes):
+      1. discovery succeeds + payload valid -> exactly 1 read-only GET
+         (`get_required_template_variables`, once per `BulkSend`, never
+         per recipient) + exactly 1 send POST per claimed recipient.
+      2. variables missing -> exactly 1 GET, 0 POST.
+      3. discovery failed (content indeterminate) -> 1 GET attempted
+         (its failure is what's being reported), 0 POST.
+      4. no eligible recipient / no-op re-run -> 0 GET, 0 POST (the GET
+         is skipped entirely — see `eligible_pks` check below).
+      5. under no circumstance can there be more than 1 send POST per
+         recipient per invocation: the single-attempt client
+         (`build_single_attempt_client`) still prevents transport-layer
+         retry on the SEND call specifically (doppler_relay.py's
+         `_request` loop runs once for `max_attempts=1`), and this
+         module still adds no retry loop of its own on top of that —
+         the single-attempt guarantee is per-recipient-send and is
+         unweakened by the gate.
+      6. the discovery GET never touches `BulkSendRecipient` at all: it
+         cannot increment `send_attempt_number`, change `send_status`,
+         or cause a `sending` transition — it runs before
+         `claim_next_recipient` is ever called (see below).
+      7. any discovery failure happens strictly before any row is
+         claimed — `eligible_pks` and the gate are resolved first, so a
+         rejected `BulkSend` never has a row sitting in `sending`.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 import requests
@@ -37,6 +61,7 @@ from relay.models import BulkSend, BulkSendRecipient
 from relay.services.bulk_v2_send_state import (
     SendStateError,
     claim_next_recipient,
+    describe_send_ledger,
     ensure_autocommit_context,
     mark_ambiguous,
     mark_send_failed,
@@ -45,6 +70,67 @@ from relay.services.bulk_v2_send_state import (
 from relay.services.doppler_relay import DopplerRelayClient, DopplerRelayError
 
 logger = logging.getLogger(__name__)
+
+_MUSTACHE_VAR_RE = re.compile(r"\{\{([^}]+)\}\}")
+_VALID_VAR_NAME_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_.]*[a-zA-Z0-9_]$")
+
+
+class TemplateVariableDiscoveryError(RuntimeError):
+    """The real Mustache variable set for a template could not be obtained
+    with confidence (e.g. `get_template_html` returned empty, or the
+    request itself failed). Never treated as "zero variables required" —
+    that conflation is exactly the pre-existing V1 bug this module avoids
+    repeating (see `RealSendTemplateDiscoveryFailed`'s docstring)."""
+
+
+class RealSendTemplateVariablesMissing(RuntimeError):
+    """Raised by `process_bulk_id_v2` before any recipient is claimed: the
+    template's real content was read successfully and its required
+    variables were determined, but at least one eligible recipient's
+    persisted `payload` does not cover all of them. The template-discovery
+    GET already happened (that's how the mismatch was found); zero send
+    POST is made and zero recipient row is touched — `BulkSendRecipient`
+    stays `not_started`.
+    Caught by `run_claimed_job` (jobs.py) exactly like any other dispatch
+    exception, which sets the `BackgroundJob` to `STATE_ERROR`."""
+
+
+class RealSendTemplateDiscoveryFailed(RuntimeError):
+    """Raised by `process_bulk_id_v2` before any recipient is claimed: the
+    template's real required variables could not be determined at all
+    (fail-closed — see `TemplateVariableDiscoveryError`). Distinct from
+    `RealSendTemplateVariablesMissing` because no variable list exists to
+    report here. Same zero-touch/BackgroundJob-error handling."""
+
+
+def get_required_template_variables(
+    client: DopplerRelayClient, account_id: int, template_id: str
+) -> frozenset[str]:
+    """V2-isolated Mustache variable discovery. Reuses the already-working
+    `DopplerRelayClient.get_template_html` (which correctly follows the
+    `_links[get-template-body]` relation `get_template_fields` does not —
+    see `V1_TEMPLATE_VARIABLE_VALIDATION_BROKEN`, registered separately and
+    left unfixed on purpose: this function duplicates only the small,
+    already-validated Mustache-extraction regex instead of touching
+    `doppler_relay.py`, so V1's `get_template_fields`/`process_bulk_id`
+    remain byte-identical.
+
+    `get_template_html` fails "open" to `""` on any error (its own
+    `except Exception: return ""`), which does not distinguish "genuinely
+    no content" from "could not determine content" — this function refuses
+    to inherit that ambiguity and raises `TemplateVariableDiscoveryError`
+    on empty content instead of returning an empty variable set."""
+    html = client.get_template_html(account_id, template_id)
+    if not html:
+        raise TemplateVariableDiscoveryError(
+            f"No se pudo obtener contenido real de la plantilla {template_id}."
+        )
+    variables: set[str] = set()
+    for match in _MUSTACHE_VAR_RE.finditer(html):
+        name = match.group(1).strip()
+        if _VALID_VAR_NAME_RE.match(name):
+            variables.add(name)
+    return frozenset(variables)
 
 
 def build_single_attempt_client() -> DopplerRelayClient:
@@ -188,11 +274,80 @@ def process_bulk_id_v2(bulk_send_id: int, *, job_id: int) -> str:
     ever invoked, by `evaluate_real_send` + the management command's
     ledger checks — so in practice the loop below claims at most one row.
 
-    At most ONE Doppler call is made per claimed row: the single-attempt
+    At most ONE send POST is made per claimed row (the single-attempt
     client already prevents transport-layer retry, and this function adds
-    no retry loop of its own on top (module docstring).
+    no retry loop of its own on top) — see the module docstring's
+    "Transport invariant" for the full picture, which also now includes
+    at most one read-only, per-`BulkSend` (not per-row) template-discovery
+    GET before the first row is ever claimed.
     """
     ensure_autocommit_context()
+
+    bulk = BulkSend.objects.only("template_id", "subject").get(pk=bulk_send_id)
+    account_id = settings.DOPPLER_RELAY.get("ACCOUNT_ID", 0)
+    client = build_single_attempt_client()
+
+    # Template-variable gate (fix-bulk-v2-template-variable-validation):
+    # runs once per BulkSend, before the first `claim_next_recipient` call,
+    # so a mismatch never claims/touches any row. Placed inside this
+    # function (not only in the management command) because the dispatcher
+    # bypass path (jobs.py's `TYPE_BULK_SEND_V2_REAL` branch, exercised by
+    # `run_background_job(job_id)`) reaches `process_bulk_id_v2` directly —
+    # the same defense-in-depth reasoning as the per-recipient CAS.
+    #
+    # `eligible_pks` is resolved FIRST, before any Doppler traffic: a run
+    # with nothing left to send (e.g. a repeated/no-op invocation after a
+    # prior success) must make zero Doppler calls of any kind, exactly as
+    # before this gate existed — reusing `describe_send_ledger` here (the
+    # same read-only classifier the management command's own checks use)
+    # means the template-discovery GET is skipped entirely rather than
+    # firing needlessly on every re-invocation.
+    eligible_pks = [row.pk for row in describe_send_ledger(bulk_send_id).eligible]
+
+    if eligible_pks:
+        try:
+            required_vars = get_required_template_variables(
+                client, account_id, bulk.template_id
+            )
+        except TemplateVariableDiscoveryError as exc:
+            logger.info(
+                "bulk_v2_real_send_template_check bulk_send_id=%s job_id=%s "
+                "code=real_send_template_discovery_failed template_id=%s",
+                bulk_send_id, job_id, bulk.template_id,
+            )
+            raise RealSendTemplateDiscoveryFailed(
+                "No se pudieron determinar las variables requeridas de la "
+                f"plantilla {bulk.template_id}."
+            ) from exc
+
+        # `email` is deliberately excluded from the coverage check:
+        # `_build_recipients_model` always supplies it as the recipient's
+        # own top-level `email` field (never inside `variables`/`payload`
+        # — see that function), so a template's `{{email}}` is already
+        # structurally satisfied by every real send regardless of what the
+        # imported CSV columns were. Treating it as "missing" here would
+        # false-positive-block the common case of a template greeting the
+        # recipient by their own address.
+        checkable_required_vars = required_vars - {"email"}
+        missing_vars: set[str] = set()
+        payloads = (
+            BulkSendRecipient.objects
+            .filter(pk__in=eligible_pks)
+            .values_list("payload", flat=True)
+        )
+        for payload in payloads:
+            missing_vars |= checkable_required_vars - set((payload or {}).keys())
+
+        if missing_vars:
+            logger.info(
+                "bulk_v2_real_send_template_check bulk_send_id=%s job_id=%s "
+                "code=real_send_template_variables_missing missing_variables=%s",
+                bulk_send_id, job_id, ",".join(sorted(missing_vars)),
+            )
+            raise RealSendTemplateVariablesMissing(
+                "Variables requeridas ausentes en el payload: "
+                f"{', '.join(sorted(missing_vars))}."
+            )
 
     processed = 0
     while True:
@@ -227,14 +382,11 @@ def process_bulk_id_v2(bulk_send_id: int, *, job_id: int) -> str:
             send_started_at.isoformat() if send_started_at else "",
         )
 
-        client = build_single_attempt_client()
         if getattr(client, "max_attempts", None) != 1:
             raise SendStateError(
                 "real send requires a single-attempt Doppler client"
             )
 
-        bulk = BulkSend.objects.only("template_id", "subject").get(pk=bulk_send_id)
-        account_id = settings.DOPPLER_RELAY.get("ACCOUNT_ID", 0)
         recipients_model = _build_recipients_model(
             bulk, row["normalized_recipient"] or "", row["payload"] or {}
         )

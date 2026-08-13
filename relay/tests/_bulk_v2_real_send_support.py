@@ -54,12 +54,47 @@ def _unmocked_transport_call(*args, **kwargs):
     )
 
 
+def _default_template_response(*args, **kwargs):
+    """fix-bulk-v2-template-variable-validation: default answer for the
+    template-discovery GET the gate makes (`get_template_html`) before any
+    send is attempted. Content is a single `{{name}}` variable, matching
+    `RealSendFixtureMixin.make_occurrence`'s default `payload={"name": ...}`
+    exactly — every pre-existing PR2b test that only cares about the SEND
+    path (and never overrides `payload` with different keys, confirmed by
+    inspection) passes this gate trivially without any change. Tests that
+    specifically exercise the gate call `mock_template_transport(...)`."""
+    return FakeDopplerResponse(
+        status_code=200,
+        json_data={
+            "id": "tpl-real",
+            "name": "Template real",
+            "subject": "Asunto",
+            "bodyType": "rawHtml",
+            "htmlContent": "{{name}}",
+        },
+    )
+
+
 class NoRealDopplerCallTestCase(TransactionTestCase):
     """PR2b-T35: base class every PR2b test file that can reach the send
     path must inherit. Patches `requests.Session.request` — the exact
-    transport call `DopplerRelayClient._request` makes — to raise
-    `RuntimeError` by default. Call `self.mock_transport(...)` to install
-    a controlled response/exception for the duration of a test.
+    transport call `DopplerRelayClient._request` makes.
+
+    fix-bulk-v2-template-variable-validation: `process_bulk_id_v2` now
+    makes a read-only GET (`get_template_html`, non-`/message` path) for
+    template-variable discovery before the send POST (`/message` path),
+    when there is at least one eligible row. This class dispatches those
+    two kinds of call to two independently-mockable targets:
+      - `mock_transport(...)` — controls the SEND (POST .../message) path,
+        exactly as before this gate existed. Defaults to the loud
+        `RuntimeError` guard (PR2b-T35) if never configured.
+      - `mock_template_transport(...)` — controls the template-discovery
+        GET path. Defaults to `_default_template_response` (a `{{name}}`
+        template), so existing tests that only care about the send path
+        need no changes.
+    `self._transport_mock` remains the single patched mock object on
+    `requests.Session.request` itself, so `call_count`/`assert_not_called`
+    assertions against it still reflect ALL Doppler traffic, GET or POST.
 
     Deliberately `TransactionTestCase`, not `TestCase`: `TestCase` wraps
     every test body in its own outer `transaction.atomic()` block for
@@ -71,20 +106,36 @@ class NoRealDopplerCallTestCase(TransactionTestCase):
 
     def setUp(self):
         super().setUp()
+        self._send_mock = mock.Mock(side_effect=_unmocked_transport_call)
+        self._template_mock = mock.Mock(side_effect=_default_template_response)
         self._transport_patcher = mock.patch(
-            "requests.Session.request", side_effect=_unmocked_transport_call
+            "requests.Session.request", side_effect=self._dispatch_transport_call
         )
         self._transport_mock = self._transport_patcher.start()
         self.addCleanup(self._transport_patcher.stop)
 
+    def _dispatch_transport_call(self, method, url, **kwargs):
+        if method == "GET" and not url.rstrip("/").endswith("/message"):
+            return self._template_mock(method, url, **kwargs)
+        return self._send_mock(method, url, **kwargs)
+
     def mock_transport(self, *, return_value=None, side_effect=None):
         if side_effect is not None:
-            self._transport_mock.side_effect = side_effect
-            self._transport_mock.return_value = None
+            self._send_mock.side_effect = side_effect
+            self._send_mock.return_value = None
         else:
-            self._transport_mock.side_effect = None
-            self._transport_mock.return_value = return_value
-        return self._transport_mock
+            self._send_mock.side_effect = None
+            self._send_mock.return_value = return_value
+        return self._send_mock
+
+    def mock_template_transport(self, *, return_value=None, side_effect=None):
+        if side_effect is not None:
+            self._template_mock.side_effect = side_effect
+            self._template_mock.return_value = None
+        else:
+            self._template_mock.side_effect = None
+            self._template_mock.return_value = return_value
+        return self._template_mock
 
 
 class RealSendFixtureMixin:

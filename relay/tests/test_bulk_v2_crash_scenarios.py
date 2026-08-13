@@ -159,7 +159,11 @@ class BulkV2CrashScenarioTests(RealSendFixtureMixin, NoRealDopplerCallTestCase):
         locking — is the actual safety boundary (design §7): calling
         run_background_job(job_id) TWICE (the exact jobs.py:68-69 bypass
         path that skips claim_next_job's select_for_update) results in at
-        most one Doppler call for the single eligible row."""
+        most one SEND call for the single eligible row (fix-bulk-v2-
+        template-variable-validation: `_transport_mock`'s total count now
+        also includes a per-BulkSend, not per-recipient, read-only
+        template-discovery GET, so the invariant checked here uses
+        `_send_mock` specifically)."""
         user = self.make_user()
         bulk = self.make_bulk(user=user)
         self.make_occurrence(bulk)
@@ -175,7 +179,11 @@ class BulkV2CrashScenarioTests(RealSendFixtureMixin, NoRealDopplerCallTestCase):
             run_background_job(job.id)
             run_background_job(job.id)
 
-        self.assertLessEqual(self._transport_mock.call_count, 1)
+        # fix-bulk-v2-template-variable-validation: assert the SEND call
+        # count specifically (`_send_mock`), not total transport traffic
+        # (`_transport_mock`), since a successful run now legitimately
+        # makes one extra read-only template-discovery GET.
+        self.assertLessEqual(self._send_mock.call_count, 1)
         row = bulk.recipient_occurrences.get()
         self.assertEqual(row.send_status, BulkSendRecipient.SEND_SENT)
 
@@ -194,13 +202,15 @@ class BulkV2CrashScenarioTests(RealSendFixtureMixin, NoRealDopplerCallTestCase):
 
         with override_settings(**self.authorized_settings(user=user, bulk=bulk)):
             call_command("bulk_v2_real_send", bulk_send_id=bulk.pk)
-            self.assertEqual(self._transport_mock.call_count, 1)
+            # fix-bulk-v2-template-variable-validation: `_send_mock`, not
+            # `_transport_mock` — see scenario 7's comment.
+            self.assertEqual(self._send_mock.call_count, 1)
 
             with self.assertRaises(CommandError) as cm:
                 call_command("bulk_v2_real_send", bulk_send_id=bulk.pk)
         self.assertIn("real_send_nothing_to_send", str(cm.exception))
         self.assertEqual(cm.exception.returncode, 0)
-        self.assertEqual(self._transport_mock.call_count, 1)
+        self.assertEqual(self._send_mock.call_count, 1)
 
     # --- PR2b-T31: fail-closed absorption of the pre-existing V1 defect ----
 
