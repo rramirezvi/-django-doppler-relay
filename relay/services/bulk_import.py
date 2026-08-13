@@ -154,7 +154,72 @@ def occurrence_idempotency_key(
 
 
 def _normalized_header(value: str) -> str:
+    """Matching-only form: NFC + strip + casefold. Never persisted as a
+    payload/variable key — used exclusively to detect the email column,
+    to look up `csv_column` values inside `clean`, and as the collision
+    key in `_build_header_index`/`_build_variable_key_index`."""
     return unicodedata.normalize("NFC", str(value or "")).strip().casefold()
+
+
+def _case_preserving_header(value: str) -> str:
+    """Persisted form: NFC + strip, WITHOUT casefold. This is what ends
+    up as a literal key in `BulkSendRecipient.payload` (and, via the
+    variables mapping, as the literal Mustache variable name sent to
+    Doppler) — case-preserving-import (fix-bulk-v2-case-preserving-import)
+    exists specifically so a CSV column named "Valor" persists as
+    "Valor", not "valor"."""
+    return unicodedata.normalize("NFC", str(value or "")).strip()
+
+
+def _build_header_index(fieldnames: list[str | None]) -> dict[str, str]:
+    """normalized -> case-preserving, one entry per distinct CSV column.
+
+    Strict by design (fix-bulk-v2-case-preserving-import): ANY second
+    header whose `_normalized_header()` already exists in the index
+    raises `duplicate_header`, regardless of whether its case-preserving
+    form is identical, differs only in case, only in whitespace, or only
+    in Unicode composition. Two physically distinct CSV columns are never
+    silently collapsed into one payload key — if both columns exist in
+    the file, the file is rejected outright. This applies uniformly to
+    `Valor,valor` / `Valor,Valor` / `Valor," Valor "` / two NFC-equivalent
+    byte-different headers / any other pair colliding after
+    NFC+strip+casefold."""
+    index: dict[str, str] = {}
+    for raw in fieldnames:
+        if raw is None:
+            continue
+        normalized = _normalized_header(raw)
+        preserved = _case_preserving_header(raw)
+        if normalized in index:
+            raise BulkImportError(
+                "duplicate_header",
+                "Encabezados ambiguos tras normalizar: "
+                f"'{index[normalized]}' y '{preserved}' representan la misma columna.",
+            )
+        index[normalized] = preserved
+    return index
+
+
+def _build_variable_key_index(raw_mapping: dict[Any, Any]) -> dict[str, str]:
+    """Same strict collision policy as `_build_header_index`, applied to
+    `BulkSend.variables`' keys (the Doppler template-variable names an
+    operator configures, independent of CSV header text). Returns
+    normalized -> case-preserving `template_key`; raises
+    `duplicate_variable_mapping_key` on any collision."""
+    index: dict[str, str] = {}
+    for template_key in raw_mapping:
+        if not isinstance(template_key, str) or template_key.startswith("__"):
+            continue
+        normalized = _normalized_header(template_key)
+        preserved = _case_preserving_header(template_key)
+        if normalized in index:
+            raise BulkImportError(
+                "duplicate_variable_mapping_key",
+                "Claves de variables ambiguas tras normalizar: "
+                f"'{index[normalized]}' y '{preserved}' representan la misma variable.",
+            )
+        index[normalized] = preserved
+    return index
 
 
 def _normalize_recipient(value: str) -> str:
@@ -365,11 +430,9 @@ class BulkImportService:
             reader = csv.DictReader(text_stream, delimiter=delimiter)
             if not reader.fieldnames:
                 raise BulkImportError("header_missing", "El CSV no tiene cabecera.")
-            normalized_headers = [
-                _normalized_header(item) for item in reader.fieldnames
-            ]
+            header_index = _build_header_index(reader.fieldnames)
             email_column = next(
-                (header for header in normalized_headers if header in EMAIL_COLUMNS),
+                (normalized for normalized in header_index if normalized in EMAIL_COLUMNS),
                 None,
             )
             if not email_column:
@@ -378,14 +441,15 @@ class BulkImportService:
                     "El CSV no contiene una columna de correo.",
                 )
 
-            mapping = (
+            raw_variables = (
                 self.bulk_send.variables
                 if isinstance(self.bulk_send.variables, dict)
                 else {}
             )
+            variable_key_index = _build_variable_key_index(raw_variables)
             mapping = {
-                _normalized_header(template_key): _normalized_header(csv_column)
-                for template_key, csv_column in mapping.items()
+                variable_key_index[_normalized_header(template_key)]: _normalized_header(csv_column)
+                for template_key, csv_column in raw_variables.items()
                 if isinstance(template_key, str)
                 and isinstance(csv_column, str)
                 and not template_key.startswith("__")
@@ -397,6 +461,7 @@ class BulkImportService:
                     source_row_number=row_number,
                     email_column=email_column,
                     mapping=mapping,
+                    header_index=header_index,
                 )
         except UnicodeDecodeError as exc:
             raise BulkImportError(
@@ -412,6 +477,7 @@ class BulkImportService:
         source_row_number: int,
         email_column: str,
         mapping: dict[str, str],
+        header_index: dict[str, str],
     ) -> dict[str, Any]:
         structural_error = None in row
         clean = {
@@ -427,6 +493,9 @@ class BulkImportService:
         normalized_recipient = _normalize_recipient(recipient)
 
         if mapping:
+            # `mapping`'s keys are already the case-preserving template_key
+            # (built in _iter_rows via variable_key_index) — persisted
+            # verbatim, no further transformation here.
             payload = {
                 template_key: clean.get(csv_column)
                 for template_key, csv_column in mapping.items()
@@ -435,8 +504,11 @@ class BulkImportService:
                 key for key, value in payload.items() if value is None
             ]
         else:
+            # header_index maps the same normalized key `clean` uses back
+            # to its case-preserving original — this is the one place the
+            # persisted payload key is chosen (fix-bulk-v2-case-preserving-import).
             payload = {
-                key: value
+                header_index[key]: value
                 for key, value in clean.items()
                 if key != email_column and not key.startswith("__")
             }

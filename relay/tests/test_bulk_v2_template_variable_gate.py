@@ -18,10 +18,12 @@ mocks explicitly — `mock_transport(...)` for the SEND path,
 
 from __future__ import annotations
 
+from django.core.files.base import ContentFile
 from django.core.management import call_command
 from django.test import override_settings
 
-from relay.models import BackgroundJob, BulkSendRecipient
+from relay.models import BackgroundJob, BulkSend, BulkSendRecipient
+from relay.services.bulk_import import BulkImportService
 from relay.services.bulk_v2_send import (
     RealSendTemplateDiscoveryFailed,
     RealSendTemplateVariablesMissing,
@@ -417,3 +419,51 @@ class TemplateVariableGateCommandIntegrationTests(RealSendFixtureMixin, NoRealDo
         row.refresh_from_db()
         self.assertEqual(row.send_status, BulkSendRecipient.SEND_NOT_STARTED)
         self._send_mock.assert_not_called()
+
+
+class CasePreservingImportGateIntegrationTests(RealSendFixtureMixin, NoRealDopplerCallTestCase):
+    """fix-bulk-v2-case-preserving-import: end-to-end proof that a REAL
+    `BulkImportService` import (not a hand-built `payload={...}` literal)
+    of the exact compatible CSV persists case-preserved keys and passes
+    the template gate — with zero manual DB manipulation anywhere in the
+    chain from CSV bytes to `sent`."""
+
+    def test_real_import_of_compatible_csv_persists_exact_case_and_passes_gate(self):
+        user = self.make_user()
+        bulk = BulkSend.objects.create(
+            engine_version=BulkSend.ENGINE_V2,
+            client_request_id="case-preserving-integration-test",
+            template_id="tpl-real",
+            template_name="PRUEBA",
+            scheduled_by=user,
+        )
+        csv_bytes = (
+            "email,nombre,cedula,codigo,Valor,Plazo\r\n"
+            "kike@example.com,Canary V2,0999999999,REALCANARY02,10.00,1\r\n"
+        ).encode("utf-8")
+        bulk.recipients_file.save("compatible.csv", ContentFile(csv_bytes), save=True)
+        result = BulkImportService(bulk, import_version=1).import_file()
+
+        self.assertEqual(result.import_status, "ready")
+        self.assertEqual((result.total_rows, result.valid_rows, result.invalid_rows), (1, 1, 0))
+
+        row = bulk.recipient_occurrences.get()
+        self.assertEqual(row.status, BulkSendRecipient.STATUS_PENDING)
+        self.assertEqual(row.send_status, BulkSendRecipient.SEND_NOT_STARTED)
+        self.assertEqual(row.send_attempt_number, 0)
+        self.assertEqual(
+            sorted(row.payload.keys()),
+            sorted(["nombre", "cedula", "codigo", "Valor", "Plazo"]),
+        )
+
+        self.mock_template_transport(return_value=_template_response(PRUEBA_TEMPLATE_HTML))
+        self.mock_transport(return_value=FakeDopplerResponse())
+
+        with override_settings(**self.authorized_settings(user=user, bulk=bulk, domain="example.com")):
+            gate_result = process_bulk_id_v2(bulk.pk, job_id=1)
+
+        self.assertIn("1 fila", gate_result)
+        row.refresh_from_db()
+        self.assertEqual(row.send_status, BulkSendRecipient.SEND_SENT)
+        self.assertEqual(row.send_attempt_number, 1)
+        self.assertEqual(self._send_mock.call_count, 1)

@@ -325,6 +325,129 @@ class BulkImportServiceTests(TestCase):
             self.assertTrue(fresh.exists())
             self.assertTrue(unrelated.exists())
 
+    # --- fix-bulk-v2-case-preserving-import ---------------------------------
+
+    def test_case_preserving_payload_keys_for_mixed_case_headers(self):
+        bulk = self.make_bulk(
+            "email,nombre,cedula,codigo,Valor,Plazo\r\n"
+            "kike@example.com,Canary V2,0999999999,REALCANARY02,10.00,1\r\n".encode("utf-8")
+        )
+        BulkImportService(bulk).import_file()
+        row = bulk.recipient_occurrences.get()
+        self.assertEqual(
+            sorted(row.payload.keys()),
+            sorted(["nombre", "cedula", "codigo", "Valor", "Plazo"]),
+        )
+        self.assertEqual(row.payload["Valor"], "10.00")
+        self.assertEqual(row.payload["Plazo"], "1")
+        self.assertNotIn("valor", row.payload)
+        self.assertNotIn("plazo", row.payload)
+
+    def test_duplicate_header_case_only_collision_is_rejected(self):
+        bulk = self.make_bulk(b"email,Valor,valor\na@example.com,1,2\n")
+        with self.assertRaises(BulkImportError) as error:
+            BulkImportService(bulk).import_file()
+        self.assertEqual(error.exception.code, "duplicate_header")
+        self.assertEqual(bulk.recipient_occurrences.count(), 0)
+
+    def test_duplicate_header_identical_case_collision_is_rejected(self):
+        bulk = self.make_bulk(b"email,Valor,Valor\na@example.com,1,2\n")
+        with self.assertRaises(BulkImportError) as error:
+            BulkImportService(bulk).import_file()
+        self.assertEqual(error.exception.code, "duplicate_header")
+        self.assertEqual(bulk.recipient_occurrences.count(), 0)
+
+    def test_duplicate_header_whitespace_only_collision_is_rejected(self):
+        bulk = self.make_bulk('email,Valor," Valor "\na@example.com,1,2\n'.encode("utf-8"))
+        with self.assertRaises(BulkImportError) as error:
+            BulkImportService(bulk).import_file()
+        self.assertEqual(error.exception.code, "duplicate_header")
+        self.assertEqual(bulk.recipient_occurrences.count(), 0)
+
+    def test_duplicate_header_nfc_equivalent_collision_is_rejected(self):
+        # Two physically distinct byte sequences that are canonically
+        # NFC-equivalent (precomposed vs decomposed accent), both present
+        # as separate CSV columns. Built explicitly via unicodedata to
+        # guarantee byte-distinctness rather than relying on two
+        # visually-identical source literals.
+        import unicodedata as _ud
+        precomposed = _ud.normalize("NFC", "Cafe" + "\u0301")
+        decomposed = _ud.normalize("NFD", precomposed)
+        self.assertNotEqual(precomposed, decomposed)
+        self.assertEqual(_ud.normalize("NFC", decomposed), precomposed)
+        header_line = "email," + precomposed + "," + decomposed + "\n"
+        bulk = self.make_bulk((header_line + "a@example.com,1,2\n").encode("utf-8"))
+        with self.assertRaises(BulkImportError) as error:
+            BulkImportService(bulk).import_file()
+        self.assertEqual(error.exception.code, "duplicate_header")
+        self.assertEqual(bulk.recipient_occurrences.count(), 0)
+
+    def test_single_unicode_header_persists_nfc_normalized(self):
+        # Only ONE physical column, authored with a decomposed accent -
+        # no collision (nothing else to collide with); persists in its
+        # NFC-normalized (precomposed) form.
+        import unicodedata as _ud
+        precomposed = _ud.normalize("NFC", "Cafe" + "\u0301")
+        decomposed = _ud.normalize("NFD", precomposed)
+        self.assertNotEqual(precomposed, decomposed)
+        header_line = "email," + decomposed + "\n"
+        bulk = self.make_bulk((header_line + "a@example.com,x\n").encode("utf-8"))
+        BulkImportService(bulk).import_file()
+        row = bulk.recipient_occurrences.get()
+        self.assertEqual(list(row.payload.keys()), [precomposed])
+
+    def test_variables_mapping_preserves_template_key_case(self):
+        bulk = self.make_bulk(
+            b"email,monto\nvalid@example.com,10.00\n",
+            variables={"Valor": "monto"},
+        )
+        BulkImportService(bulk).import_file()
+        row = bulk.recipient_occurrences.get()
+        self.assertEqual(row.payload, {"Valor": "10.00"})
+        self.assertNotIn("valor", row.payload)
+
+    def test_variables_mapping_duplicate_key_collision_is_rejected(self):
+        bulk = self.make_bulk(
+            b"email,col1,col2\na@example.com,1,2\n",
+            variables={"Valor": "col1", "valor": "col2"},
+        )
+        with self.assertRaises(BulkImportError) as error:
+            BulkImportService(bulk).import_file()
+        self.assertEqual(error.exception.code, "duplicate_variable_mapping_key")
+        self.assertEqual(bulk.recipient_occurrences.count(), 0)
+
+    def test_payload_hash_deterministic_for_case_preserved_payload(self):
+        # payload_hash IS part of occurrence_idempotency_key's hashed
+        # identity (bulk_send_id:import_version:source_row_number:
+        # payload_hash — see occurrence_idempotency_key). Case-preserving
+        # keys change the hash VALUE relative to the old casefolded
+        # behavior for any header with uppercase, but determinism for a
+        # fixed input is what idempotency actually depends on: hashing
+        # the same case-preserved payload twice must be stable, and no
+        # code anywhere compares payload_hash across two separate import
+        # runs (confirmed by inspection of every payload_hash reference
+        # in relay/), so a changed hash value relative to pre-fix
+        # behavior is not itself a compatibility break.
+        payload = {"Valor": "10.00", "Plazo": "1"}
+        _, _, hash_a = canonicalize_payload(payload)
+        _, _, hash_b = canonicalize_payload(dict(payload))
+        self.assertEqual(hash_a, hash_b)
+
+        key_a = occurrence_idempotency_key(
+            bulk_send_id=1, import_version=1, source_row_number=1, payload_hash=hash_a,
+        )
+        key_b = occurrence_idempotency_key(
+            bulk_send_id=1, import_version=1, source_row_number=1, payload_hash=hash_b,
+        )
+        self.assertEqual(key_a, key_b)
+
+        # A payload differing only by key case is a DIFFERENT canonical
+        # payload (different hash) — expected and correct, not a
+        # regression: "Valor" and "valor" are different Mustache variable
+        # names, not the same value re-cased.
+        _, _, hash_lower = canonicalize_payload({"valor": "10.00", "plazo": "1"})
+        self.assertNotEqual(hash_a, hash_lower)
+
     def test_spool_is_removed_after_success(self):
         bulk = self.make_bulk(b"email\na@example.com\n")
         observed_path = None
