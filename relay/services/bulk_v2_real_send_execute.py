@@ -1,5 +1,6 @@
-"""bulk-v2 real-send authorization + execution boundary (PR C, design
-round 8).
+"""bulk-v2 real-send authorization + execution boundary (PR C design
+round 8; PR C2 design rounds 9-12: atomic job creation + crash-safe
+claim).
 
 `authorize_and_execute_real_send` is the ONE sanctioned internal entry
 point to start a V2 real send. It centralizes the fourteen ordered checks
@@ -8,30 +9,52 @@ point to start a V2 real send. It centralizes the fourteen ordered checks
 BulkSend/engine/import-status validation, the existing-job defense-in-
 depth check, the read-only ledger, the ambiguous/stale-sending/in-flight
 aborts, the nothing-eligible clean no-op, the full `evaluate_real_send`
-authorization gate, the dry-run short-circuit, and finally BackgroundJob
-creation + the LOCKED claim path + dispatch via `run_claimed_job`. First
-failure wins, same order, same codes, same returncodes as before -- only
-relocated, not changed.
+authorization gate, the dry-run short-circuit, and finally durable
+BackgroundJob creation + a crash-recoverable claim + dispatch.
+
+Check 14 (PR C2, design round 9-11): creating the BackgroundJob and
+deciding "is one already active" both happen under a `select_for_update`
+lock on the BulkSend row itself -- the single mechanism that closes the
+Check-6/Check-14 TOCTOU (two concurrent authorize calls for the SAME
+BulkSend can never both create a job). The job is committed durably
+`queued` BEFORE any claim is attempted, and the lock is released the
+instant that transaction commits -- `execute_specific_queued_job`
+(relay/services/jobs.py) then claims and runs it OUTSIDE any lock, so no
+Doppler I/O ever happens while a row is locked. If the process dies
+between that commit and the claim, the job stays `queued` and is
+recovered by the already-running continuous worker
+(`process_background_jobs --loop`) without any new machinery. The
+remaining gap -- between the claim's own commit and the start of
+`dispatch_background_job` -- is structurally unavoidable without lease/
+fencing (design round 11's proof) and is deliberately deferred, not
+built around: the existing `BulkSendRecipient` state machine (Check 9's
+stale_sending detection) is what prevents an unsafe second POST, not the
+job's own state.
+
+`RealSendOutcome.result` distinguishes `"executed_here"` (this call
+claimed and ran the job) from `"delegated"` (this call created the job
+but another caller -- typically the continuous worker -- claimed it
+first; the job WILL be/was processed, just not by this call) from
+`"refused"` (no job exists). `executed` (bool) is preserved for the
+command's existing CommandError-vs-success branching and is True for
+both `executed_here` and `delegated`.
 
 The management command is now a thin wrapper: parse arguments, call this
-function, print the exact same messages it always has, translate the
-returned `RealSendOutcome` into the same `CommandError`/exit-code
-convention it always used. No business logic lives in the command
-anymore.
+function, print the exact same messages it always has (plus one new,
+additive branch for `delegated`), translate the returned `RealSendOutcome`
+into the same `CommandError`/exit-code convention it always used. No
+business logic lives in the command.
 
 No scheduling here: this function does not decide WHEN to run, only
-WHETHER and HOW, exactly like the command it was extracted from. A future
-scheduler calls this same function directly, in-process -- it does not
-gain any capability the management command didn't already have, and the
-management command gains none it didn't already have either.
+WHETHER and HOW. A future scheduler calls this same function directly,
+in-process.
 
-Boundary (design round 8): zero references to scheduling,
-process_bulk_scheduled, V1, bulk_processing.py, views.py,
-RemoteQuotaState, Limit Status, X-Rate-Limit headers, or quota settings.
-The quota guard (PR B) lives entirely inside `run_claimed_job` ->
-`dispatch_background_job` -> `process_bulk_id_v2`, called here exactly as
-the command always called it -- this module never reads
-`DOPPLER_QUOTA_*` and never imports `bulk_quota`.
+Boundary: zero references to scheduling, process_bulk_scheduled, V1,
+bulk_processing.py, views.py, RemoteQuotaState, Limit Status,
+X-Rate-Limit headers, or quota settings. The quota guard (PR B) lives
+entirely inside `run_claimed_job` -> `dispatch_background_job` ->
+`process_bulk_id_v2`, unaffected by this module -- this module never
+reads `DOPPLER_QUOTA_*` and never imports `bulk_quota`.
 """
 
 from __future__ import annotations
@@ -46,10 +69,37 @@ from django.utils import timezone
 
 from relay.models import BackgroundJob, BulkSend
 from relay.services.bulk_v2_real_send import evaluate_real_send
-from relay.services.bulk_v2_send_state import LedgerRow, describe_send_ledger
-from relay.services.jobs import run_claimed_job
+from relay.services.bulk_v2_send_state import (
+    STALE_SENDING_AFTER,
+    LedgerRow,
+    describe_send_ledger,
+)
+from relay.services.jobs import execute_specific_queued_job
 
 logger = logging.getLogger(__name__)
+
+# design round 12 (PR C2): observability-only threshold for a
+# TYPE_BULK_SEND_V2_REAL BackgroundJob stuck in `running` -- never used to
+# auto-recover/reset/reclaim anything, only to emit a distinct, more
+# alarming log line than the ordinary "already present" refusal. Not a
+# new Django setting (mirrors STALE_SENDING_AFTER's own precedent:
+# derived, not configured). Deliberately larger than STALE_SENDING_AFTER
+# (a per-recipient HTTP-timeout-derived threshold): a job-level stall
+# must look wrong at a coarser level than "one recipient's request is
+# slow" -- that narrower case is already Check 9's job via
+# STALE_SENDING_AFTER. Today MAX_ROWS is hard-gated to exactly 1
+# (evaluate_real_send), so a legitimate job's total runtime is bounded by
+# roughly one recipient's worth of work -- doubling the per-recipient
+# threshold gives headroom above that without inventing an unrelated
+# number. MUST be revisited if MAX_ROWS is ever allowed above 1 (a
+# legitimately busy multi-recipient job could then run longer than this
+# without being stuck).
+#
+# BACKGROUND_JOB_STALE_THRESHOLD_REVIEW_BEFORE_SCALE: named debt marker
+# (design round 13) -- this derivation is appropriate for today's
+# MAX_ROWS=1 state only. No new setting, no behavior change here; this
+# comment is the deliberate, conceptual registration of that debt.
+BACKGROUND_JOB_STALE_RUNNING_AFTER = STALE_SENDING_AFTER * 2
 
 
 def _request_fingerprint(client_request_id: str) -> str:
@@ -60,15 +110,36 @@ def _request_fingerprint(client_request_id: str) -> str:
     ).hexdigest()[:12]
 
 
+REAL_SEND_RESULT_REFUSED = "refused"
+REAL_SEND_RESULT_EXECUTED_HERE = "executed_here"
+REAL_SEND_RESULT_DELEGATED = "delegated"
+
+
 @dataclass(frozen=True)
 class RealSendOutcome:
     """Structured result of `authorize_and_execute_real_send`.
 
-    `executed` is True ONLY when check 14 ran (BackgroundJob created,
-    claimed, and dispatched via `run_claimed_job`) -- dry-run and every
-    refusal (including returncode=0 no-ops like "nothing to send") have
-    `executed=False`, mirroring the original command's uniform
-    CommandError-for-everything-except-final-success CLI convention.
+    `executed` is True whenever a BackgroundJob durably exists as a
+    consequence of THIS call's authorization succeeding -- true for both
+    `result="executed_here"` and `result="delegated"` (design round 12).
+    Every refusal (including returncode=0 no-ops like "nothing to send")
+    has `executed=False`. Preserved for the command's existing
+    CommandError-vs-success branching -- unchanged meaning from PR C for
+    every scenario that could occur before PR C2 (`delegated` did not
+    exist until this round).
+
+    `result` (design round 12) is the precise, three-way signal a
+    careful caller (a future scheduler, in particular) should branch on:
+      - "refused": no job exists because of this call.
+      - "executed_here": this call created AND ran the job to a
+        terminal state (`done`/`error`) -- `job_state`/`job_message`
+        reflect that terminal outcome.
+      - "delegated": this call created the job, but another caller
+        (typically the continuous worker, `process_background_jobs
+        --loop`) claimed it first. The job WILL be, or already is being,
+        processed -- just not by this call. `job_state` is a best-effort,
+        unlocked, purely informational read of the job's current state
+        at the moment of delegation, never used for any decision.
 
     `command_error_message` is the exact string the command must pass to
     `CommandError` when `executed` is False -- computed here, not by the
@@ -86,6 +157,7 @@ class RealSendOutcome:
     eligible_rows: int
     max_rows: int
     dry_run: bool
+    result: str = REAL_SEND_RESULT_REFUSED
     authorization_code: str = ""
     blocked_ambiguous_rows: tuple[LedgerRow, ...] = ()
     job_id: int | None = None
@@ -169,14 +241,37 @@ def authorize_and_execute_real_send(
         )
 
     # Check 6: no queued/running job of this type already exists for this
-    # bulk (defence in depth; NOT the safety boundary -- design §7,
-    # jobs.py's comment, and PR2b-T28).
-    existing_job = BackgroundJob.objects.filter(
-        bulk_id=bulk.pk,
-        job_type=BackgroundJob.TYPE_BULK_SEND_V2_REAL,
-        state__in=[BackgroundJob.STATE_QUEUED, BackgroundJob.STATE_RUNNING],
-    ).exists()
-    if existing_job:
+    # bulk. This is a cheap, UNLOCKED fast path only -- NOT the safety
+    # boundary against duplicate jobs (that is Check 14's locked
+    # re-verification, design round 9). It still exists here because it
+    # avoids doing the ledger read + authorization gate below when a job
+    # is obviously already active.
+    existing_job = (
+        BackgroundJob.objects.filter(
+            bulk_id=bulk.pk,
+            job_type=BackgroundJob.TYPE_BULK_SEND_V2_REAL,
+            state__in=[BackgroundJob.STATE_QUEUED, BackgroundJob.STATE_RUNNING],
+        )
+        .only("pk", "state", "started_at")
+        .first()
+    )
+    if existing_job is not None:
+        # design round 12 (PR C2): observability-only. Never resets,
+        # reclaims, or otherwise mutates the job or any recipient --
+        # purely a more alarming log line than the ordinary refusal
+        # below, for the case where the existing job has been `running`
+        # long enough that it is very unlikely to still be healthy.
+        if (
+            existing_job.state == BackgroundJob.STATE_RUNNING
+            and existing_job.started_at is not None
+        ):
+            age = timezone.now() - existing_job.started_at
+            if age > BACKGROUND_JOB_STALE_RUNNING_AFTER:
+                logger.warning(
+                    "bulk_v2_real_send_job_stale_detected job_id=%s "
+                    "bulk_send_id=%s age_seconds=%s",
+                    existing_job.pk, bulk.pk, int(age.total_seconds()),
+                )
         return _refused(
             code="real_send_job_already_present",
             message="Ya existe un job bulk_send_v2_real en curso para este BulkSend.",
@@ -269,49 +364,71 @@ def authorize_and_execute_real_send(
             authorization_code=decision.code,
         )
 
-    # Check 14: execute. Create the BackgroundJob, claim it through the
-    # LOCKED claim path (never run_background_job's bypass, design §7),
-    # then dispatch via run_claimed_job.
-    job = BackgroundJob.objects.create(
-        job_type=BackgroundJob.TYPE_BULK_SEND_V2_REAL,
-        bulk=bulk, triggered_by=None, state=BackgroundJob.STATE_QUEUED,
-    )
+    # Check 14a (design round 9-12, PR C2): lock the BulkSend row itself
+    # for the remainder of this decision -- the single mechanism that
+    # closes the Check-6/Check-14 TOCTOU window. Re-verifies job
+    # existence UNDER the lock (THIS is the actual job-level safety
+    # boundary now -- Check 6 above is only the cheap early exit), then
+    # creates the BackgroundJob DURABLY QUEUED in the same short
+    # transaction. Deliberately does NOT claim/transition it to running
+    # here: the lock must release before any claim is attempted, so a
+    # crash between this commit and the claim below leaves the job
+    # `queued` -- recoverable by the already-running continuous worker
+    # (`process_background_jobs --loop`), not orphaned in `running`
+    # (design round 11's crash-window analysis).
     with transaction.atomic():
-        claimed = (
-            BackgroundJob.objects
-            .select_for_update(skip_locked=True)
-            .filter(pk=job.pk, state=BackgroundJob.STATE_QUEUED)
-            .first()
+        locked_bulk = (
+            BulkSend.objects.select_for_update().filter(pk=bulk.pk).first()
         )
-        if claimed is None:
-            # Defensive: unreachable in a single-shell invocation (the job
-            # was just created with a fresh pk in STATE_QUEUED immediately
-            # above, in the same process). `command_error_message` is the
-            # exact pre-PR-C literal -- deliberately WITHOUT the
-            # `f"{code}: {message}"` prefix every other refusal uses, to
-            # keep the command's observable output byte-for-byte
-            # unchanged from before this extraction.
-            return RealSendOutcome(
-                executed=False, code="real_send_claim_failed",
-                message="real_send_allowed: job claim failed unexpectedly",
-                returncode=4, bulk_send_id=bulk_send_id,
-                eligible_rows=eligible_row_count, max_rows=max_rows,
-                dry_run=dry_run, authorization_code=decision.code,
-                command_error_message="real_send_allowed: job claim failed unexpectedly",
+        if locked_bulk is None:  # pragma: no cover - defensive, bulk deleted mid-flight
+            return _refused(
+                code="real_send_bulk_not_found",
+                message=f"No existe BulkSend {bulk_send_id}.",
+                returncode=2, eligible_rows=eligible_row_count,
             )
-        claimed.state = BackgroundJob.STATE_RUNNING
-        claimed.started_at = timezone.now()
-        claimed.attempts = int(claimed.attempts or 0) + 1
-        claimed.error = ""
-        claimed.save(
-            update_fields=["state", "started_at", "attempts", "error", "updated_at"]
-        )
 
-    run_claimed_job(claimed)
-    claimed.refresh_from_db()
+        existing_job_locked = BackgroundJob.objects.filter(
+            bulk_id=locked_bulk.pk,
+            job_type=BackgroundJob.TYPE_BULK_SEND_V2_REAL,
+            state__in=[BackgroundJob.STATE_QUEUED, BackgroundJob.STATE_RUNNING],
+        ).exists()
+        if existing_job_locked:
+            return _refused(
+                code="real_send_job_already_present",
+                message="Ya existe un job bulk_send_v2_real en curso para este BulkSend.",
+                returncode=4, eligible_rows=eligible_row_count,
+            )
+
+        job = BackgroundJob.objects.create(
+            job_type=BackgroundJob.TYPE_BULK_SEND_V2_REAL,
+            bulk=locked_bulk, triggered_by=None, state=BackgroundJob.STATE_QUEUED,
+        )
+    # BulkSend lock released here (transaction committed). Job durable,
+    # visible to the continuous worker and to any other caller. No I/O
+    # of any kind has occurred yet.
+
+    # Check 14b: claim THIS specific job and run it synchronously, via
+    # the one shared primitive (relay/services/jobs.py) also usable by a
+    # future scheduler. If another caller (typically the continuous
+    # worker) claims it first, this call delegates cleanly -- it never
+    # re-creates a job, never retries the claim, and never dispatches
+    # anything itself.
+    claimed = execute_specific_queued_job(job.pk)
+    if claimed is None:
+        current_state = (
+            BackgroundJob.objects.filter(pk=job.pk).values_list("state", flat=True).first()
+        )
+        return RealSendOutcome(
+            executed=True, result=REAL_SEND_RESULT_DELEGATED,
+            code=decision.code, message="", returncode=0,
+            bulk_send_id=bulk_send_id, eligible_rows=eligible_row_count,
+            max_rows=max_rows, dry_run=False, authorization_code=decision.code,
+            job_id=job.pk, job_state=current_state, job_message=None,
+        )
 
     return RealSendOutcome(
-        executed=True, code=decision.code, message="", returncode=0,
+        executed=True, result=REAL_SEND_RESULT_EXECUTED_HERE,
+        code=decision.code, message="", returncode=0,
         bulk_send_id=bulk_send_id, eligible_rows=eligible_row_count,
         max_rows=max_rows, dry_run=False, authorization_code=decision.code,
         job_id=claimed.pk, job_state=claimed.state, job_message=claimed.message,

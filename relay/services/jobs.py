@@ -102,6 +102,61 @@ def claim_next_job() -> BackgroundJob | None:
         return job
 
 
+def claim_specific_job(job_id: int) -> BackgroundJob | None:
+    """Same CAS shape as `claim_next_job`, scoped to one exact `job_id`
+    instead of "the oldest queued job" -- used when a caller (design
+    round 9/10/11, PR C2) already knows which job it wants to run
+    synchronously, immediately after durably creating it as `queued`.
+
+    Returns None if the row is no longer `queued` (someone else --
+    typically the continuous worker, `process_background_jobs --loop`
+    -- already claimed it first). The caller MUST treat None as
+    "delegated to whoever else claimed it", never re-create a job or
+    retry the claim itself.
+    """
+    with transaction.atomic():
+        job = (
+            BackgroundJob.objects
+            .select_for_update(skip_locked=True)
+            .filter(pk=job_id, state=BackgroundJob.STATE_QUEUED)
+            .first()
+        )
+        if job is None:
+            return None
+        job.state = BackgroundJob.STATE_RUNNING
+        job.started_at = timezone.now()
+        job.attempts = int(job.attempts or 0) + 1
+        job.error = ""
+        job.save(update_fields=["state", "started_at", "attempts", "error", "updated_at"])
+        return job
+
+
+def execute_specific_queued_job(job_id: int) -> BackgroundJob | None:
+    """Claims exactly one specific queued job and, if this call wins the
+    claim, runs it synchronously via `run_claimed_job` -- returning the
+    job in its terminal state (`done`/`error`). Returns None if another
+    caller already claimed it first (design round 11: "delegated", not a
+    failure -- the job WILL be, or already is being, processed by
+    whoever else claimed it).
+
+    Does NOT eliminate the gap between the claim's COMMIT and the start
+    of `dispatch_background_job` inside `run_claimed_job` -- no
+    code-level restructuring can (design round 11's analysis: a database
+    commit and a subsequent Python function call belong to different
+    failure domains connected by network latency that can never be
+    proven to be zero). This function exists to give every caller (the
+    management command via `authorize_and_execute_real_send`, and a
+    future scheduler) ONE shared, tested claim-then-dispatch sequence
+    instead of duplicating it -- not to close that window.
+    """
+    job = claim_specific_job(job_id)
+    if job is None:
+        return None
+    run_claimed_job(job)
+    job.refresh_from_db()
+    return job
+
+
 def run_claimed_job(job: BackgroundJob) -> None:
     try:
         result = dispatch_background_job(job)

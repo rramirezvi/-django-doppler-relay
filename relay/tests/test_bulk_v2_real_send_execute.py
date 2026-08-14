@@ -214,53 +214,51 @@ class AllowedExecutionTests(RealSendFixtureMixin, NoRealDopplerCallTestCase):
         row = bulk.recipient_occurrences.get()
         self.assertEqual(row.send_status, BulkSendRecipient.SEND_SENT)
 
-    def test_claim_failed_branch_preserves_exact_original_message_and_returncode(self):
-        """Forces the defensive `claimed is None` branch (check 14) via a
-        mock, with no real DB race and no transport -- converts the
-        former `pragma: no cover` branch into specified, tested
-        behavior. Must reproduce, byte-for-byte, the exact pre-PR-C
-        CommandError the monolithic command used to raise for this case:
-        'real_send_allowed: job claim failed unexpectedly', returncode=4
-        -- deliberately WITHOUT the `f"{code}: {message}"` prefix every
-        other refusal uses."""
+    def test_delegated_when_another_caller_claims_the_job_first(self):
+        """design round 12 (PR C2): supersedes the old pre-PR-C2
+        'claim_failed' defensive branch -- losing the Check 14b claim is
+        now the expected, specified 'delegated' outcome, never an error.
+        Forces it deterministically (no real timing race needed): the
+        mocked `execute_specific_queued_job` genuinely claims the same
+        job via the REAL, unmocked `claim_next_job()` -- exactly what
+        the continuous worker (`process_background_jobs --loop`) would
+        do -- before returning None, so the DB ends up in a real,
+        consistent 'already claimed by someone else' state."""
+        from relay.services import jobs as jobs_module
+
         user = self.make_user()
         bulk = self.make_bulk(user=user)
         self.make_occurrence(bulk)
 
+        def fake_execute_specific_queued_job(job_id):
+            claimed_by_other = jobs_module.claim_next_job()
+            self.assertIsNotNone(claimed_by_other)
+            self.assertEqual(claimed_by_other.pk, job_id)
+            return None
+
         with override_settings(**self.authorized_settings(user=user, bulk=bulk)):
             with mock.patch(
-                "relay.services.bulk_v2_real_send_execute.BackgroundJob.objects.select_for_update"
-            ) as mocked_select_for_update:
-                mocked_select_for_update.return_value.filter.return_value.first.return_value = None
-                with mock.patch(
-                    "relay.services.bulk_v2_real_send_execute.run_claimed_job"
-                ) as mocked_dispatch:
-                    outcome = authorize_and_execute_real_send(bulk.pk)
-
-        self.assertFalse(outcome.executed)
-        self.assertEqual(outcome.returncode, 4)
-        self.assertEqual(
-            outcome.command_error_message,
-            "real_send_allowed: job claim failed unexpectedly",
-        )
-        mocked_dispatch.assert_not_called()
-        self._transport_mock.assert_not_called()
-        # The job WAS created (check 14's create() runs before the claim
-        # attempt) but never transitions past STATE_QUEUED -- identical
-        # to the pre-PR-C command's behavior for this exact branch.
-        self.assertEqual(BackgroundJob.objects.count(), 1)
-        self.assertEqual(BackgroundJob.objects.get().state, BackgroundJob.STATE_QUEUED)
-
-        # Command-level: the CommandError raised by the thin wrapper must
-        # carry this exact message, unprefixed, with returncode=4.
-        with self.assertRaises(CommandError) as ctx:
-            with mock.patch(
-                "relay.management.commands.bulk_v2_real_send.authorize_and_execute_real_send",
-                return_value=outcome,
+                "relay.services.bulk_v2_real_send_execute.execute_specific_queued_job",
+                side_effect=fake_execute_specific_queued_job,
             ):
-                call_command("bulk_v2_real_send", bulk_send_id=bulk.pk)
-        self.assertEqual(str(ctx.exception), "real_send_allowed: job claim failed unexpectedly")
-        self.assertEqual(ctx.exception.returncode, 4)
+                outcome = authorize_and_execute_real_send(bulk.pk)
+
+        self.assertTrue(outcome.executed)
+        self.assertEqual(outcome.result, "delegated")
+        job = BackgroundJob.objects.get()
+        self.assertEqual(outcome.job_id, job.pk)
+        self.assertEqual(outcome.job_state, BackgroundJob.STATE_RUNNING)
+        self.assertEqual(job.attempts, 1)
+        # This invocation never dispatched anything itself.
+        self._transport_mock.assert_not_called()
+
+        # Command-level: delegated must be a clean success (exit 0), never
+        # a CommandError.
+        with mock.patch(
+            "relay.management.commands.bulk_v2_real_send.authorize_and_execute_real_send",
+            return_value=outcome,
+        ):
+            call_command("bulk_v2_real_send", bulk_send_id=bulk.pk)  # must not raise
 
 
 class QuotaIntegrationTests(RealSendFixtureMixin, NoRealDopplerCallTestCase):
@@ -323,3 +321,66 @@ class QuotaIntegrationTests(RealSendFixtureMixin, NoRealDopplerCallTestCase):
         self.assertEqual(QuotaWindow.objects.count(), 0)
         row.refresh_from_db()
         self.assertEqual(row.send_status, BulkSendRecipient.SEND_SENT)
+
+
+class StaleJobDetectionTests(RealSendFixtureMixin, NoRealDopplerCallTestCase):
+    """design round 12 (PR C2): observability-only. A `running` job past
+    BACKGROUND_JOB_STALE_RUNNING_AFTER gets a distinct, more alarming log
+    line -- never a state change, never a reset, never a re-claim, never
+    a recipient mutation."""
+
+    def test_stale_running_job_logs_without_mutating_anything(self):
+        from datetime import timedelta
+
+        from django.utils import timezone
+
+        from relay.services.bulk_v2_real_send_execute import (
+            BACKGROUND_JOB_STALE_RUNNING_AFTER,
+        )
+
+        user = self.make_user()
+        bulk = self.make_bulk(user=user)
+        row = self.make_occurrence(bulk)
+        stuck_job = BackgroundJob.objects.create(
+            job_type=BackgroundJob.TYPE_BULK_SEND_V2_REAL,
+            bulk=bulk,
+            state=BackgroundJob.STATE_RUNNING,
+            started_at=timezone.now() - BACKGROUND_JOB_STALE_RUNNING_AFTER - timedelta(seconds=1),
+        )
+
+        with self.assertLogs("relay.services.bulk_v2_real_send_execute", level="WARNING") as logs:
+            with override_settings(**self.authorized_settings(user=user, bulk=bulk)):
+                outcome = authorize_and_execute_real_send(bulk.pk)
+
+        self.assertFalse(outcome.executed)
+        self.assertEqual(outcome.code, "real_send_job_already_present")
+        self.assertTrue(
+            any("bulk_v2_real_send_job_stale_detected" in line for line in logs.output),
+            logs.output,
+        )
+        # Zero mutation: the stuck job and the recipient are untouched.
+        stuck_job.refresh_from_db()
+        self.assertEqual(stuck_job.state, BackgroundJob.STATE_RUNNING)
+        self.assertEqual(BackgroundJob.objects.filter(bulk=bulk).count(), 1)
+        row.refresh_from_db()
+        self.assertEqual(row.send_status, BulkSendRecipient.SEND_NOT_STARTED)
+        self._transport_mock.assert_not_called()
+
+    def test_fresh_running_job_does_not_log_stale_event(self):
+        user = self.make_user()
+        bulk = self.make_bulk(user=user)
+        self.make_occurrence(bulk)
+        BackgroundJob.objects.create(
+            job_type=BackgroundJob.TYPE_BULK_SEND_V2_REAL,
+            bulk=bulk, state=BackgroundJob.STATE_RUNNING,
+        )
+
+        with self.assertLogs("relay.services.bulk_v2_real_send_execute", level="INFO") as logs:
+            with override_settings(**self.authorized_settings(user=user, bulk=bulk)):
+                outcome = authorize_and_execute_real_send(bulk.pk)
+
+        self.assertFalse(outcome.executed)
+        self.assertFalse(
+            any("bulk_v2_real_send_job_stale_detected" in line for line in logs.output),
+            logs.output,
+        )
