@@ -219,6 +219,32 @@ BULK_PROCESSING_V2_REAL_SEND_MAX_ROWS = env.int(
     "BULK_PROCESSING_V2_REAL_SEND_MAX_ROWS", default=1
 )
 
+# bulk-v2 quota guard (design round 5/6, PR A): dormant infrastructure
+# settings. Nothing in the send path reads DOPPLER_QUOTA_GUARD_ENABLED yet
+# (PR B wires it in) -- these exist only so relay/services/bulk_quota.py
+# and its tests have a real settings surface to resolve against. All
+# defaults are fail-closed/inert: guard disabled, limits at 0 (invalid,
+# never "unlimited" -- see bulk_quota._resolve_effective_limit), no
+# safety margin, overage unsupported.
+DOPPLER_QUOTA_GUARD_ENABLED = env.bool(
+    "DOPPLER_QUOTA_GUARD_ENABLED", default=False
+)
+DOPPLER_QUOTA_MONTHLY_LIMIT = env.int(
+    "DOPPLER_QUOTA_MONTHLY_LIMIT", default=0
+)
+DOPPLER_QUOTA_DAILY_LIMIT = env.int(
+    "DOPPLER_QUOTA_DAILY_LIMIT", default=0
+)
+DOPPLER_QUOTA_HOURLY_LIMIT = env.int(
+    "DOPPLER_QUOTA_HOURLY_LIMIT", default=0
+)
+DOPPLER_QUOTA_SAFETY_MARGIN_RATIO = env.float(
+    "DOPPLER_QUOTA_SAFETY_MARGIN_RATIO", default=0.0
+)
+DOPPLER_QUOTA_OVERAGE_ENABLED = env.bool(
+    "DOPPLER_QUOTA_OVERAGE_ENABLED", default=False
+)
+
 BULK_PROCESSING_V2_ALLOW_EXTERNAL_TEMPLATE_LOOKUP = env.bool(
     "BULK_PROCESSING_V2_ALLOW_EXTERNAL_TEMPLATE_LOOKUP", default=False
 )

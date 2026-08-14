@@ -561,3 +561,53 @@ class Event(models.Model):
             models.Index(fields=["kind", "ts"]),
             models.Index(fields=["email"]),
         ]
+
+
+class QuotaWindow(models.Model):
+    """bulk-v2 quota guard (design round 5, PR A): a single local, atomic
+    reservation counter per UTC window. Dormant infrastructure — nothing
+    outside relay/services/bulk_quota.py may reference this model, and
+    that module has no caller yet (PR B wires it into the V2 send path).
+
+    `limit_value` is resolved once, at row-creation time, from
+    `_resolve_effective_limit()` and then never rewritten — a later
+    config change only affects windows created after the change, never
+    an already-created row (design round 5, point 5).
+    """
+
+    WINDOW_MONTH = "month"
+    WINDOW_DAY = "day"
+    WINDOW_HOUR = "hour"
+    WINDOW_TYPE_CHOICES = (
+        (WINDOW_MONTH, "Month"),
+        (WINDOW_DAY, "Day"),
+        (WINDOW_HOUR, "Hour"),
+    )
+
+    window_type = models.CharField(max_length=8, choices=WINDOW_TYPE_CHOICES)
+    window_start = models.DateTimeField()
+    limit_value = models.PositiveIntegerField()
+    consumed = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        verbose_name = "Ventana de cuota"
+        verbose_name_plural = "Ventanas de cuota"
+        constraints = [
+            models.UniqueConstraint(
+                fields=["window_type", "window_start"],
+                name="uniq_quota_window",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(consumed__lte=models.F("limit_value")),
+                name="quota_window_consumed_lte_limit",
+            ),
+            models.CheckConstraint(
+                condition=models.Q(window_type__in=["month", "day", "hour"]),
+                name="quota_window_valid_type",
+            ),
+        ]
+
+    def __str__(self):
+        return f"{self.window_type} {self.window_start.isoformat()} [{self.consumed}/{self.limit_value}]"
