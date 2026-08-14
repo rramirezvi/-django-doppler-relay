@@ -345,19 +345,42 @@ class ConstraintTests(TestCase):
 
 class IsolationTests(TestCase):
     def test_no_forbidden_imports_in_bulk_quota_module(self):
-        executable_source = _executable_source(bulk_quota)
-        forbidden_tokens = (
-            "doppler_relay",
-            "bulk_v2_send",
-            "bulk_v2_send_state",
-            "services.jobs",
-            "import requests",
-            "management.commands",
-        )
-        for token in forbidden_tokens:
-            self.assertNotIn(token, executable_source)
+        # fix-bulk-v2-quota-integration (PR B): AST-based, checking actual
+        # `import`/`from ... import` statements only -- not a blind
+        # substring search. reserve_and_claim's own docstring legitimately
+        # names relay/services/bulk_v2_send.py in prose (to document who
+        # wires it in), which a substring check would misfire on; a real
+        # import of any of these modules would still be caught here.
+        tree = ast.parse(inspect.getsource(bulk_quota))
+        imported_modules: set[str] = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imported_modules.update(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imported_modules.add(node.module)
 
-    def test_no_public_reservation_wrapper_exists(self):
-        self.assertFalse(hasattr(bulk_quota, "reserve_and_claim"))
+        forbidden_modules = (
+            "relay.services.doppler_relay",
+            "relay.services.bulk_v2_send",
+            "relay.services.bulk_v2_send_state",
+            "relay.services.jobs",
+            "requests",
+        )
+        for forbidden in forbidden_modules:
+            self.assertFalse(
+                any(m == forbidden or m.startswith(forbidden + ".") for m in imported_modules),
+                f"unexpected import of {forbidden!r}: {imported_modules}",
+            )
+        self.assertFalse(any(m.startswith("relay.management.commands") for m in imported_modules))
+
+    def test_no_bypassable_reservation_wrapper_exists(self):
+        # fix-bulk-v2-quota-integration (PR B): reserve_and_claim is now
+        # the ONE sanctioned public entry point (design round 6/7) --
+        # PR A's original "nothing public yet" assertion is superseded by
+        # design, not broken by accident. What must still never exist is
+        # a wrapper that lets a caller reserve quota WITHOUT the recipient
+        # claim fused into the same transaction.
+        self.assertTrue(hasattr(bulk_quota, "reserve_and_claim"))
         self.assertFalse(hasattr(bulk_quota, "reserve_quota"))
+        self.assertFalse(hasattr(bulk_quota, "reserve_quota_only"))
         self.assertFalse(hasattr(bulk_quota, "reserve_quota_only"))

@@ -1,35 +1,39 @@
-"""bulk-v2 quota guard -- infrastructure primitives (design round 5/6, PR A).
+"""bulk-v2 quota guard (design round 5/6/7, PR A + PR B).
 
-DORMANT: nothing in this module is called from the send path yet, and
-nothing outside this module and its own tests may import it. PR B will
-add `reserve_and_claim` (fusing these primitives with the recipient claim
-in ONE transaction.atomic() block) and wire it into
-relay/services/bulk_v2_send.py's claim loop, behind
-`settings.DOPPLER_QUOTA_GUARD_ENABLED` (default False).
-
-Every function below is a private, composable primitive -- prefixed with
-`_` deliberately. There is NO public `reserve_quota()` / `reserve_and_claim()`
-in this module, and none should ever be added here: the only sanctioned way
-to combine quota reservation with a recipient claim is PR B's
-`reserve_and_claim` (lives with the V2 send path, not here), and the only
-sanctioned way to reserve quota WITHOUT a recipient claim (V1's temporary,
-documented-as-removable bridge) is PR E's `reserve_quota_only`. Both will
-compose the primitives below; neither is defined in this module.
+`reserve_and_claim` is the ONLY public, sanctioned way for V2 to combine
+quota reservation with a recipient claim (design round 6, section 6;
+design round 7 = PR B). Every other function below is a private,
+composable primitive -- prefixed with `_` deliberately, never to be
+called directly from send-path code. There is no `reserve_quota()`
+convenience wrapper and none should ever be added: the only other
+sanctioned composition of these primitives is V1's temporary bridge
+`reserve_quota_only` (PR E, not yet implemented), which reserves quota
+WITHOUT a recipient claim because V1 has no equivalent row.
 
 Global lock-order rule (design round 6, point 2): RECIPIENT -> MONTH -> DAY
 -> HOUR is the only compound lock order that exists or will exist in this
-system, and it belongs exclusively to `reserve_and_claim` (PR B). This
-module never acquires a BulkSendRecipient/BackgroundJob/BulkSend lock --
-only QuotaWindow rows, always in MONTH -> DAY -> HOUR order.
+system, and it belongs exclusively to `reserve_and_claim`. No other
+function in this module acquires a BulkSendRecipient/BackgroundJob/
+BulkSend lock -- the private primitives only ever touch QuotaWindow rows,
+always in MONTH -> DAY -> HOUR order.
+
+Wiring (PR B): `relay/services/bulk_v2_send.py`'s claim loop calls
+`reserve_and_claim` only when `settings.DOPPLER_QUOTA_GUARD_ENABLED` is
+True; when False it calls the pre-existing
+`bulk_v2_send_state.claim_next_recipient` instead, byte-identical to the
+pre-PR-B behavior -- this module performs zero reads/writes of
+`QuotaWindow` in that case.
 
 All window boundaries are UTC (Doppler's contractually confirmed quota
 timezone), independent of `settings.TIME_ZONE` -- deliberately never read
 here.
 
 Zero imports from relay.services.doppler_relay, relay.services.bulk_v2_send,
-relay.services.bulk_v2_send_state, relay.services.jobs, any management
-command, or any HTTP transport library -- this module has no knowledge
-Doppler exists.
+relay.services.jobs, any management command, or any HTTP transport
+library -- this module has no knowledge Doppler exists. `BulkSendRecipient`
+is imported (from relay.models) solely for the CAS inside
+`reserve_and_claim` -- no send-status transition logic is duplicated here;
+the transition mirrors `bulk_v2_send_state.claim_next_recipient` exactly.
 """
 
 from __future__ import annotations
@@ -41,8 +45,9 @@ from datetime import timezone as dt_timezone
 from django.conf import settings
 from django.db import IntegrityError, transaction
 from django.db.models import F
+from django.utils import timezone as django_timezone
 
-from relay.models import QuotaWindow
+from relay.models import BulkSendRecipient, QuotaWindow
 
 # The only sanctioned sub-order for QuotaWindow locks, anywhere.
 _WINDOW_ORDER = (QuotaWindow.WINDOW_MONTH, QuotaWindow.WINDOW_DAY, QuotaWindow.WINDOW_HOUR)
@@ -196,3 +201,88 @@ def _increment_windows(windows: dict[str, QuotaWindow], *, now: datetime) -> Non
         QuotaWindow.objects.filter(pk=windows[window_type].pk).update(
             consumed=F("consumed") + 1, updated_at=now
         )
+
+
+class _ClaimRaceLost(Exception):
+    """Internal control-flow signal only -- never escapes
+    `reserve_and_claim`. Forces the surrounding transaction to roll back
+    (including any quota already incremented in the same transaction)
+    when the recipient CAS matches zero rows after the quota windows were
+    already locked and incremented. Without this, a plain `return None`
+    from inside the `with transaction.atomic():` block would let the
+    quota increment commit while reporting "nothing claimed" -- exactly
+    the invariant violation ("ninguna quota puede quedar incrementada sin
+    recipient reclamado") this design forbids."""
+
+
+def reserve_and_claim(bulk_send_id: int, *, job_id: int) -> int | None:
+    """The ONLY sanctioned V2 operation combining quota reservation with a
+    recipient claim (design round 6/7). Single `transaction.atomic()`
+    block, lock order RECIPIENT -> MONTH -> DAY -> HOUR:
+
+      1. select_for_update(skip_locked=True) the next eligible recipient
+         (status=pending, send_status=not_started, deterministic order) --
+         mirrors `bulk_v2_send_state.claim_next_recipient` exactly.
+      2. If none: return None immediately. Nothing was locked/written, so
+         there is nothing to roll back.
+      3. Lock the three QuotaWindow rows (MONTH -> DAY -> HOUR).
+      4. Validate all three have capacity BEFORE mutating any of them --
+         `_validate_capacity` raises `QuotaExhausted`, which propagates
+         out of the `with` block and rolls back the entire transaction
+         (nothing was incremented yet, and the recipient's CAS below never
+         ran, so it stays `not_started`). Callers MUST catch
+         `QuotaExhausted` to stop their claim loop cleanly -- it is not an
+         error state for the row or the BulkSend.
+      5. Increment all three windows by 1.
+      6. CAS the recipient not_started -> sending (same fields as
+         `claim_next_recipient`: send_started_at, send_attempt_number+1,
+         send_job_id). If this matches zero rows (a race lost despite the
+         lock -- defensive, should be unreachable), raise `_ClaimRaceLost`
+         to roll back the quota increments too, then return None.
+
+    Only after this function returns a non-None pk (i.e. after COMMIT) may
+    any Doppler I/O occur -- identical timing guarantee to
+    `claim_next_recipient` today.
+    """
+    now = django_timezone.now()
+    try:
+        with transaction.atomic():
+            row_pk = (
+                BulkSendRecipient.objects
+                .select_for_update(skip_locked=True)
+                .filter(
+                    bulk_send_id=bulk_send_id,
+                    status=BulkSendRecipient.STATUS_PENDING,
+                    send_status=BulkSendRecipient.SEND_NOT_STARTED,
+                )
+                .order_by("import_version", "source_row_number")
+                .values_list("pk", flat=True)
+                .first()
+            )
+            if row_pk is None:
+                return None
+
+            windows = _lock_quota_windows(_resolve_window_starts(now))
+            _validate_capacity(windows)
+            _increment_windows(windows, now=now)
+
+            updated = (
+                BulkSendRecipient.objects
+                .filter(
+                    pk=row_pk,
+                    status=BulkSendRecipient.STATUS_PENDING,
+                    send_status=BulkSendRecipient.SEND_NOT_STARTED,
+                )
+                .update(
+                    send_status=BulkSendRecipient.SEND_SENDING,
+                    send_started_at=now,
+                    send_attempt_number=F("send_attempt_number") + 1,
+                    send_job_id=job_id,
+                    updated_at=now,
+                )
+            )
+            if updated != 1:
+                raise _ClaimRaceLost()
+    except _ClaimRaceLost:
+        return None
+    return row_pk

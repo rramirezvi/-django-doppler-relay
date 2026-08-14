@@ -530,6 +530,14 @@ class SendStatusWriteBoundaryTests(TestCase):
     ALLOWED_RELATIVE_PATHS = {
         Path("services") / "bulk_v2_send_state.py",
         Path("migrations") / "20260808120000_bulk_v2_real_send_state.py",
+        # fix-bulk-v2-quota-integration (design round 6/7, PR B):
+        # bulk_quota.reserve_and_claim performs the exact same
+        # not_started -> sending CAS as claim_next_recipient (same
+        # WHERE/UPDATE shape, same fields), fused into one transaction
+        # with the quota reservation. A second sanctioned write site by
+        # design, not a bypass of the state module's ownership -- no
+        # send_status transition logic is duplicated or diverges here.
+        Path("services") / "bulk_quota.py",
     }
 
     UPDATE_CALL_RE = re.compile(r"\.update\(")

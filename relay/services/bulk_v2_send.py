@@ -7,11 +7,15 @@ function `relay/services/jobs.py::dispatch_background_job` routes the new
 Hard structural constraints, each independently verifiable and each
 enforced/tested by PR2b-T35's suite-wide no-real-HTTP guard and the grep
 checks referenced inline below:
-  - Recipients are read EXCLUSIVELY from `BulkSendRecipient` via
-    `bulk_v2_send_state.claim_next_recipient` (PR2a). Zero import of `csv`,
-    zero reference to `bulk.recipients_file` or `BulkImportService`
-    anywhere in this module (design §6 "Zero CSV dependency is
-    structural").
+  - Recipients are read EXCLUSIVELY from `BulkSendRecipient`, via
+    `bulk_v2_send_state.claim_next_recipient` (PR2a) when
+    `DOPPLER_QUOTA_GUARD_ENABLED=False`, or via `bulk_quota.reserve_and_claim`
+    (PR B, design round 6/7) when `True` -- both apply the exact same
+    not_started -> sending compare-and-set, `reserve_and_claim` additionally
+    fusing it with an atomic MONTH/DAY/HOUR quota reservation in the same
+    transaction. Zero import of `csv`, zero reference to
+    `bulk.recipients_file` or `BulkImportService` anywhere in this module
+    (design §6 "Zero CSV dependency is structural").
   - `relay/services/bulk_processing.py` is not imported and is not
     modified — this module is intentionally separate (design §14's
     refinement of the proposal), so the legacy guard at
@@ -58,6 +62,7 @@ from django.conf import settings
 from django.utils import timezone
 
 from relay.models import BulkSend, BulkSendRecipient
+from relay.services.bulk_quota import QuotaExhausted, reserve_and_claim
 from relay.services.bulk_v2_send_state import (
     SendStateError,
     claim_next_recipient,
@@ -349,9 +354,39 @@ def process_bulk_id_v2(bulk_send_id: int, *, job_id: int) -> str:
                 f"{', '.join(sorted(missing_vars))}."
             )
 
+    # fix-bulk-v2-quota-integration (design round 6/7, PR B): the flag is
+    # read once, before the loop starts -- not re-read per iteration -- so
+    # a single invocation never straddles both behaviors. Flag OFF is
+    # byte-identical to pre-PR-B behavior: claim_next_recipient is called
+    # exactly as before, and this module makes zero QuotaWindow reads or
+    # writes.
+    quota_guard_enabled = settings.DOPPLER_QUOTA_GUARD_ENABLED
+
     processed = 0
     while True:
-        row_pk = claim_next_recipient(bulk_send_id, job_id=job_id)
+        if quota_guard_enabled:
+            try:
+                row_pk = reserve_and_claim(bulk_send_id, job_id=job_id)
+            except QuotaExhausted as exc:
+                # design round 7, section 4: stop the loop cleanly. The
+                # recipient that would have been claimed next (if any)
+                # never left `not_started` -- QuotaExhausted is raised
+                # before any CAS runs (bulk_quota.reserve_and_claim). Not
+                # send_failed, not ambiguous, not an error for the
+                # BackgroundJob -- a normal, expected end-of-capacity
+                # condition. No PII: bulk_send_id + window aggregates only.
+                logger.info(
+                    "bulk_v2_real_send_quota_exhausted bulk_send_id=%s "
+                    "window_type=%s limit=%s consumed=%s timestamp=%s",
+                    bulk_send_id,
+                    exc.window_type,
+                    exc.limit_value,
+                    exc.consumed,
+                    timezone.now().isoformat(),
+                )
+                break
+        else:
+            row_pk = claim_next_recipient(bulk_send_id, job_id=job_id)
         if row_pk is None:
             break
 
